@@ -1,0 +1,68 @@
+[workspace]
+members = ["crates/music_stream", "crates/music_stream_napi"]
+default-members = ["crates/music_stream", "crates/music_stream_napi"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "AGPL-3.0-or-later"
+rust-version = "1.96"
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+rust_2018_idioms = "warn"
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+bytes = "1.11.0"
+criterion = "0.8.2"
+futures = "0.3.31"
+lru = "0.18.0"
+metrics = "0.24.6"
+metrics-util = { version = "0.20.4", default-features = false, features = [
+  "debugging",
+] }
+napi = { version = "3.9.3", default-features = false, features = ["napi8", "tokio_rt"] }
+napi-derive = "3.5.6"
+opus = "0.3.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "rustls", "stream"] }
+rtcp = "0.17.1"
+rtp = "0.17.1"
+rubato = "3.0.0"
+symphonia = { version = "0.6.0", default-features = false, features = [
+  "aac",
+  "alac",
+  "flac",
+  "isomp4",
+  "mp3",
+  "ogg",
+  "pcm",
+  "vorbis",
+  "wav",
+] }
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+util = { package = "webrtc-util", version = "0.17.1", default-features = false, features = [
+  "marshal",
+] }
+tokio = { version = "1.48.0", features = [
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "time",
+  "net",
+  "fs",
+] }
+tokio-util = "0.7.17"
+tracing = "0.1.44"
+music_stream = { path = "crates/music_stream" }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+panic = "abort"
+strip = "symbols"

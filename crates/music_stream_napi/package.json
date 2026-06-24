@@ -1,0 +1,38 @@
+{
+  "name": "@music/streamer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Rust + napi-rs music decoding and RTP streaming addon.",
+  "license": "AGPL-3.0-or-later",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "*.node"
+  ],
+  "type": "commonjs",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "require": "./index.js"
+    }
+  },
+  "scripts": {
+    "build": "napi build --platform",
+    "test": "npm run build && tsc --noEmit && vitest run"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "3.7.2",
+    "@types/node": "24.13.2",
+    "typescript": "6.0.3",
+    "vitest": "4.1.9"
+  },
+  "napi": {
+    "binaryName": "music_streamer"
+  },
+  "engines": {
+    "node": ">=24.17.0 <26"
+  },
+  "packageManager": "npm@11.17.0"
+}

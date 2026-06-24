@@ -1,0 +1,15 @@
+/target/
+/node_modules/
+/crates/*/node_modules/
+/voice_sender/
+/.idea/
+/cmake-build-*/
+/coverage/
+/dist/
+/crates/*/coverage/
+/crates/*/dist/
+/crates/*/index.js
+/crates/*/index.d.ts
+/crates/*/*.node
+*.node
+*.log

@@ -1,0 +1,44 @@
+[package]
+name = "music_stream"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = ["decoder-symphonia", "resampler-rubato", "transport-rtp"]
+decoder-symphonia = ["dep:symphonia"]
+decoder-ffmpeg = []
+resampler-rubato = ["dep:rubato"]
+transport-rtp = ["dep:rtp", "dep:rtcp", "dep:util"]
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+futures.workspace = true
+lru.workspace = true
+metrics.workspace = true
+opus.workspace = true
+reqwest.workspace = true
+rtcp = { workspace = true, optional = true }
+rtp = { workspace = true, optional = true }
+rubato = { workspace = true, optional = true }
+symphonia = { workspace = true, optional = true }
+tempfile.workspace = true
+thiserror.workspace = true
+util = { workspace = true, optional = true }
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+metrics-util.workspace = true
+
+[[bench]]
+name = "criterion_pipeline"
+harness = false
