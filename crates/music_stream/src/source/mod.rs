@@ -106,10 +106,10 @@ impl SourceArtifactCache {
 
     #[must_use]
     fn get(&mut self, key: &str, max_bytes: u64) -> Option<SourceArtifact> {
-        if !self
+        if self
             .entries
             .peek(key)
-            .is_some_and(|artifact| artifact.len_bytes <= max_bytes)
+            .is_none_or(|artifact| artifact.len_bytes > max_bytes)
         {
             return None;
         }
