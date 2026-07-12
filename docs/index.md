@@ -18,6 +18,7 @@ source、current/next、事件、错误恢复和 shutdown，不复制生成的 T
 - [testing.md](testing.md)：必须保护的不变量、验证层次和性能判断方法。
 - [dependencies.md](dependencies.md)：依赖边界以及为什么选择这些依赖。
 - [status.md](status.md)：当前能力边界、尚需产品输入的扩展和演进准入条件。
+- [releasing.md](releasing.md)：napi-rs 平台包、GitHub Actions、npm OIDC 和版本发布契约。
 
 ## 文档维护规则
 

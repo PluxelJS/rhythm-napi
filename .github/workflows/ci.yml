@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags-ignore: ['**']
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: '0'
+  NAPI_DIR: crates/music_stream_napi
+  RUST_BACKTRACE: '1'
+
+jobs:
+  quality:
+    name: Quality and runtime tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/music_stream_napi/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install Node dependencies
+        working-directory: ${{ env.NAPI_DIR }}
+        run: npm ci
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Rust tests
+        run: cargo test --workspace --all-targets
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Rust documentation
+        run: cargo doc --workspace --no-deps
+      - name: Node and N-API tests
+        working-directory: ${{ env.NAPI_DIR }}
+        run: npm test
+
+  build-bindings:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - host: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            extra: --use-napi-cross
+          - host: windows-latest
+            target: x86_64-pc-windows-msvc
+            extra: ''
+          - host: macos-latest
+            target: x86_64-apple-darwin
+            extra: ''
+          - host: macos-latest
+            target: aarch64-apple-darwin
+            extra: ''
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: crates/music_stream_napi/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install Node dependencies
+        working-directory: ${{ env.NAPI_DIR }}
+        run: npm ci
+      - name: Build release binding
+        working-directory: ${{ env.NAPI_DIR }}
+        shell: bash
+        run: npm run build -- --target ${{ matrix.target }} ${{ matrix.extra }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: binding-${{ matrix.target }}
+          path: crates/music_stream_napi/rhythm_streamer.*.node
+          if-no-files-found: error
+
+  test-bindings:
+    name: Test ${{ matrix.settings.target }} on Node ${{ matrix.node }}
+    needs: build-bindings
+    runs-on: ${{ matrix.settings.host }}
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 24]
+        settings:
+          - { host: ubuntu-latest, target: x86_64-unknown-linux-gnu, architecture: x64 }
+          - { host: windows-latest, target: x86_64-pc-windows-msvc, architecture: x64 }
+          - { host: macos-latest, target: x86_64-apple-darwin, architecture: x64 }
+          - { host: macos-latest, target: aarch64-apple-darwin, architecture: arm64 }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: ${{ matrix.settings.architecture }}
+          cache: npm
+          cache-dependency-path: crates/music_stream_napi/package-lock.json
+      - name: Install Node dependencies
+        working-directory: ${{ env.NAPI_DIR }}
+        run: npm ci
+      - uses: actions/download-artifact@v8
+        with:
+          name: binding-${{ matrix.settings.target }}
+          path: crates/music_stream_napi
+      - name: Type contract and binding tests
+        working-directory: ${{ env.NAPI_DIR }}
+        run: npx tsc --noEmit && npx vitest run

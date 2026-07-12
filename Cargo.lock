@@ -1006,18 +1006,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "music_stream_napi"
-version = "0.1.0"
-dependencies = [
- "lru",
- "music_stream",
- "napi",
- "napi-build",
- "napi-derive",
- "tokio",
-]
-
-[[package]]
 name = "napi"
 version = "3.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1499,6 +1487,18 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-streams",
  "web-sys",
+]
+
+[[package]]
+name = "rhythm_streamer"
+version = "0.1.0"
+dependencies = [
+ "lru",
+ "music_stream",
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "tokio",
 ]
 
 [[package]]

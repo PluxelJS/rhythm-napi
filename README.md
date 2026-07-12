@@ -1,6 +1,6 @@
-# Music Streamer
+# Rhythm NAPI
 
-Music Streamer 是面向 Node.js 宿主的 Rust 音频推流内核。它接收已经确定的音源和 RTP
+Rhythm NAPI 是面向 Node.js 宿主的 Rust 音频推流内核。它接收已经确定的音源和 RTP
 传输参数，把本地文件、有界 HTTP 音频或 live HTTP 音频统一解码为 48 kHz stereo PCM，
 编码为 20 ms Opus frame，并按实时节拍发送 RTP/RTCP。
 
@@ -59,13 +59,12 @@ docs/                      当前设计与使用契约
 cd crates/music_stream_napi
 npm ci
 npm run build
-npm pack --pack-destination ../../dist
+npm run create:npm
 ```
 
 `build` 始终生成经过 LTO 和 strip 的 release 原生库；`npm test` 使用单独的 debug 构建。
-tarball 包含 CommonJS loader、生成的 TypeScript 契约、README 和当前 target 的 `.node` 文件。
-原生产物与 OS/architecture/libc 绑定；新 target 必须在对应 toolchain/CI job 中重建，不能复用
-其他平台的 tarball。
+正式发布由 GitHub Actions 分 target 构建并通过 `napi artifacts`/`napi pre-publish` 组装主包和
+平台子包，详见 [发布契约](docs/releasing.md)。
 
 ## 验证
 

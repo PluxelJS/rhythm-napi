@@ -1,0 +1,34 @@
+{
+  "name": "@rhythm-app/streamer-darwin-x64",
+  "version": "0.1.0",
+  "cpu": [
+    "x64"
+  ],
+  "main": "rhythm_streamer.darwin-x64.node",
+  "files": [
+    "rhythm_streamer.darwin-x64.node"
+  ],
+  "description": "Low-latency audio decode, Opus encode, and RTP/RTCP streaming runtime for Node.js",
+  "keywords": [
+    "napi-rs",
+    "audio",
+    "opus",
+    "rtp",
+    "streaming"
+  ],
+  "license": "AGPL-3.0-or-later",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Kokoro-js/rhythm-napi.git"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "os": [
+    "darwin"
+  ]
+}

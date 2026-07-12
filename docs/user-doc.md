@@ -40,7 +40,7 @@ runtime 负责一次确定媒体执行：下载、解码、预载、Opus、RTP/R
 起点，只有实际 profile 和并发目标证明需要时才调整。
 
 ```ts
-import { Streamer } from '@music/streamer'
+import { Streamer } from '@rhythm-app/streamer'
 
 const streamer = new Streamer({
   maxStreams: 1_024,

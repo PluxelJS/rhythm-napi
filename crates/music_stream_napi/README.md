@@ -1,4 +1,8 @@
-# @music/streamer
+# @rhythm-app/streamer
+
+```sh
+npm install @rhythm-app/streamer
+```
 
 Rust N-API media runtime for decoding file, bounded HTTP, and live HTTP audio, encoding fixed
 48 kHz stereo Opus frames, and sending paced RTP/RTCP.
@@ -18,3 +22,6 @@ a colon. Media failure events expose the same code in their `code` field.
 
 The generated `index.d.ts` is the API reference. The repository documentation explains the ownership,
 latency, pause, retry, event, and resource-limit contracts in depth.
+
+Published releases use napi-rs platform packages for Linux x64 GNU, Windows x64, macOS x64, and
+macOS arm64. The main package contains no platform-specific binary.

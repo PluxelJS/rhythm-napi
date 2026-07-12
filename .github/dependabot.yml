@@ -1,0 +1,23 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      rust-dependencies:
+        patterns: ['*']
+  - package-ecosystem: npm
+    directory: /crates/music_stream_napi
+    schedule:
+      interval: weekly
+    groups:
+      node-dependencies:
+        patterns: ['*']
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ['*']
