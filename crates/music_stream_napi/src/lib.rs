@@ -25,6 +25,7 @@ use music_stream::{
 };
 
 type Result<T> = std::result::Result<T, Error>;
+const MAX_STATUS_BATCH_SIZE: usize = 4_096;
 
 #[derive(Clone, Debug)]
 enum RuntimeEntry {
@@ -154,6 +155,7 @@ impl Streamer {
         stream_id: &str,
     ) -> std::result::Result<StreamStatusOutput, MusicStreamError> {
         self.ensure_open()?;
+        StreamRuntime::validate_stream_id(stream_id)?;
         match self.runtimes.read().await.get(stream_id).cloned() {
             Some(RuntimeEntry::Active(runtime)) => {
                 return Ok(status_output(runtime.snapshot().await));
@@ -174,7 +176,15 @@ impl Streamer {
     }
 
     #[napi]
-    pub async fn get_statuses(&self, stream_ids: Vec<String>) -> Vec<StreamStatusBatchItemOutput> {
+    pub async fn get_statuses(
+        &self,
+        stream_ids: Vec<String>,
+    ) -> Result<Vec<StreamStatusBatchItemOutput>> {
+        if stream_ids.len() > MAX_STATUS_BATCH_SIZE {
+            return Err(to_napi_error(MusicStreamError::InvalidConfig(format!(
+                "status batch must not contain more than {MAX_STATUS_BATCH_SIZE} stream ids"
+            ))));
+        }
         let mut output = Vec::with_capacity(stream_ids.len());
         for stream_id in stream_ids {
             match self.get_status_inner(&stream_id).await {
@@ -194,7 +204,7 @@ impl Streamer {
                 }),
             }
         }
-        output
+        Ok(output)
     }
 
     #[napi]
@@ -276,6 +286,7 @@ impl Streamer {
     pub async fn stop_stream(&self, stream_id: String) -> Result<StreamStatusOutput> {
         let _lifecycle = self.lifecycle.read().await;
         self.ensure_open().map_err(to_napi_error)?;
+        StreamRuntime::validate_stream_id(&stream_id).map_err(to_napi_error)?;
         let runtime = {
             let mut runtimes = self.runtimes.write().await;
             match runtimes.get(&stream_id) {
@@ -306,6 +317,9 @@ impl Streamer {
 
     #[napi]
     pub fn drain_events(&self, stream_id: Option<String>) -> Result<Vec<StreamEventOutput>> {
+        if let Some(stream_id) = stream_id.as_deref() {
+            StreamRuntime::validate_stream_id(stream_id).map_err(to_napi_error)?;
+        }
         Ok(self
             .events
             .drain(stream_id.as_deref())?
@@ -437,6 +451,7 @@ impl Streamer {
     async fn command(&self, stream_id: &str, command: StreamCommand) -> Result<StreamStatusOutput> {
         let _lifecycle = self.lifecycle.read().await;
         self.ensure_open().map_err(to_napi_error)?;
+        StreamRuntime::validate_stream_id(stream_id).map_err(to_napi_error)?;
         let runtime = match self.runtimes.read().await.get(stream_id).cloned() {
             Some(RuntimeEntry::Active(runtime)) => runtime,
             Some(RuntimeEntry::Starting) => {

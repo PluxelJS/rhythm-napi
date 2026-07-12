@@ -1,0 +1,20 @@
+# @music/streamer
+
+Rust N-API media runtime for decoding file, bounded HTTP, and live HTTP audio, encoding fixed
+48 kHz stereo Opus frames, and sending paced RTP/RTCP.
+
+Create one long-lived `Streamer` per media process. A `streamId` owns one persistent RTP session;
+seek, switch, and next promotion replace media generations without resetting SSRC, RTP sequence, or
+timestamp. Playlist policy, provider authentication, URL refresh, and gateway negotiation remain in
+the Node host.
+
+Bounded HTTP sources can start playback before the response completes. Give signed URLs without an
+extension an accurate `formatHint`. Live sources are current-only and do not support pause, seek, or
+next preload because the runtime deliberately has no implicit timeshift store.
+
+All lifecycle methods return Promises. Await `shutdown()` before process exit; shutdown is idempotent
+and permanently closes the instance. Promise errors begin with a stable media error code followed by
+a colon. Media failure events expose the same code in their `code` field.
+
+The generated `index.d.ts` is the API reference. The repository documentation explains the ownership,
+latency, pause, retry, event, and resource-limit contracts in depth.

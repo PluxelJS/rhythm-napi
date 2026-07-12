@@ -247,13 +247,15 @@ metadata并显式应用建议；当前 runtime 不扫描 EBU R128，也不会自
 
 ## 错误恢复
 
-Promise rejection 的 message 以稳定 code 开头，异步媒体错误事件也带 code。按恢复含义处理：
+Promise rejection 的 message 以稳定 code 和冒号开头，异步媒体错误事件也带同一套结构化
+code。这是 napi-rs Tokio Promise 边界的明确契约：宿主只取第一个冒号前的 code 做恢复分类，
+其余 message 只用于诊断：
 
 | Code | 宿主建议 |
 | --- | --- |
 | `SOURCE_AUTH_EXPIRED` | 获取同 ID 新 URL并 refresh；失败则按 playlist 策略跳过 |
 | `SOURCE_TIMEOUT` | 根据 provider/节点策略有限重试或切换，不在紧循环重启 |
-| `INVALID_SOURCE`, `UNSUPPORTED_FORMAT`, `DECODE_ERROR` | 标记本次 source不可用，选择下一首或上报内容问题 |
+| `INVALID_SOURCE`, `DECODE_ERROR` | 标记本次 source不可用，选择下一首或上报内容问题 |
 | `NOT_SEEKABLE`, `UNSUPPORTED` | 修正产品操作，不把它当网络重试 |
 | `RTP_SEND_ERROR` | 检查 gateway/session；通常需要重建外部连接，而非重试同一 packet |
 | `BUSY` | 等待正在进行的生命周期操作完成，避免并发重复命令 |
@@ -283,6 +285,7 @@ sender lateness 和 Node event-loop delay，再调整最接近瓶颈的一层。
 命令按 stream 串行化，但宿主仍应避免对同一 stream 同时发出相互矛盾的 pause/resume/switch/stop。
 以每个 Promise 的返回 status作为该操作提交后的快照。批量 status 适合监控，不应作为高频播放时钟；
 `timePlayedMs` 表示已发送或为实时追赶而跳过的媒体位置，不是 wall-clock 计时器。
+单次批量查询最多接受 4096 个 ID，所有 stream ID 都必须是 1..512 bytes 的非空字符串。
 
 stop 后保留最近的轻量 stopped status，因此重复 stop/status 可以用于收敛。该历史是容量等于
 `maxStreams` 的 LRU，旧 ID 会被淘汰，不是持久存储。新的 start 可以复用已停止的 `streamId`；

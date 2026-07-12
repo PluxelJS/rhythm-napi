@@ -19,8 +19,10 @@
     }
   },
   "scripts": {
-    "build": "napi build --platform",
-    "test": "npm run build && tsc --noEmit && vitest run"
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "prepack": "npm run build",
+    "test": "npm run build:debug && tsc --noEmit && vitest run"
   },
   "devDependencies": {
     "@napi-rs/cli": "3.7.2",
@@ -32,7 +34,7 @@
     "binaryName": "music_streamer"
   },
   "engines": {
-    "node": ">=24.17.0 <26"
+    "node": ">=20"
   },
   "packageManager": "npm@11.17.0"
 }

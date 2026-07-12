@@ -53,6 +53,20 @@ crates/music_stream_napi/  Node 类型转换、Promise 边界和事件桥接
 docs/                      当前设计与使用契约
 ```
 
+## N-API 包
+
+```sh
+cd crates/music_stream_napi
+npm ci
+npm run build
+npm pack --pack-destination ../../dist
+```
+
+`build` 始终生成经过 LTO 和 strip 的 release 原生库；`npm test` 使用单独的 debug 构建。
+tarball 包含 CommonJS loader、生成的 TypeScript 契约、README 和当前 target 的 `.node` 文件。
+原生产物与 OS/architecture/libc 绑定；新 target 必须在对应 toolchain/CI job 中重建，不能复用
+其他平台的 tarball。
+
 ## 验证
 
 ```sh

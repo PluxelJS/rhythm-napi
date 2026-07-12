@@ -18,6 +18,19 @@ import {
   waitForStatus,
 } from './helpers'
 
+test('status queries enforce bounded validated stream identifiers', async () => {
+  const streamer = new Streamer()
+  try {
+    await expect(streamer.getStatus(' '.repeat(8))).rejects.toThrow(/INVALID_CONFIG.*stream id/i)
+    await expect(streamer.getStatuses(
+      Array.from({ length: 4_097 }, (_, index) => `stream-${index}`),
+    )).rejects.toThrow(/INVALID_CONFIG.*4096/i)
+    expect(() => streamer.drainEvents('x'.repeat(513))).toThrow(/INVALID_CONFIG.*stream id/i)
+  } finally {
+    await streamer.shutdown()
+  }
+})
+
 test('all lifecycle methods are asynchronous and RTP remains monotonic across switch', async () => {
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'music-runtime-'))
   const firstPath = path.join(directory, 'first.wav')

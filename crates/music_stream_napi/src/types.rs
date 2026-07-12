@@ -18,6 +18,7 @@ pub struct RuntimeResourceLimitsInput {
 #[napi(object)]
 pub struct TrackSourceInput {
     pub id: String,
+    #[napi(ts_type = "'file' | 'url' | 'live'")]
     pub kind: String,
     pub url: Option<String>,
     pub path: Option<String>,
@@ -31,6 +32,7 @@ pub struct StreamStatusOutput {
     pub stream_id: String,
     pub current: Option<TrackSourceOutput>,
     pub next: Option<TrackSourceOutput>,
+    #[napi(ts_type = "'idle' | 'buffering' | 'playing' | 'paused' | 'stopped'")]
     pub play_state: String,
     pub time_played_ms: i64,
     pub generation: i64,
@@ -45,6 +47,9 @@ pub struct StreamStatusBatchItemOutput {
     pub stream_id: String,
     pub ok: bool,
     pub status: Option<StreamStatusOutput>,
+    #[napi(
+        ts_type = "'INVALID_SOURCE' | 'SOURCE_TIMEOUT' | 'SOURCE_AUTH_EXPIRED' | 'NOT_SEEKABLE' | 'DECODE_ERROR' | 'RESAMPLE_ERROR' | 'ENCODE_ERROR' | 'RTP_SEND_ERROR' | 'STREAM_CLOSED' | 'BUSY' | 'INTERNAL' | 'STREAM_NOT_FOUND' | 'STREAM_ALREADY_EXISTS' | 'INVALID_CONFIG' | 'UNSUPPORTED'"
+    )]
     pub code: Option<String>,
     pub message: Option<String>,
 }
@@ -53,6 +58,7 @@ pub struct StreamStatusBatchItemOutput {
 #[napi(object)]
 pub struct TrackSourceOutput {
     pub id: String,
+    #[napi(ts_type = "'file' | 'url' | 'live'")]
     pub kind: String,
     pub format_hint: Option<String>,
     pub seekable: Option<bool>,
@@ -62,9 +68,13 @@ pub struct TrackSourceOutput {
 #[napi(object)]
 pub struct StreamEventOutput {
     pub sequence: i64,
+    #[napi(
+        ts_type = "'streamStarted' | 'streamStopped' | 'stateChanged' | 'nextNeeded' | 'sourceRefreshNeeded' | 'networkQualityChanged' | 'error'"
+    )]
     pub r#type: String,
     pub stream_id: Option<String>,
     pub track_id: Option<String>,
+    #[napi(ts_type = "'good' | 'degraded' | 'poor'")]
     pub quality: Option<String>,
     pub quality_samples: Option<u32>,
     pub latest_loss_percent: Option<f64>,
@@ -74,6 +84,9 @@ pub struct StreamEventOutput {
     pub max_jitter_ms: Option<f64>,
     pub average_round_trip_time_ms: Option<f64>,
     pub max_round_trip_time_ms: Option<f64>,
+    #[napi(
+        ts_type = "'INVALID_SOURCE' | 'SOURCE_TIMEOUT' | 'SOURCE_AUTH_EXPIRED' | 'NOT_SEEKABLE' | 'DECODE_ERROR' | 'RESAMPLE_ERROR' | 'ENCODE_ERROR' | 'RTP_SEND_ERROR' | 'STREAM_CLOSED' | 'BUSY' | 'INTERNAL' | 'STREAM_NOT_FOUND' | 'STREAM_ALREADY_EXISTS' | 'INVALID_CONFIG' | 'UNSUPPORTED'"
+    )]
     pub code: Option<String>,
     pub message: Option<String>,
     pub status: Option<StreamStatusOutput>,
@@ -102,6 +115,7 @@ pub struct RtcpReceiverReportOutput {
 #[derive(Debug)]
 #[napi(object)]
 pub struct ReplayGainInput {
+    #[napi(ts_type = "'track' | 'album'")]
     pub mode: Option<String>,
     pub track_gain_db: Option<f64>,
     pub album_gain_db: Option<f64>,
@@ -116,6 +130,7 @@ pub struct ReplayGainInput {
 #[derive(Debug)]
 #[napi(object)]
 pub struct ReplayGainRecommendationOutput {
+    #[napi(ts_type = "'track' | 'album'")]
     pub source: String,
     pub gain_db: f64,
     pub requested_gain_db: f64,
