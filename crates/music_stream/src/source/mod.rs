@@ -32,7 +32,7 @@ const HTTP_SOURCE_RETRY_BACKOFF: Duration = Duration::from_millis(250);
 const DEFAULT_ARTIFACT_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const TEMPFILE_QUOTA_BYTES: u64 = 1024 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HttpSourceConfig {
     pub io_timeout: Duration,
     pub max_bytes: u64,
@@ -105,7 +105,14 @@ impl SourceArtifactCache {
     }
 
     #[must_use]
-    fn get(&mut self, key: &str) -> Option<SourceArtifact> {
+    fn get(&mut self, key: &str, max_bytes: u64) -> Option<SourceArtifact> {
+        if !self
+            .entries
+            .peek(key)
+            .is_some_and(|artifact| artifact.len_bytes <= max_bytes)
+        {
+            return None;
+        }
         self.entries.get(key).cloned()
     }
 
@@ -144,6 +151,32 @@ pub type SharedSourceArtifactCache = Arc<Mutex<SourceArtifactCache>>;
 #[derive(Debug, Default)]
 pub struct SourceDownloadRegistry {
     flights: Mutex<HashMap<String, Weak<SharedUrlFlight>>>,
+    prune_counter: AtomicU64,
+}
+
+impl SourceDownloadRegistry {
+    fn prune_dead_if_due(&self, flights: &mut HashMap<String, Weak<SharedUrlFlight>>) {
+        if self
+            .prune_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(64)
+        {
+            flights.retain(|_, flight| flight.strong_count() > 0);
+        }
+    }
+}
+
+fn download_flight_key(source: &TrackSource, config: &HttpSourceConfig) -> String {
+    let stable_key = source.stable_key();
+    format!(
+        "{}:{stable_key}:{}:{:?}:{}:{:?}:{}",
+        stable_key.len(),
+        config.max_bytes,
+        config.io_timeout,
+        config.max_retries,
+        config.retry_backoff,
+        config.cache_temp_files,
+    )
 }
 
 pub type SharedSourceDownloadRegistry = Arc<SourceDownloadRegistry>;
@@ -165,7 +198,7 @@ pub(crate) struct SharedUrlFlight {
     terminal: watch::Sender<Option<Result<SourceArtifact>>>,
     subscribers: Mutex<SubscriberState>,
     next_subscriber_id: AtomicU64,
-    current_priority: watch::Sender<bool>,
+    pub(crate) current_priority: watch::Sender<bool>,
     pub(crate) transfer_gate: Arc<PauseGate>,
     cancellation: CancellationToken,
     task: Mutex<Option<SharedUrlTask>>,
@@ -233,6 +266,18 @@ impl SharedUrlFlight {
             .expect("shared URL subscriber lock poisoned");
         if let Some(state) = subscribers.subscribers.get_mut(&subscriber_id) {
             state.paused = paused;
+        }
+        drop(subscribers);
+        self.apply_aggregate_state();
+    }
+
+    fn promote_to_current(&self, subscriber_id: u64) {
+        let mut subscribers = self
+            .subscribers
+            .lock()
+            .expect("shared URL subscriber lock poisoned");
+        if let Some(state) = subscribers.subscribers.get_mut(&subscriber_id) {
+            state.current = true;
         }
         drop(subscribers);
         self.apply_aggregate_state();
@@ -323,6 +368,12 @@ impl SharedUrlControl {
     pub(crate) fn resume(&self) {
         if let Some(flight) = self.flight.upgrade() {
             flight.set_paused(self.subscriber_id, false);
+        }
+    }
+
+    pub(crate) fn promote_to_current(&self) {
+        if let Some(flight) = self.flight.upgrade() {
+            flight.promote_to_current(self.subscriber_id);
         }
     }
 }
@@ -560,7 +611,7 @@ impl FileSourceResolver {
             .cache
             .lock()
             .map_err(|_| MusicStreamError::Internal("source cache poisoned".to_owned()))?
-            .get(key)
+            .get(key, self.config.http.max_bytes)
         {
             metrics::counter!("music_stream.source.cache_hit").increment(1);
             return Ok(hit);
@@ -583,7 +634,7 @@ impl FileSourceResolver {
             .cache
             .lock()
             .map_err(|_| MusicStreamError::Internal("source cache poisoned".to_owned()))?
-            .get(key)
+            .get(key, self.config.http.max_bytes)
         {
             metrics::counter!("music_stream.source.cache_hit").increment(1);
             return Ok(UrlPlaybackSource::Cached(hit));
@@ -604,18 +655,19 @@ impl FileSourceResolver {
     }
 
     fn shared_url_flight(&self, source: &TrackSource) -> Result<Arc<SharedUrlFlight>> {
-        let key = source.stable_key();
+        let key = download_flight_key(source, &self.config.http);
         let (flight, created) = {
             let mut flights = self.resources.downloads.flights.lock().map_err(|_| {
                 MusicStreamError::Internal("source download registry poisoned".to_owned())
             })?;
-            if let Some(flight) = flights.get(key).and_then(Weak::upgrade) {
+            self.resources.downloads.prune_dead_if_due(&mut flights);
+            if let Some(flight) = flights.get(&key).and_then(Weak::upgrade) {
                 metrics::counter!("music_stream.source.shared_download_followers").increment(1);
                 (flight, false)
             } else {
-                flights.remove(key);
+                flights.remove(&key);
                 let flight = SharedUrlFlight::new();
-                flights.insert(key.to_owned(), Arc::downgrade(&flight));
+                flights.insert(key, Arc::downgrade(&flight));
                 (flight, true)
             }
         };
@@ -800,7 +852,7 @@ async fn run_shared_url_transfer(
         .cache
         .lock()
         .map_err(|_| MusicStreamError::Internal("source cache poisoned".to_owned()))?
-        .get(source.stable_key())
+        .get(source.stable_key(), config.max_bytes)
     {
         metrics::counter!("music_stream.source.cache_hit_after_wait").increment(1);
         return Ok(hit);
@@ -1191,6 +1243,12 @@ async fn download_http_artifact_once(
     if !gate.wait_async(cancellation).await {
         return Err(HttpAttemptError::terminal(cancelled_transfer()));
     }
+    let request_started = Instant::now();
+    let transfer_mode = if reader_sender.is_some() {
+        "progressive"
+    } else {
+        "artifact"
+    };
     let response = {
         let response = client.get(url).send();
         tokio::pin!(response);
@@ -1219,16 +1277,20 @@ async fn download_http_artifact_once(
     let mut response = response
         .error_for_status()
         .map_err(HttpAttemptError::from_http)?;
-    if response
-        .content_length()
-        .is_some_and(|length| length > config.max_bytes)
-    {
+    metrics::histogram!(
+        "music_stream.source.http_open_us",
+        "mode" => transfer_mode
+    )
+    .record(request_started.elapsed().as_micros() as f64);
+    let declared_length = response.content_length();
+    if declared_length.is_some_and(|length| length > config.max_bytes) {
         return Err(HttpAttemptError::terminal(MusicStreamError::InvalidSource(
             "HTTP source exceeds configured byte limit".to_owned(),
         )));
     }
 
-    let suffix = source_suffix(url);
+    let suffix = source_suffix(source, url);
+    let tempfile_started = Instant::now();
     let named =
         tokio::task::spawn_blocking(move || tempfile::Builder::new().suffix(&suffix).tempfile())
             .await
@@ -1240,18 +1302,29 @@ async fn download_http_artifact_once(
             .map_err(|error| {
                 HttpAttemptError::terminal(MusicStreamError::InvalidSource(error.to_string()))
             })?;
+    metrics::histogram!(
+        "music_stream.source.tempfile_create_us",
+        "mode" => transfer_mode
+    )
+    .record(tempfile_started.elapsed().as_micros() as f64);
     let (std_file, temp_path) = named.into_parts();
     let path = temp_path.to_path_buf();
     let cleanup = Arc::new(TempArtifactCleanup::new(temp_path, quota));
+    if let Some(declared_length) = declared_length {
+        cleanup.shrink_quota_to(declared_length);
+    }
     let progressive_reader_published = reader_sender.is_some();
     let mut file = if let Some(sender) = reader_sender {
         let (writer, spool) = growing_spool(std_file, path.clone(), Arc::clone(&cleanup));
         sender.send_replace(Some(spool));
+        metrics::histogram!("music_stream.source.http_to_spool_ready_us")
+            .record(request_started.elapsed().as_micros() as f64);
         ArtifactFileWriter::Growing(writer)
     } else {
         ArtifactFileWriter::File(tokio::fs::File::from_std(std_file))
     };
     let mut length = 0_u64;
+    let mut first_body_byte_recorded = false;
     loop {
         if !gate.wait_async(cancellation).await {
             return Err(HttpAttemptError::terminal(cancelled_transfer()));
@@ -1289,7 +1362,21 @@ async fn download_http_artifact_once(
         let Some(chunk) = chunk else {
             break;
         };
+        if !first_body_byte_recorded && !chunk.is_empty() {
+            metrics::histogram!(
+                "music_stream.source.http_first_body_byte_us",
+                "mode" => transfer_mode
+            )
+            .record(request_started.elapsed().as_micros() as f64);
+            first_body_byte_recorded = true;
+        }
         length = length.saturating_add(chunk.len().try_into().unwrap_or(u64::MAX));
+        if declared_length.is_some_and(|declared| length > declared) {
+            return Err(HttpAttemptError::terminal(MusicStreamError::InvalidSource(
+                "HTTP source exceeds its declared Content-Length".to_owned(),
+            ))
+            .after_bytes(length > chunk.len() as u64 || progressive_reader_published));
+        }
         if length > config.max_bytes {
             return Err(HttpAttemptError::terminal(MusicStreamError::InvalidSource(
                 "HTTP source exceeds configured byte limit".to_owned(),
@@ -1320,7 +1407,14 @@ async fn download_http_artifact_once(
     })
 }
 
-fn source_suffix(url: &str) -> String {
+fn source_suffix(source: &TrackSource, url: &str) -> String {
+    if let Some(hint) = source.format_hint.as_deref()
+        && !hint.is_empty()
+        && hint.len() <= 16
+        && hint.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return format!(".{hint}");
+    }
     let path = url.split(['?', '#']).next().unwrap_or(url);
     Path::new(path)
         .extension()
@@ -1375,14 +1469,20 @@ fn cancelled_transfer() -> MusicStreamError {
 
 fn map_http_error(error: reqwest::Error) -> MusicStreamError {
     if error.is_timeout() {
-        MusicStreamError::SourceTimeout(error.to_string())
+        MusicStreamError::SourceTimeout("HTTP source request timed out".to_owned())
     } else if error
         .status()
         .is_some_and(|status| matches!(status.as_u16(), 401 | 403))
     {
-        MusicStreamError::SourceAuthExpired(error.to_string())
+        MusicStreamError::SourceAuthExpired("HTTP source authorization failed".to_owned())
+    } else if let Some(status) = error.status() {
+        MusicStreamError::InvalidSource(format!("HTTP source returned status {}", status.as_u16()))
+    } else if error.is_connect() {
+        MusicStreamError::InvalidSource("HTTP source connection failed".to_owned())
+    } else if error.is_body() || error.is_decode() {
+        MusicStreamError::InvalidSource("HTTP source body failed".to_owned())
     } else {
-        MusicStreamError::InvalidSource(error.to_string())
+        MusicStreamError::InvalidSource("HTTP source request failed".to_owned())
     }
 }
 
@@ -1407,14 +1507,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn download_registry_periodically_prunes_dead_flight_keys() {
+        let registry = SourceDownloadRegistry::default();
+        let flight = SharedUrlFlight::new();
+        registry
+            .flights
+            .lock()
+            .expect("registry")
+            .insert("expired".to_owned(), Arc::downgrade(&flight));
+        drop(flight);
+        registry.prune_counter.store(64, Ordering::Relaxed);
+
+        let mut flights = registry.flights.lock().expect("registry");
+        registry.prune_dead_if_due(&mut flights);
+        assert!(flights.is_empty());
+    }
+
+    #[test]
+    fn download_flights_are_isolated_by_transfer_policy() {
+        let source = url_source("https://example.test/audio.mp3".to_owned());
+        let first = HttpSourceConfig::default();
+        let mut second = first.clone();
+        second.max_bytes /= 2;
+
+        assert_ne!(
+            download_flight_key(&source, &first),
+            download_flight_key(&source, &second)
+        );
+        assert_eq!(
+            download_flight_key(&source, &first),
+            download_flight_key(&source, &first)
+        );
+    }
+
+    #[test]
     fn artifact_cache_evicts_lru_entries_by_total_bytes() {
         let mut cache = SourceArtifactCache::new(10);
         assert!(cache.insert(test_artifact("first", 6)));
         assert!(cache.insert(test_artifact("second", 5)));
 
         assert_eq!(cache.total_bytes, 5);
-        assert!(cache.get("first").is_none());
-        assert_eq!(cache.get("second").expect("cached").len_bytes, 5);
+        assert!(cache.get("first", u64::MAX).is_none());
+        assert_eq!(cache.get("second", u64::MAX).expect("cached").len_bytes, 5);
+    }
+
+    #[test]
+    fn artifact_cache_hit_respects_the_callers_byte_limit() {
+        let mut cache = SourceArtifactCache::new(10);
+        assert!(cache.insert(test_artifact("entry", 6)));
+
+        assert!(cache.get("entry", 5).is_none());
+        assert_eq!(cache.get("entry", 6).expect("within limit").len_bytes, 6);
     }
 
     #[test]
@@ -1426,9 +1569,9 @@ mod tests {
 
         assert_eq!(cache.max_bytes, 10);
         assert_eq!(cache.total_bytes, 0);
-        assert!(cache.get("entry").is_none());
+        assert!(cache.get("entry", u64::MAX).is_none());
         assert_eq!(taken.total_bytes, 4);
-        assert!(taken.get("entry").is_some());
+        assert!(taken.get("entry", u64::MAX).is_some());
     }
 
     #[tokio::test]
@@ -1442,6 +1585,7 @@ mod tests {
             kind: TrackKind::File,
             url: None,
             path: Some(file.path().display().to_string()),
+            format_hint: None,
             seekable: Some(true),
         };
         let artifact = resolve_local_file(&source).await.expect("resolve");
@@ -1509,6 +1653,30 @@ mod tests {
 
         assert!(!filesystem_path.exists());
         assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn declared_content_length_releases_excess_worst_case_quota_early() {
+        let budget = Arc::new(Semaphore::new(8));
+        let quota = acquire_tempfile_quota(
+            Arc::clone(&budget),
+            8 * TEMPFILE_QUOTA_BYTES,
+            &PauseGate::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("quota");
+        assert_eq!(budget.available_permits(), 0);
+        let named = tempfile::NamedTempFile::new().expect("tempfile");
+        let (_file, path) = named.into_parts();
+        let cleanup = TempArtifactCleanup::new(path, quota);
+
+        cleanup.shrink_quota_to(TEMPFILE_QUOTA_BYTES);
+        assert_eq!(budget.available_permits(), 7);
+
+        drop(cleanup);
+        flush_temp_cleanup().await.expect("cleanup");
+        assert_eq!(budget.available_permits(), 8);
     }
 
     #[tokio::test]
@@ -2026,6 +2194,7 @@ mod tests {
             kind: TrackKind::Url,
             url: Some(url),
             path: None,
+            format_hint: None,
             seekable: Some(true),
         }
     }

@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -28,15 +29,17 @@ pub(super) struct SenderHandle {
 
 #[derive(Debug)]
 struct SenderTask {
-    join: Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
+    supervisor: Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
+    worker_abort: tokio::task::AbortHandle,
 }
 
 impl Drop for SenderTask {
     fn drop(&mut self) {
-        if let Ok(slot) = self.join.get_mut()
-            && let Some(task) = slot.take()
+        self.worker_abort.abort();
+        if let Ok(slot) = self.supervisor.get_mut()
+            && let Some(supervisor) = slot.take()
         {
-            task.abort();
+            supervisor.abort();
         }
     }
 }
@@ -77,7 +80,8 @@ impl SenderHandle {
         };
         let (commands, command_rx) = mpsc::channel(32);
         let (progress_tx, progress) = watch::channel(StreamRuntimeProgress::default());
-        let task = tokio::spawn(run_sender(
+        let active_generation = Arc::new(AtomicU64::new(0));
+        let worker = tokio::spawn(run_sender(
             socket,
             rtcp_socket,
             SenderRuntime {
@@ -87,14 +91,18 @@ impl SenderHandle {
                 rtcp_interval,
                 commands: command_rx,
                 progress: progress_tx,
-                events,
+                events: events.clone(),
             },
+            Arc::clone(&active_generation),
         ));
+        let worker_abort = worker.abort_handle();
+        let supervisor = supervise_sender(worker, active_generation, events);
         Ok(Self {
             commands,
             progress,
             task: Arc::new(SenderTask {
-                join: Mutex::new(Some(task)),
+                supervisor: Mutex::new(Some(supervisor)),
+                worker_abort,
             }),
         })
     }
@@ -141,28 +149,33 @@ impl SenderHandle {
             .await;
         let task = self
             .task
-            .join
+            .supervisor
             .lock()
             .map_err(|_| MusicStreamError::Internal("sender task lock poisoned".to_owned()))?
             .take();
         let task_result = match task {
-            Some(mut task) => match tokio::time::timeout(SENDER_STOP_TIMEOUT, &mut task).await {
-                Ok(Ok(result)) => result,
-                Ok(Err(error)) => Err(MusicStreamError::Internal(format!(
-                    "RTP sender task failed: {error}"
-                ))),
-                Err(_) => {
-                    task.abort();
-                    let _ = task.await;
-                    Err(MusicStreamError::Internal(
-                        "RTP sender did not stop within 2 seconds".to_owned(),
-                    ))
+            Some(mut supervisor) => {
+                match tokio::time::timeout(SENDER_STOP_TIMEOUT, &mut supervisor).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(error)) => Err(MusicStreamError::Internal(format!(
+                        "RTP sender supervisor failed: {error}"
+                    ))),
+                    Err(_) => {
+                        self.task.worker_abort.abort();
+                        supervisor.abort();
+                        let _ = supervisor.await;
+                        Err(MusicStreamError::Internal(
+                            "RTP sender did not stop within 2 seconds".to_owned(),
+                        ))
+                    }
                 }
-            },
+            }
             None => Ok(()),
         };
-        command_result?;
-        task_result
+        match (command_result, task_result) {
+            (_, Err(error)) | (Err(error), Ok(())) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     }
 
     async fn request(
@@ -188,6 +201,34 @@ impl SenderHandle {
             )
         })?
     }
+}
+
+fn supervise_sender(
+    worker: tokio::task::JoinHandle<Result<()>>,
+    active_generation: Arc<AtomicU64>,
+    events: mpsc::Sender<WorkerEvent>,
+) -> tokio::task::JoinHandle<Result<()>> {
+    tokio::spawn(async move {
+        let result = match worker.await {
+            Ok(result) => result,
+            Err(error) => Err(MusicStreamError::Internal(format!(
+                "RTP sender task failed: {error}"
+            ))),
+        };
+        if let Err(error) = &result {
+            let generation = active_generation.load(Ordering::Acquire);
+            if generation != 0 {
+                let _ = events
+                    .send(WorkerEvent::CurrentFailed {
+                        generation,
+                        code: error.code(),
+                        message: error.to_string(),
+                    })
+                    .await;
+            }
+        }
+        result
+    })
 }
 
 #[derive(Debug)]
@@ -226,6 +267,7 @@ struct ActiveMedia {
     deadline: Option<Instant>,
     media_sent_ms: u64,
     activation_started: Option<Instant>,
+    first_packet_started: Option<Instant>,
 }
 
 struct SenderRuntime {
@@ -242,6 +284,7 @@ async fn run_sender(
     socket: UdpSocket,
     rtcp_socket: Option<UdpSocket>,
     runtime: SenderRuntime,
+    active_generation: Arc<AtomicU64>,
 ) -> Result<()> {
     let SenderRuntime {
         config,
@@ -311,6 +354,7 @@ async fn run_sender(
             if media.receiver.is_drained() {
                 let generation = media.generation;
                 active = None;
+                active_generation.store(0, Ordering::Release);
                 emit_worker_event(
                     &events,
                     &mut pending_events,
@@ -330,6 +374,7 @@ async fn run_sender(
                 match command {
                     Some(SenderCommand::Activate { generation, start_position_ms, paused: initial_paused, receiver, reply }) => {
                         metrics::counter!("music_stream.runtime.sender_activations").increment(1);
+                        let activation_started = (!initial_paused).then(Instant::now);
                         active = Some(ActiveMedia {
                             generation,
                             start_position_ms,
@@ -339,14 +384,17 @@ async fn run_sender(
                             first_packet: true,
                             deadline: None,
                             media_sent_ms: 0,
-                            activation_started: (!initial_paused).then(Instant::now),
+                            activation_started,
+                            first_packet_started: activation_started,
                         });
+                        active_generation.store(generation, Ordering::Release);
                         paused = initial_paused;
                         let _ = reply.send(());
                     }
                     Some(SenderCommand::Deactivate { generation, reply }) => {
                         if active.as_ref().is_some_and(|media| media.generation == generation) {
                             active = None;
+                            active_generation.store(0, Ordering::Release);
                         }
                         let _ = reply.send(());
                     }
@@ -355,6 +403,7 @@ async fn run_sender(
                             paused = true;
                             if !media.started {
                                 media.activation_started = None;
+                                media.first_packet_started = None;
                             }
                         }
                         let _ = reply.send(());
@@ -364,12 +413,15 @@ async fn run_sender(
                             paused = false;
                             media.deadline = Some(Instant::now());
                             if !media.started {
-                                media.activation_started = Some(Instant::now());
+                                let activation_started = Instant::now();
+                                media.activation_started = Some(activation_started);
+                                media.first_packet_started = Some(activation_started);
                             }
                         }
                         let _ = reply.send(());
                     }
                     Some(SenderCommand::Shutdown { reply }) => {
+                        active_generation.store(0, Ordering::Release);
                         let _ = reply.send(());
                         return Ok(());
                     }
@@ -424,7 +476,8 @@ async fn run_sender(
                     media.deadline = None;
                     continue;
                 };
-                if media.first_packet {
+                let is_first_packet = media.first_packet;
+                if is_first_packet {
                     frame.marker = true;
                     media.first_packet = false;
                 }
@@ -444,6 +497,14 @@ async fn run_sender(
                             metrics::counter!("music_stream.runtime.rtp_packets").increment(1);
                             metrics::counter!("music_stream.runtime.rtp_bytes")
                                 .increment(sent as u64);
+                            if is_first_packet
+                                && let Some(started) = media.first_packet_started.take()
+                            {
+                                metrics::histogram!(
+                                    "music_stream.runtime.activation_to_first_packet_us"
+                                )
+                                .record(started.elapsed().as_micros() as f64);
+                            }
                             sequence = sequence.wrapping_add(1);
                             rtp_timestamp = rtp_timestamp.wrapping_add(samples);
                             media.media_sent_ms = media.media_sent_ms.saturating_add(duration_ms);
@@ -485,6 +546,7 @@ async fn run_sender(
                 if let Some(error) = send_failure {
                     let generation = media.generation;
                     active = None;
+                    active_generation.store(0, Ordering::Release);
                     emit_worker_event(
                         &events,
                         &mut pending_events,
@@ -654,6 +716,29 @@ mod tests {
     use super::*;
     use crate::audio::frame::OpusFrame;
     use crate::runtime::opus_queue;
+
+    #[tokio::test]
+    async fn sender_panic_is_published_for_the_active_generation() {
+        let active_generation = Arc::new(AtomicU64::new(42));
+        let (events, mut event_rx) = mpsc::channel(1);
+        let worker = tokio::spawn(async {
+            panic!("injected sender panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        let supervisor = supervise_sender(worker, active_generation, events);
+
+        let event = event_rx.recv().await.expect("sender failure event");
+        assert!(matches!(
+            event,
+            WorkerEvent::CurrentFailed {
+                generation: 42,
+                code: crate::ErrorCode::Internal,
+                ..
+            }
+        ));
+        assert!(supervisor.await.expect("supervisor").is_err());
+    }
 
     #[tokio::test]
     async fn activating_paused_media_never_sends_before_resume() {

@@ -1,6 +1,6 @@
 use std::io::Read;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
@@ -274,6 +274,7 @@ async fn run_http_live_stream(
             report.stopped = true;
             return Ok(report);
         }
+        let attempt_started = Instant::now();
         let response = tokio::select! {
             _ = cancellation.cancelled() => {
                 report.stopped = true;
@@ -282,7 +283,11 @@ async fn run_http_live_stream(
             response = open_live_response(&client, &url, config.open_timeout) => response,
         };
         let mut response = match response {
-            Ok(response) => response,
+            Ok(response) => {
+                metrics::histogram!("music_stream.source.live_http_open_us")
+                    .record(attempt_started.elapsed().as_micros() as f64);
+                response
+            }
             Err(error) if error.retryable && report.retries < config.max_retries => {
                 report.retries += 1;
                 metrics::counter!("music_stream.source.live_http_retries").increment(1);
@@ -311,6 +316,10 @@ async fn run_http_live_stream(
             };
             match chunk {
                 Ok(Ok(Some(bytes))) => {
+                    if report.bytes_read == 0 && !bytes.is_empty() {
+                        metrics::histogram!("music_stream.source.live_http_first_body_byte_us")
+                            .record(attempt_started.elapsed().as_micros() as f64);
+                    }
                     report.bytes_read = report
                         .bytes_read
                         .saturating_add(bytes.len().try_into().unwrap_or(u64::MAX));

@@ -58,6 +58,9 @@ pub(crate) fn runtime_resource_limits_from_input(
     let Some(input) = input else {
         return Ok(limits);
     };
+    if let Some(value) = input.max_streams {
+        limits.max_streams = value as usize;
+    }
     if let Some(value) = input.max_cpu_workers {
         limits.max_cpu_workers = value as usize;
     }
@@ -253,15 +256,31 @@ impl TryFrom<TrackSourceInput> for TrackSource {
             music_stream::TrackKind::Live => Some(false),
             music_stream::TrackKind::File | music_stream::TrackKind::Url => value.seekable,
         };
+        let format_hint = value
+            .format_hint
+            .map(|hint| normalize_format_hint(&hint))
+            .transpose()?;
 
         Ok(Self {
             id: value.id,
             kind,
             url: value.url,
             path: value.path,
+            format_hint,
             seekable,
         })
     }
+}
+
+fn normalize_format_hint(hint: &str) -> std::result::Result<String, MusicStreamError> {
+    let hint = hint.trim();
+    if hint.is_empty() || hint.len() > 16 || !hint.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Err(MusicStreamError::InvalidSource(
+            "formatHint must contain 1 to 16 ASCII letters or digits".to_owned(),
+        ));
+    }
+    Ok(hint.to_ascii_lowercase())
 }
 
 impl From<music_stream::StreamStatus> for StreamStatusOutput {
@@ -334,8 +353,7 @@ impl From<TrackSource> for TrackSourceOutput {
         Self {
             id: value.id,
             kind: kind.to_owned(),
-            url: value.url,
-            path: value.path,
+            format_hint: value.format_hint,
             seekable: value.seekable,
         }
     }
@@ -498,5 +516,35 @@ fn checked_f32(
             )));
         }
         Ok(value as f32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn track_format_hint_is_normalized_and_validated() {
+        let track = TrackSource::try_from(TrackSourceInput {
+            id: "opaque".to_owned(),
+            kind: "url".to_owned(),
+            url: Some("https://cdn.test/signed".to_owned()),
+            path: None,
+            format_hint: Some(" MP3 ".to_owned()),
+            seekable: None,
+        })
+        .expect("format hint");
+        assert_eq!(track.format_hint.as_deref(), Some("mp3"));
+
+        let error = TrackSource::try_from(TrackSourceInput {
+            id: "invalid".to_owned(),
+            kind: "url".to_owned(),
+            url: Some("https://cdn.test/signed".to_owned()),
+            path: None,
+            format_hint: Some("audio/mpeg".to_owned()),
+            seekable: None,
+        })
+        .expect_err("MIME types are not format hints");
+        assert_eq!(error.code(), music_stream::ErrorCode::InvalidSource);
     }
 }

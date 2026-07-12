@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
+use lru::LruCache;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
@@ -33,7 +36,8 @@ enum RuntimeEntry {
 pub struct Streamer {
     runtimes: Arc<tokio::sync::RwLock<HashMap<String, RuntimeEntry>>>,
     lifecycle: tokio::sync::RwLock<()>,
-    inactive: Arc<tokio::sync::RwLock<HashMap<String, StreamStatusOutput>>>,
+    inactive: Arc<tokio::sync::RwLock<LruCache<String, StreamStatusOutput>>>,
+    closed: AtomicBool,
     resources: Arc<RuntimeResources>,
     events: EventQueue,
     event_callback: Arc<RwLock<Option<EventCallback>>>,
@@ -45,10 +49,13 @@ impl Streamer {
     pub fn new(options: Option<RuntimeResourceLimitsInput>) -> Result<Self> {
         let limits = runtime_resource_limits_from_input(options).map_err(to_napi_error)?;
         let resources = RuntimeResources::new(limits).map_err(to_napi_error)?;
+        let inactive_capacity = NonZeroUsize::new(resources.limits().max_streams)
+            .expect("validated stream limit is non-zero");
         Ok(Self {
             runtimes: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             lifecycle: tokio::sync::RwLock::new(()),
-            inactive: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            inactive: Arc::new(tokio::sync::RwLock::new(LruCache::new(inactive_capacity))),
+            closed: AtomicBool::new(false),
             resources: Arc::new(resources),
             events: EventQueue::default(),
             event_callback: Arc::new(RwLock::new(None)),
@@ -58,7 +65,9 @@ impl Streamer {
     #[napi]
     pub async fn start_stream(&self, options: StartStreamInput) -> Result<StreamStatusOutput> {
         let _lifecycle = self.lifecycle.read().await;
+        self.ensure_open().map_err(to_napi_error)?;
         let stream_id = options.stream_id;
+        StreamRuntime::validate_stream_id(&stream_id).map_err(to_napi_error)?;
         let current = TrackSource::try_from(options.current).map_err(to_napi_error)?;
         let next = options
             .next
@@ -80,8 +89,14 @@ impl Streamer {
                     stream_id,
                 )));
             }
+            if runtimes.len() >= self.resources.limits().max_streams {
+                return Err(to_napi_error(MusicStreamError::Busy(format!(
+                    "stream limit {} is exhausted",
+                    self.resources.limits().max_streams
+                ))));
+            }
             runtimes.insert(stream_id.clone(), RuntimeEntry::Starting);
-            self.inactive.write().await.remove(&stream_id);
+            self.inactive.write().await.pop(&stream_id);
         }
         let events = self.events.clone();
         let callback = Arc::clone(&self.event_callback);
@@ -129,30 +144,40 @@ impl Streamer {
 
     #[napi]
     pub async fn get_status(&self, stream_id: String) -> Result<StreamStatusOutput> {
-        match self.runtimes.read().await.get(&stream_id).cloned() {
+        self.get_status_inner(&stream_id)
+            .await
+            .map_err(to_napi_error)
+    }
+
+    async fn get_status_inner(
+        &self,
+        stream_id: &str,
+    ) -> std::result::Result<StreamStatusOutput, MusicStreamError> {
+        self.ensure_open()?;
+        match self.runtimes.read().await.get(stream_id).cloned() {
             Some(RuntimeEntry::Active(runtime)) => {
                 return Ok(status_output(runtime.snapshot().await));
             }
             Some(RuntimeEntry::Starting) => {
-                return Err(to_napi_error(MusicStreamError::Busy(format!(
+                return Err(MusicStreamError::Busy(format!(
                     "stream {stream_id} is still starting"
-                ))));
+                )));
             }
             None => {}
         }
         self.inactive
-            .read()
+            .write()
             .await
-            .get(&stream_id)
+            .get(stream_id)
             .cloned()
-            .ok_or_else(|| to_napi_error(MusicStreamError::StreamNotFound(stream_id)))
+            .ok_or_else(|| MusicStreamError::StreamNotFound(stream_id.to_owned()))
     }
 
     #[napi]
     pub async fn get_statuses(&self, stream_ids: Vec<String>) -> Vec<StreamStatusBatchItemOutput> {
         let mut output = Vec::with_capacity(stream_ids.len());
         for stream_id in stream_ids {
-            match self.get_status(stream_id.clone()).await {
+            match self.get_status_inner(&stream_id).await {
                 Ok(status) => output.push(StreamStatusBatchItemOutput {
                     stream_id,
                     ok: true,
@@ -164,8 +189,8 @@ impl Streamer {
                     stream_id,
                     ok: false,
                     status: None,
-                    code: Some("INTERNAL".to_owned()),
-                    message: Some(error.reason.clone()),
+                    code: Some(error.code().as_str().to_owned()),
+                    message: Some(error.to_string()),
                 }),
             }
         }
@@ -250,6 +275,7 @@ impl Streamer {
     #[napi]
     pub async fn stop_stream(&self, stream_id: String) -> Result<StreamStatusOutput> {
         let _lifecycle = self.lifecycle.read().await;
+        self.ensure_open().map_err(to_napi_error)?;
         let runtime = {
             let mut runtimes = self.runtimes.write().await;
             match runtimes.get(&stream_id) {
@@ -267,14 +293,11 @@ impl Streamer {
         };
         if let Some(runtime) = runtime {
             let output = status_output(runtime.shutdown().await.map_err(to_napi_error)?);
-            self.inactive
-                .write()
-                .await
-                .insert(stream_id, output.clone());
+            self.inactive.write().await.put(stream_id, output.clone());
             return Ok(output);
         }
         self.inactive
-            .read()
+            .write()
             .await
             .get(&stream_id)
             .cloned()
@@ -345,6 +368,9 @@ impl Streamer {
     #[napi]
     pub async fn shutdown(&self) -> Result<()> {
         let _lifecycle = self.lifecycle.write().await;
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
         let entries = std::mem::take(&mut *self.runtimes.write().await);
         let mut shutdowns = tokio::task::JoinSet::new();
         for (stream_id, entry) in entries {
@@ -368,6 +394,7 @@ impl Streamer {
             }
         }
         self.inactive.write().await.clear();
+        *self.event_callback.write().map_err(lock_error)? = None;
         self.events.clear()?;
         let stale_cache = self.resources.take_source_cache().map_err(to_napi_error)?;
         tokio::task::spawn_blocking(move || drop(stale_cache))
@@ -398,8 +425,18 @@ impl Streamer {
 }
 
 impl Streamer {
+    fn ensure_open(&self) -> std::result::Result<(), MusicStreamError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(MusicStreamError::StreamClosed(
+                "streamer has been shut down".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn command(&self, stream_id: &str, command: StreamCommand) -> Result<StreamStatusOutput> {
         let _lifecycle = self.lifecycle.read().await;
+        self.ensure_open().map_err(to_napi_error)?;
         let runtime = match self.runtimes.read().await.get(stream_id).cloned() {
             Some(RuntimeEntry::Active(runtime)) => runtime,
             Some(RuntimeEntry::Starting) => {

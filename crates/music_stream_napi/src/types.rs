@@ -4,6 +4,7 @@ use napi_derive::napi;
 #[derive(Debug)]
 #[napi(object)]
 pub struct RuntimeResourceLimitsInput {
+    pub max_streams: Option<u32>,
     pub max_cpu_workers: Option<u32>,
     pub max_blocking_producers: Option<u32>,
     pub max_blocking_preloads: Option<u32>,
@@ -20,6 +21,7 @@ pub struct TrackSourceInput {
     pub kind: String,
     pub url: Option<String>,
     pub path: Option<String>,
+    pub format_hint: Option<String>,
     pub seekable: Option<bool>,
 }
 
@@ -52,14 +54,14 @@ pub struct StreamStatusBatchItemOutput {
 pub struct TrackSourceOutput {
     pub id: String,
     pub kind: String,
-    pub url: Option<String>,
-    pub path: Option<String>,
+    pub format_hint: Option<String>,
     pub seekable: Option<bool>,
 }
 
 #[derive(Debug)]
 #[napi(object)]
 pub struct StreamEventOutput {
+    pub sequence: i64,
     pub r#type: String,
     pub stream_id: Option<String>,
     pub track_id: Option<String>,

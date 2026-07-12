@@ -1009,6 +1009,7 @@ dependencies = [
 name = "music_stream_napi"
 version = "0.1.0"
 dependencies = [
+ "lru",
  "music_stream",
  "napi",
  "napi-build",

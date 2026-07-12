@@ -13,6 +13,7 @@ workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
+lru.workspace = true
 music_stream.workspace = true
 napi.workspace = true
 napi-derive.workspace = true

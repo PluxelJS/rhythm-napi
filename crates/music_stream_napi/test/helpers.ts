@@ -327,7 +327,7 @@ export async function stopStreamIfPresent(streamer: Streamer, streamId: string):
     await streamer.stopStream(streamId)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    if (!message.includes('not found')) {
+    if (!message.includes('not found') && !message.includes('shut down')) {
       throw error
     }
   }

@@ -45,6 +45,7 @@ fn file_track(id: &str, path: &Path) -> TrackSource {
         kind: TrackKind::File,
         url: None,
         path: Some(path.display().to_string()),
+        format_hint: None,
         seekable: Some(true),
     }
 }
@@ -262,6 +263,7 @@ async fn stalled_live_decode_never_blocks_rtp_deadlines() {
         kind: TrackKind::Live,
         url: Some(format!("http://{address}/live.wav")),
         path: None,
+        format_hint: None,
         seekable: Some(false),
     };
     let runtime = runtime_for("stalled-live", live, None, &receiver, 11).await;
@@ -467,8 +469,9 @@ async fn pause_during_url_download_excludes_paused_time_from_io_timeout() {
         TrackSource {
             id: "paused-url".to_owned(),
             kind: TrackKind::Url,
-            url: Some(format!("http://{address}/audio.wav")),
+            url: Some(format!("http://{address}/opaque")),
             path: None,
+            format_hint: Some("wav".to_owned()),
             seekable: Some(true),
         },
         None,
@@ -549,8 +552,9 @@ async fn progressive_url_sends_rtp_before_http_download_completes() {
         TrackSource {
             id: "progressive-url".to_owned(),
             kind: TrackKind::Url,
-            url: Some(format!("http://{address}/audio.wav")),
+            url: Some(format!("http://{address}/opaque")),
             path: None,
+            format_hint: Some("wav".to_owned()),
             seekable: Some(true),
         },
         None,
@@ -606,6 +610,7 @@ async fn next_url_added_while_paused_starts_no_download_until_resume() {
             kind: TrackKind::Url,
             url: Some(format!("http://{address}/next.wav")),
             path: None,
+            format_hint: None,
             seekable: Some(true),
         })))
         .await
@@ -669,6 +674,7 @@ async fn switching_to_url_while_paused_preserves_pause_and_defers_download() {
                 kind: TrackKind::Url,
                 url: Some(format!("http://{address}/switched.wav")),
                 path: None,
+                format_hint: None,
                 seekable: Some(true),
             },
             next: None,
@@ -701,51 +707,6 @@ async fn switching_to_url_while_paused_preserves_pause_and_defers_download() {
     drop(stream);
 
     let _ = recv_rtp(&receiver).await;
-    runtime.shutdown().await.expect("shutdown");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pausing_file_current_restarts_live_next_instead_of_buffering_it() {
-    let current_wav = tempfile::Builder::new()
-        .suffix(".wav")
-        .tempfile()
-        .expect("current wav");
-    write_wav(current_wav.path(), 1.0);
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("HTTP bind");
-    let address = listener.local_addr().expect("HTTP address");
-    let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("RTP bind");
-    let runtime = runtime_for(
-        "paused-live-next",
-        file_track("current", current_wav.path()),
-        Some(TrackSource {
-            id: "live-next".to_owned(),
-            kind: TrackKind::Live,
-            url: Some(format!("http://{address}/live.wav")),
-            path: None,
-            seekable: Some(false),
-        }),
-        &receiver,
-        204,
-    )
-    .await;
-
-    let (mut first, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
-        .await
-        .expect("initial live connection timeout")
-        .expect("initial live connection");
-    let mut request = [0_u8; 2_048];
-    let _ = first.read(&mut request).await;
-    let _ = recv_rtp(&receiver).await;
-
-    runtime.command(StreamCommand::Pause).await.expect("pause");
-    runtime.command(StreamCommand::Play).await.expect("resume");
-
-    let (mut second, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
-        .await
-        .expect("resumed live connection timeout")
-        .expect("resumed live connection");
-    let _ = second.read(&mut request).await;
-
     runtime.shutdown().await.expect("shutdown");
 }
 

@@ -1,52 +1,66 @@
 # Music Streamer
 
-一个面向 Node.js 的 Rust 原生音频推流内核：读取本地文件、有界 HTTP 音频或 live HTTP 音频，解码并统一为 48 kHz PCM，编码为 Opus，然后按实时节拍发送 RTP/RTCP。
+Music Streamer 是面向 Node.js 宿主的 Rust 音频推流内核。它接收已经确定的音源和 RTP
+传输参数，把本地文件、有界 HTTP 音频或 live HTTP 音频统一解码为 48 kHz stereo PCM，
+编码为 20 ms Opus frame，并按实时节拍发送 RTP/RTCP。
 
-## 核心设计
+它解决的是媒体节点问题，不是播放器产品策略问题。playlist、循环/随机、推荐、业务 URL
+解析、鉴权刷新、网关协商和跨节点调度由 TypeScript 宿主负责。
+
+## 设计核心
 
 ```text
-Node Promise API
-      │
-      ▼
-StreamRuntime / StreamActor
-      ├── current producer
-      ├── next preload producer
-      └── persistent RTP session
+TypeScript policy
+       │ commands / source refresh / next selection
+       ▼
+StreamActor ── transactional actions ── StreamRuntime
+                                          ├── current producer
+                                          ├── next producer
+                                          └── persistent RTP/RTCP sender
 
-async source I/O                 blocking CPU worker
-HTTP/file/live ────────────────> decode → resample → DSP → Opus
-                                                   │
-                                    duration-bounded Opus queue
-                                                   │
-                                                   ▼
-                                      async RTP/RTCP sender
+async source I/O              bounded blocking CPU work           async realtime I/O
+file / URL / live ──────────> decode → resample → DSP → Opus ───> OpusQueue ───> RTP/RTCP
 ```
 
-- 每个 stream 只有一个长期存活的 RTP session；切歌和 seek 不重置 sequence、timestamp 或 SSRC。
-- source、timer、UDP 和 Node 边界使用 async。
-- Symphonia、Rubato、DSP 和 libopus 运行在 blocking CPU worker，绝不占用 RTP sender 调度。
-- current 与 next 只共享 immutable Opus frame，不共享 decoder 或 PCM scratch。
-- URL使用进程级磁盘预算下的共享growing spool，live与Opus桥接均有明确容量；暂停和预载通过聚合控制与背压停止生产。
-- current在CPU、blocking worker、HTTP、live连接和tempfile admission中均优先于next preload。
-- Rust 不维护 playlist、随机/循环模式、鉴权刷新、voice gateway 或业务重试策略。
+- 每个 stream 只有一个长期 sender。切歌、seek 和 next promotion 只替换媒体 generation，
+  不重置 SSRC、RTP sequence 或 timestamp。
+- HTTP、UDP、timer、清理等待和 Node Promise 边界使用 async；Symphonia、Rubato、DSP 和
+  libopus 只在受控 blocking worker 中执行。
+- producer 与 sender 之间只有一个按媒体时长计量的有界 Opus queue，不存在第二层 encoded
+  backlog。
+- 零起点有界 URL 使用可多读 growing tempfile 渐进解码；完整响应才成为 seekable cache
+  artifact。无扩展名签名 URL可通过显式 `formatHint`进入渐进路径，相同内容身份的并发请求共享
+  一次传输。
+- current 在 CPU、blocking worker、HTTP 和 tempfile admission 上优先于 next；live 只能
+  作为 current，所有连接与媒体资源都有明确上限。
+- pause、cancel、错误、generation 替换和 shutdown 都必须唤醒等待者并确定性收敛资源。
+- active stream、停止状态、flight registry、事件、连接、worker、内存和磁盘都有明确上限。
+
+## 文档
+
+- [设计总览](docs/architecture.md)：问题边界、所有权、核心决策与理由。
+- [运行模型](docs/runtime.md)：状态、任务、背压、暂停、失败和关闭语义。
+- [首包延迟](docs/latency.md)：没下完即播放的流水线、退化条件和后续优化重点。
+- [具体实现](docs/implementation.md)：source、音频管线、传输和实现约束。
+- [使用指南](docs/user-doc.md)：宿主如何正确驱动播放器并处理事件与错误。
+- [文档索引](docs/index.md)：其余验证、依赖和能力边界文档。
 
 ## Workspace
 
 ```text
-crates/music_stream/       source、音频管线、状态机、RTP/RTCP runtime
-crates/music_stream_napi/  Node 类型映射、Promise API、事件 callback
-docs/                      当前实现契约
+crates/music_stream/       Rust 状态机、source、音频管线和 RTP/RTCP runtime
+crates/music_stream_napi/  Node 类型转换、Promise 边界和事件桥接
+docs/                      当前设计与使用契约
 ```
 
 ## 验证
 
 ```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 cargo test --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
+cargo doc --workspace --no-deps
 
 cd crates/music_stream_napi
 npm test
 ```
-
-设计入口见 [docs/index.md](docs/index.md)。

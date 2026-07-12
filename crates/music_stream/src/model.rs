@@ -5,16 +5,67 @@ pub enum TrackKind {
     Live,
 }
 
+const MAX_TRACK_ID_BYTES: usize = 512;
+const MAX_SOURCE_LOCATION_BYTES: usize = 16 * 1024;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrackSource {
     pub id: String,
     pub kind: TrackKind,
     pub url: Option<String>,
     pub path: Option<String>,
+    /// Optional media format hint such as `mp3`, `flac`, `ogg`, or `wav`.
+    /// It describes the bytes, not the spelling of a temporary URL.
+    pub format_hint: Option<String>,
     pub seekable: Option<bool>,
 }
 
 impl TrackSource {
+    pub fn validate(&self) -> crate::Result<()> {
+        if self.id.trim().is_empty() || self.id.len() > MAX_TRACK_ID_BYTES {
+            return Err(crate::MusicStreamError::InvalidSource(
+                "track id must contain 1 to 512 bytes".to_owned(),
+            ));
+        }
+        match self.kind {
+            TrackKind::File
+                if self.path.as_deref().is_none_or(|path| {
+                    path.is_empty() || path.len() > MAX_SOURCE_LOCATION_BYTES
+                }) =>
+            {
+                return Err(crate::MusicStreamError::InvalidSource(
+                    "file source requires a path no longer than 16 KiB".to_owned(),
+                ));
+            }
+            TrackKind::Url | TrackKind::Live => {
+                let Some(url) = self.url.as_deref() else {
+                    return Err(crate::MusicStreamError::InvalidSource(
+                        "URL and live sources require url".to_owned(),
+                    ));
+                };
+                if url.len() > MAX_SOURCE_LOCATION_BYTES
+                    || !(url.starts_with("http://") || url.starts_with("https://"))
+                {
+                    return Err(crate::MusicStreamError::InvalidSource(
+                        "URL and live sources require an HTTP(S) URL no longer than 16 KiB"
+                            .to_owned(),
+                    ));
+                }
+            }
+            TrackKind::File => {}
+        }
+        if let Some(hint) = self.format_hint.as_deref()
+            && (hint.is_empty()
+                || hint.len() > 16
+                || !hint.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        {
+            return Err(crate::MusicStreamError::InvalidSource(
+                "format hint must contain 1 to 16 ASCII letters or digits".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn stable_key(&self) -> &str {
         &self.id
@@ -176,6 +227,9 @@ pub struct MediaBufferConfig {
     pub max_playout_lateness_ms: u64,
 }
 
+const MAX_DECODE_BATCH_MS: u64 = 1_000;
+const MAX_ENCODED_CAPACITY_MS: u64 = 10_000;
+
 impl Default for MediaBufferConfig {
     fn default() -> Self {
         Self {
@@ -193,6 +247,14 @@ impl MediaBufferConfig {
         if self.decode_batch_ms == 0 || self.encoded_capacity_ms == 0 || self.prebuffer_ms == 0 {
             return Err(crate::MusicStreamError::InvalidConfig(
                 "media buffer durations must be greater than zero".to_owned(),
+            ));
+        }
+        if self.decode_batch_ms > MAX_DECODE_BATCH_MS
+            || self.encoded_capacity_ms > MAX_ENCODED_CAPACITY_MS
+        {
+            return Err(crate::MusicStreamError::InvalidConfig(
+                "decode batch must not exceed 1 second and encoded capacity must not exceed 10 seconds"
+                    .to_owned(),
             ));
         }
         if self.prebuffer_ms > self.encoded_capacity_ms
@@ -219,6 +281,7 @@ mod tests {
             kind,
             url: Some("https://example.test/audio".to_owned()),
             path: Some("/tmp/audio.wav".to_owned()),
+            format_hint: None,
             seekable,
         }
     }
@@ -238,5 +301,26 @@ mod tests {
         assert!(file.is_seekable());
         assert!(url.is_seekable());
         assert!(!non_seekable_url.is_seekable());
+    }
+
+    #[test]
+    fn source_validation_rejects_invalid_format_hint() {
+        let mut url = source(TrackKind::Url, None);
+        url.format_hint = Some("audio/mpeg".to_owned());
+        assert_eq!(
+            url.validate().expect_err("invalid hint").code(),
+            crate::ErrorCode::InvalidSource
+        );
+    }
+
+    #[test]
+    fn media_buffer_validation_preserves_a_hard_memory_bound() {
+        let error = MediaBufferConfig {
+            encoded_capacity_ms: MAX_ENCODED_CAPACITY_MS + 1,
+            ..MediaBufferConfig::default()
+        }
+        .validate()
+        .expect_err("oversized encoded window");
+        assert_eq!(error.code(), crate::ErrorCode::InvalidConfig);
     }
 }

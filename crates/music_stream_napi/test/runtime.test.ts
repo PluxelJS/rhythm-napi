@@ -25,7 +25,7 @@ test('all lifecycle methods are asynchronous and RTP remains monotonic across sw
   await fs.promises.writeFile(firstPath, makeSineWave(1))
   await fs.promises.writeFile(secondPath, makeSineWave(1))
   const socket = await createBoundUdpSocket()
-  const streamer = new Streamer()
+  const streamer = new Streamer({ maxStreams: 1 })
   const streamId = `runtime-${Date.now()}`
   const ssrc = 0x11223344
 
@@ -37,13 +37,22 @@ test('all lifecycle methods are asynchronous and RTP remains monotonic across sw
       transport: rtpTransport(socket, ssrc),
     })
     expect(started.current?.id).toBe('first')
+    expect(started.current && 'path' in started.current).toBe(false)
     const before = (await firstPacket).message
+    await expect(streamer.startStream({
+      streamId: `${streamId}-overflow`,
+      current: { id: 'overflow', kind: 'file', path: firstPath },
+      transport: rtpTransport(socket, ssrc + 1),
+    })).rejects.toThrow(/BUSY.*stream limit/i)
 
     const paused = await streamer.pauseStream(streamId)
     expect(paused.playState).toBe('paused')
     await delay(60)
     const pausedStatus = await streamer.getStatus(streamId)
     expect(pausedStatus.playState).toBe('paused')
+    const batch = await streamer.getStatuses([streamId, `${streamId}-missing`])
+    expect(batch[0].ok).toBe(true)
+    expect(batch[1].code).toBe('STREAM_NOT_FOUND')
     await streamer.resumeStream(streamId)
 
     const switched = await streamer.switchTrack(
@@ -64,6 +73,22 @@ test('all lifecycle methods are asynchronous and RTP remains monotonic across sw
     const stopped = await streamer.stopStream(streamId)
     expect(stopped.playState).toBe('stopped')
     expect((await streamer.getStatus(streamId)).playState).toBe('stopped')
+
+    const replacementId = `${streamId}-replacement`
+    await streamer.startStream({
+      streamId: replacementId,
+      current: { id: 'replacement', kind: 'file', path: secondPath },
+      transport: rtpTransport(socket, ssrc + 2),
+    })
+    await streamer.stopStream(replacementId)
+    await expect(streamer.getStatus(streamId)).rejects.toThrow(/STREAM_NOT_FOUND/)
+    await streamer.shutdown()
+    await streamer.shutdown()
+    await expect(streamer.startStream({
+      streamId: `${streamId}-after-shutdown`,
+      current: { id: 'closed', kind: 'file', path: firstPath },
+      transport: rtpTransport(socket, ssrc + 3),
+    })).rejects.toThrow(/STREAM_CLOSED.*shut down/i)
   } finally {
     await stopStreamIfPresent(streamer, streamId)
     await closeSocket(socket)
@@ -84,12 +109,20 @@ test('bounded URL startup does not block the JavaScript event loop', async () =>
     const packet = waitForDatagram(socket, (message) => isRtpForSsrc(message, ssrc))
     const started = await streamer.startStream({
       streamId,
-      current: { id: 'url', kind: 'url', url: server.url, seekable: true },
+      current: {
+        id: 'url',
+        kind: 'url',
+        url: server.url,
+        formatHint: 'WAV',
+        seekable: true,
+      },
       transport: rtpTransport(socket, ssrc),
     })
     await delay(0)
     expect(heartbeat).toBe(true)
     expect(started.current?.kind).toBe('url')
+    expect(started.current?.formatHint).toBe('wav')
+    expect(started.current && 'url' in started.current).toBe(false)
     await packet
   } finally {
     await stopStreamIfPresent(streamer, streamId)

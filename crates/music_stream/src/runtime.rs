@@ -6,7 +6,7 @@
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, Semaphore, mpsc};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 
 mod opus_queue;
 mod producer;
@@ -34,6 +34,8 @@ const CHANNELS: u16 = 2;
 const FRAME_SAMPLES: u32 = 960;
 const PREBUFFER_MS: u64 = 100;
 const RTCP_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_STREAMS: usize = 1_024;
+const MAX_STREAM_ID_BYTES: usize = 512;
 const MAX_CONCURRENT_HTTP_DOWNLOADS: usize = 8;
 const MAX_CONCURRENT_LIVE_STREAMS: usize = 64;
 const MAX_LIVE_BUFFERED_BYTES: usize = 64 * 1024 * 1024;
@@ -44,6 +46,7 @@ const MAX_BLOCKING_PRODUCERS: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeResourceLimits {
+    pub max_streams: usize,
     pub max_cpu_workers: usize,
     pub max_blocking_producers: usize,
     pub max_blocking_preloads: usize,
@@ -62,6 +65,7 @@ impl Default for RuntimeResourceLimits {
             .saturating_mul(4)
             .clamp(MIN_BLOCKING_PRODUCERS, MAX_BLOCKING_PRODUCERS);
         Self {
+            max_streams: MAX_STREAMS,
             max_cpu_workers,
             max_blocking_producers,
             max_blocking_preloads: (max_blocking_producers / 4).max(1),
@@ -76,12 +80,12 @@ impl Default for RuntimeResourceLimits {
 #[derive(Debug)]
 pub struct RuntimeResources {
     limits: RuntimeResourceLimits,
+    streams: Arc<Semaphore>,
     source_cache: SharedSourceArtifactCache,
     source_downloads: SharedSourceDownloadRegistry,
     http_downloads: Arc<Semaphore>,
     http_preloads: Arc<Semaphore>,
     live_streams: Arc<Semaphore>,
-    live_preloads: Arc<Semaphore>,
     live_byte_budget: Arc<Semaphore>,
     tempfile_budget: Arc<Semaphore>,
     tempfile_preloads: Arc<Semaphore>,
@@ -99,7 +103,9 @@ impl Default for RuntimeResources {
 
 impl RuntimeResources {
     pub fn new(limits: RuntimeResourceLimits) -> Result<Self> {
-        if limits.max_cpu_workers == 0
+        if limits.max_streams == 0
+            || limits.max_streams > Semaphore::MAX_PERMITS
+            || limits.max_cpu_workers == 0
             || limits.max_blocking_producers == 0
             || limits.max_cpu_workers > limits.max_blocking_producers
             || limits.max_blocking_preloads == 0
@@ -108,7 +114,7 @@ impl RuntimeResources {
             || limits.max_blocking_preloads > Semaphore::MAX_PERMITS
             || limits.max_concurrent_http_downloads < 2
             || limits.max_concurrent_http_downloads > Semaphore::MAX_PERMITS
-            || limits.max_concurrent_live_streams < 2
+            || limits.max_concurrent_live_streams == 0
             || limits.max_concurrent_live_streams > Semaphore::MAX_PERMITS
             || limits.max_live_buffered_bytes == 0
             || limits.max_live_buffered_bytes > u32::MAX as usize
@@ -117,7 +123,7 @@ impl RuntimeResources {
             || limits.max_tempfile_bytes / TEMPFILE_QUOTA_BYTES > Semaphore::MAX_PERMITS as u64
         {
             return Err(MusicStreamError::InvalidConfig(
-                "CPU, blocking producer, HTTP/live connection, live byte, and tempfile limits are invalid".to_owned(),
+                "stream, CPU, blocking producer, HTTP/live connection, live byte, and tempfile limits are invalid".to_owned(),
             ));
         }
         let tempfile_permits = usize::try_from(limits.max_tempfile_bytes / TEMPFILE_QUOTA_BYTES)
@@ -125,10 +131,10 @@ impl RuntimeResources {
                 MusicStreamError::InvalidConfig("tempfile byte limit is too large".to_owned())
             })?;
         Ok(Self {
+            streams: Arc::new(Semaphore::new(limits.max_streams)),
             http_downloads: Arc::new(Semaphore::new(limits.max_concurrent_http_downloads)),
             http_preloads: Arc::new(Semaphore::new(limits.max_concurrent_http_downloads - 1)),
             live_streams: Arc::new(Semaphore::new(limits.max_concurrent_live_streams)),
-            live_preloads: Arc::new(Semaphore::new(limits.max_concurrent_live_streams - 1)),
             live_byte_budget: Arc::new(Semaphore::new(limits.max_live_buffered_bytes)),
             tempfile_budget: Arc::new(Semaphore::new(tempfile_permits)),
             tempfile_preloads: Arc::new(Semaphore::new((tempfile_permits / 4).max(1))),
@@ -270,6 +276,7 @@ impl std::fmt::Debug for StreamRuntime {
 }
 
 struct StreamRuntimeInner {
+    stream_permit: Mutex<Option<OwnedSemaphorePermit>>,
     actor: Mutex<StreamActor>,
     orchestration: Mutex<()>,
     sender: SenderHandle,
@@ -290,6 +297,15 @@ struct ProducerRequest {
 }
 
 impl StreamRuntime {
+    pub fn validate_stream_id(stream_id: &str) -> Result<()> {
+        if stream_id.trim().is_empty() || stream_id.len() > MAX_STREAM_ID_BYTES {
+            return Err(MusicStreamError::InvalidConfig(
+                "stream id must contain 1 to 512 bytes".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn start(
         stream_id: String,
         current: TrackSource,
@@ -298,7 +314,20 @@ impl StreamRuntime {
         volume: VolumeLevel,
         gain: GainLevel,
     ) -> Result<Self> {
+        Self::validate_stream_id(&stream_id)?;
         config.validate()?;
+        current.validate()?;
+        if let Some(next) = &next {
+            validate_next_source(next)?;
+        }
+        let stream_permit = Arc::clone(&config.resources.streams)
+            .try_acquire_owned()
+            .map_err(|_| {
+                MusicStreamError::Busy(format!(
+                    "stream limit {} is exhausted",
+                    config.resources.limits.max_streams
+                ))
+            })?;
         let (worker_tx, worker_rx) = mpsc::channel(64);
         let sender = SenderHandle::spawn(
             config.transport.clone(),
@@ -309,6 +338,7 @@ impl StreamRuntime {
         )
         .await?;
         let inner = Arc::new(StreamRuntimeInner {
+            stream_permit: Mutex::new(Some(stream_permit)),
             actor: Mutex::new(StreamActor::new(stream_id, Some(current), next)),
             orchestration: Mutex::new(()),
             sender,
@@ -330,6 +360,7 @@ impl StreamRuntime {
     }
 
     pub async fn command(&self, command: StreamCommand) -> Result<StreamRuntimeSnapshot> {
+        validate_command_sources(&command)?;
         let _guard = self.inner.orchestration.lock().await;
         let (planned, output) = {
             let actor = self.inner.actor.lock().await;
@@ -357,6 +388,37 @@ impl StreamRuntime {
     pub async fn shutdown(&self) -> Result<StreamRuntimeSnapshot> {
         self.command(StreamCommand::Stop).await
     }
+}
+
+fn validate_command_sources(command: &StreamCommand) -> Result<()> {
+    match command {
+        StreamCommand::SetNext(Some(next)) => validate_next_source(next),
+        StreamCommand::SwitchTrack { current, next } => {
+            current.validate()?;
+            if let Some(next) = next {
+                validate_next_source(next)?;
+            }
+            Ok(())
+        }
+        StreamCommand::RefreshCurrentSource { current } => current.validate(),
+        StreamCommand::Play
+        | StreamCommand::Pause
+        | StreamCommand::Stop
+        | StreamCommand::Seek { .. }
+        | StreamCommand::SetNext(None)
+        | StreamCommand::SetVolume { .. }
+        | StreamCommand::SetGain { .. } => Ok(()),
+    }
+}
+
+fn validate_next_source(next: &TrackSource) -> Result<()> {
+    next.validate()?;
+    if next.is_live() {
+        return Err(MusicStreamError::Unsupported(
+            "live sources cannot be preloaded as next without a timeshift model".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn spawn_worker_event_loop(
@@ -430,6 +492,7 @@ impl StreamRuntimeInner {
             stop_producer(next),
             self.sender.shutdown(),
         );
+        self.stream_permit.lock().await.take();
         for cleanup_error in [current_result, next_result, sender_result]
             .into_iter()
             .filter_map(std::result::Result::err)
@@ -451,6 +514,7 @@ impl StreamRuntimeInner {
         match action {
             TaskAction::StartCurrent { generation, track } => {
                 if let Some(mut producer) = take_generation(&self.next, generation).await {
+                    producer.promote_to_current();
                     let receiver = producer.take_receiver()?;
                     self.sender
                         .activate(generation, start_position_ms, paused, receiver)
@@ -532,6 +596,7 @@ impl StreamRuntimeInner {
                 let (current_result, next_result) =
                     tokio::join!(stop_producer(current), stop_producer(next));
                 let sender_result = self.sender.shutdown().await;
+                self.stream_permit.lock().await.take();
                 current_result?;
                 next_result?;
                 sender_result?;
@@ -576,7 +641,6 @@ impl StreamRuntimeInner {
             source: self.config.source.clone(),
             live_byte_budget: Arc::clone(&self.config.resources.live_byte_budget),
             live_streams: Arc::clone(&self.config.resources.live_streams),
-            live_preloads: Arc::clone(&self.config.resources.live_preloads),
             cpu_scheduler: Arc::clone(&self.config.resources.cpu_scheduler),
             blocking_producers: Arc::clone(&self.config.resources.blocking_producers),
             blocking_preloads: Arc::clone(&self.config.resources.blocking_preloads),
@@ -682,6 +746,21 @@ mod tests {
         .expect_err("zero download slots must fail");
 
         assert_eq!(error.code(), crate::error::ErrorCode::InvalidConfig);
+    }
+
+    #[test]
+    fn stream_admission_is_hard_bounded_and_reusable() {
+        let resources = RuntimeResources::new(RuntimeResourceLimits {
+            max_streams: 1,
+            ..RuntimeResourceLimits::default()
+        })
+        .expect("resources");
+        let first = Arc::clone(&resources.streams)
+            .try_acquire_owned()
+            .expect("first stream");
+        assert!(Arc::clone(&resources.streams).try_acquire_owned().is_err());
+        drop(first);
+        assert!(Arc::clone(&resources.streams).try_acquire_owned().is_ok());
     }
 
     #[test]

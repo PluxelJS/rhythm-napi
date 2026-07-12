@@ -1,69 +1,107 @@
-# 测试
+# 验证策略
 
-## 常规验证
+测试的目的不是覆盖函数数量，而是保护跨任务、跨 generation 和跨协议的设计不变量。单元测试负责
+纯状态与原语，集成测试负责真实 task/HTTP/UDP 时序，Node 测试负责 Promise、类型和宿主边界。
+
+## 必须通过的验证
 
 ```sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
 cargo test --workspace --all-targets
-cd crates/music_stream_napi && npm test
+cargo clippy --workspace --all-targets -- -D warnings
+cargo doc --workspace --no-deps
+
+cd crates/music_stream_napi
+npm test
 ```
 
-## 当前覆盖
+`--all-targets` 会运行 Criterion debug harness，确保 fake encoder 和 libopus 两条 pipeline 至少能够
+完整构建与执行。性能采样应另外使用 release benchmark。
 
-- actor generation、seek、switch、next promotion、跨曲空窗 pause/resume和错误事件。
-- WAV/MP3 decode、44.1 kHz resample、真实 libopus encode。
-- shared growing URL spool、bounded live byte bridge和 async HTTP source。
-- localhost UDP 实际 RTP pacing。
-- switch 和 preload promotion 后 sequence/timestamp连续。
-- pause 停止 playout，resume继续同一 RTP session。
-- 多路 current 与 next preload 并发时所有 RTP clock 前进，current 不被 preload 饿死。
-- 短于 prebuffer 的 source 仍完整发送。
-- live body 可超过 open timeout 持续读取，partial body 失败不进行字节流拼接重连。
-- live body 的 chunk idle timeout 产生 `SOURCE_TIMEOUT`，但不会把直播总时长误当作超时。
-- HTTP chunk 大于 live byte budget 时保持有界并完整切分。
-- 有界 HTTP 对 404 不重试，对 500 使用全新 artifact 重试。
-- live byte reader 只在 channel receive 边界释放/恢复 CPU lease。
-- CPU scheduler 饱和时，取消中的 waiter 能在有限时间内退出。
-- partial URL body 暂停超过 `ioTimeoutMs` 后仍从同一 pinned open/body future 恢复并发送 RTP；该场景重复运行验证 cancellation safety。
-- paused 状态新增 next URL 不建连，resume 后才启动 preload。
-- paused 状态 switch 到 URL 保持 Paused 且不建连，显式 resume 后才下载。
-- 慢速有界 URL在服务器释放剩余HTTP body前已经产生首个RTP packet。
-- 渐进 URL完整下载后提升为cache artifact；交付部分正文后断流不重试或拼接。
-- 同内容并发URL subscriber只建立一个HTTP transfer；单个pause/cancel不阻塞其他subscriber，全部pause才冻结。
-- preload饱和时current保留HTTP/tempfile admission；排队flight可被current提升优先级。
-- shared transfer panic稳定广播，shutdown cleanup barrier等待tempfile删除和quota释放。
-- source失败事件必须先于queue drained；N-API鉴权错误竞态重复运行验证稳定的 `SOURCE_AUTH_EXPIRED`。
-- file current 暂停时取消 live next 连接，resume 后建立全新 live preload。
-- final partial PCM frame 补零发送，连续损坏 packet 有显式错误预算。
-- 注入 event callback panic 时媒体 action 仍然执行并产生 RTP。
-- RTCP RR 解析和 N-API status 回写。
-- N-API Promise 类型、URL 启动不阻塞 JS heartbeat、live HTTP。
-- ReplayGain 和 source/transport 配置校验。
+## 不变量矩阵
 
-## 性能验收
+| 设计风险 | 必须验证的行为 |
+| --- | --- |
+| actor 与异步结果竞争 | generation 过滤、staged commit、callback failure 不跳过 action |
+| next 抢占 current | CPU、blocking、HTTP 和 tempfile 都保留 current 能力；live 不允许作为 next |
+| stream/status/registry增长 | `maxStreams`硬 admission、stopped LRU和dead weak key周期清理 |
+| pause 被实现成 cancel | URL 保持同一 response；超时不计算暂停时间；resume 不重置 RTP clock |
+| shared download 相互阻塞 | 单 subscriber pause/cancel 不影响 active follower；全部 pause 才冻结 |
+| partial response 被伪装完整 | 正文交付后不重试拼接；partial 不进入 cache |
+| codec 阻塞 realtime | source wait 和 queue wait 释放 CPU lease；sender 独立按 deadline 发送 |
+| queue 无界或重复 | 唯一 Opus queue 按媒体时长限流；next prime 后停止生产 |
+| RTP session 被 track 重置 | switch、seek、promotion 后 sequence/timestamp 连续 |
+| sender stall 形成 burst | 超限丢旧媒体；timestamp 跳过、sequence 只统计实际包 |
+| 错误被 EOF 覆盖 | source/auth/timeout terminal 优先；failure event 先于 drained |
+| 任务 panic 或关闭泄漏 | producer/shared-flight panic 事件化；stop/shutdown 有 deadline 与 barrier |
+| sender panic 后假 Playing | supervisor立即发布active generation failure并收敛runtime |
+| Node event loop 被阻塞 | URL 启动期间 heartbeat 继续；所有等待型方法返回 Promise |
 
-2026-07-11 release Criterion 基线（当前开发机，5 秒 48 kHz stereo PCM）：
+## 测试层次
 
-- pipeline + fake encoder：约 176 µs；
-- pipeline + libopus：约 39.1 ms，即约 128 倍实时速度。
+### 纯单元测试
 
-该结果表明当前 CPU 主成本明确集中在 libopus；在没有 allocation profile 证明收益前，不引入复杂的跨 sender payload pool。
+- actor 的状态、generation、promotion、pause 意图和错误策略；
+- PCM frame assembly、downmix、gain/limiter、ReplayGain；
+- decoder 错误预算、resample 和真实 libopus frame；
+- Opus queue 的容量、关闭、drain 和 stale drop；
+- RTP packetize、RTCP parse 和 quality window；
+- PauseGate、CPU scheduler、resource validation。
 
-新增优化不能只报告吞吐，至少同时观察：
+这些测试不依赖 wall-clock 网络，应尽量保持确定性。
 
+### 并发与 source 测试
+
+- growing spool 多 reader 都从 offset 0 获得相同字节；
+- artifact/progressive resolver 共用一次 HTTP flight；
+- preload 饱和时 current 仍获得 admission；
+- paused transfer 不建新连接，resume 后继续；
+- HTTP retry 使用全新 artifact，partial body 不拼接；
+- live open/idle timeout、chunk split 和全局 byte budget；
+- tempfile 删除完成后才释放 quota，shutdown barrier 等待真实清理。
+
+涉及 race 的短测试应在本地或 CI 中重复运行，尤其是 source terminal、pause/cancel 和 task panic
+路径。重复通过不能证明没有 race，但能暴露依赖不安全轮询或错误事件顺序的实现。
+
+### RTP/HTTP 集成测试
+
+localhost UDP 测试必须观察真实 packet，而不是只检查内部计数：
+
+- 首包 marker、SSRC、sequence 和 timestamp；
+- pacing 不 burst；
+- 文件、渐进 URL 和 finite live 能完成 decode → Opus → RTP；
+- next promotion、switch 和 seek 不重建 session；
+- pause 期间停止 playout，resume 从同一 session 继续；
+- RTCP mux/non-mux、SR 和 RR status；
+- 慢 source 不占用 sender deadline。
+
+### N-API 测试
+
+Node 层验证生成的 `index.d.ts` 能被 TypeScript 消费，并覆盖 lifecycle Promise、配置校验、事件
+callback/补偿队列、鉴权刷新信号、批量 status、ReplayGain 和 shutdown。Rust 单元测试不能替代
+这些 ABI 与 event-loop 契约。
+
+## 性能判断
+
+离线 pipeline 吞吐只是一个下限。当前开发机的 release Criterion 参考值（5 秒 48 kHz stereo
+PCM）为：fake encoder 约 176 µs，libopus pipeline 约 39.1 ms，约 128 倍实时速度。该数字说明当前
+样本中主要 CPU 成本位于 libopus，但不能直接推导生产并发容量。
+
+任何性能改动至少同时记录：
+
+- activation-to-prebuffer；
 - decode/resample/encode realtime factor；
-- encoded queue 媒体时长；
-- prebuffer 时间和 underrun；
-- RTP deadline lateness；
-- current 与 preload CPU 竞争；
-- stop/switch/seek 收敛时间；
+- CPU 和 admission wait；
+- Opus queue duration 与 underrun；
+- sender lateness、drop 和恢复次数；
+- pause/seek/switch/stop 收敛时间；
+- tempfile/live byte 峰值；
 - Node event-loop delay。
 
-## 仍需扩充的 corpus
+只提升离线吞吐但增加首包、尾延迟、内存或取消时间的改动不算优化。
 
-- AAC/M4A、ALAC、FLAC、OGG/Vorbis。
-- VBR、超大 metadata、损坏 packet和极短文件。
-- mono、multichannel、44.1/48/96 kHz。
-- 慢 HTTP、无 Content-Length、中途断流和长时间 live stall。
-- 10/50 路并发和持续数小时 soak。
+## 生产验证
+
+代码库内测试保护语义，部署前还需要真实 corpus、规模和故障注入：多格式/VBR/损坏媒体、慢
+DNS/TLS、无 Content-Length、磁盘满、UDP stall、多路 current/preload 竞争和多小时 soak。结果应
+用于设置资源默认值，而不是在单元测试中硬编码某台机器的容量结论。

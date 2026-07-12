@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::sync::atomic::{AtomicI16, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU16, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -96,7 +96,7 @@ struct CpuPermit {
 
 #[derive(Debug)]
 struct CpuLease {
-    role: ProducerRole,
+    current_role: Arc<AtomicBool>,
     cancellation: CancellationToken,
     scheduler: Arc<CpuScheduler>,
     permit: std::sync::Mutex<Option<CpuPermit>>,
@@ -104,12 +104,12 @@ struct CpuLease {
 
 impl CpuLease {
     fn new(
-        role: ProducerRole,
+        current_role: Arc<AtomicBool>,
         cancellation: CancellationToken,
         scheduler: Arc<CpuScheduler>,
     ) -> Self {
         Self {
-            role,
+            current_role,
             cancellation,
             scheduler,
             permit: std::sync::Mutex::new(None),
@@ -121,7 +121,12 @@ impl CpuLease {
         if permit.is_some() {
             return true;
         }
-        *permit = self.scheduler.acquire(self.role, &self.cancellation);
+        let role = if self.current_role.load(Ordering::Acquire) {
+            ProducerRole::Current
+        } else {
+            ProducerRole::Next
+        };
+        *permit = self.scheduler.acquire(role, &self.cancellation);
         permit.is_some()
     }
 
@@ -172,7 +177,6 @@ pub(super) struct ProducerSpec {
     pub source: SourceResolverConfig,
     pub live_byte_budget: Arc<tokio::sync::Semaphore>,
     pub live_streams: Arc<Semaphore>,
-    pub live_preloads: Arc<Semaphore>,
     pub cpu_scheduler: Arc<CpuScheduler>,
     pub blocking_producers: Arc<Semaphore>,
     pub blocking_preloads: Arc<Semaphore>,
@@ -200,17 +204,73 @@ struct MediaControl {
     volume: AtomicU16,
     gain: AtomicI16,
     gate: Arc<PauseGate>,
+    promotion_gate: PauseGate,
+    current_role: Arc<AtomicBool>,
+    current_role_changed: tokio::sync::watch::Sender<bool>,
+    preload_admission: Mutex<Option<OwnedSemaphorePermit>>,
     shared_url: Mutex<Option<SharedUrlControl>>,
 }
 
 impl MediaControl {
-    fn new(volume: VolumeLevel, gain: GainLevel) -> Self {
+    fn new(volume: VolumeLevel, gain: GainLevel, role: ProducerRole) -> Self {
+        let promotion_gate = PauseGate::default();
+        if matches!(role, ProducerRole::Next) {
+            promotion_gate.pause();
+        }
+        let is_current = matches!(role, ProducerRole::Current);
+        let (current_role_changed, _) = tokio::sync::watch::channel(is_current);
         Self {
             volume: AtomicU16::new(volume.units()),
             gain: AtomicI16::new(gain.centibels()),
             gate: Arc::new(PauseGate::default()),
+            promotion_gate,
+            current_role: Arc::new(AtomicBool::new(is_current)),
+            current_role_changed,
+            preload_admission: Mutex::new(None),
             shared_url: Mutex::new(None),
         }
+    }
+
+    fn role(&self) -> ProducerRole {
+        if self.current_role.load(Ordering::Acquire) {
+            ProducerRole::Current
+        } else {
+            ProducerRole::Next
+        }
+    }
+
+    fn attach_preload_admission(&self, permit: OwnedSemaphorePermit) {
+        if self.current_role.load(Ordering::Acquire) {
+            return;
+        }
+        let mut admission = self
+            .preload_admission
+            .lock()
+            .expect("preload admission lock poisoned");
+        if self.current_role.load(Ordering::Acquire) {
+            return;
+        }
+        admission.replace(permit);
+    }
+
+    fn promote_to_current(&self) {
+        if self.current_role.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.current_role_changed.send_replace(true);
+        self.preload_admission
+            .lock()
+            .expect("preload admission lock poisoned")
+            .take();
+        if let Some(shared) = self
+            .shared_url
+            .lock()
+            .expect("shared URL control lock poisoned")
+            .as_ref()
+        {
+            shared.promote_to_current();
+        }
+        self.promotion_gate.resume();
     }
 
     fn volume(&self) -> VolumeLevel {
@@ -224,6 +284,9 @@ impl MediaControl {
     }
 
     fn attach_shared_url(&self, control: SharedUrlControl) {
+        if self.current_role.load(Ordering::Acquire) {
+            control.promote_to_current();
+        }
         if self.gate.is_paused() {
             control.pause();
         } else {
@@ -253,6 +316,11 @@ impl ProducerHandle {
         self.receiver.take().ok_or_else(|| {
             MusicStreamError::Internal("producer receiver was already transferred".to_owned())
         })
+    }
+
+    pub(super) fn promote_to_current(&mut self) {
+        self.role = ProducerRole::Current;
+        self.control.promote_to_current();
     }
 
     pub(super) fn set_volume(&self, volume: VolumeLevel) {
@@ -330,17 +398,18 @@ pub(super) fn spawn(spec: ProducerSpec) -> ProducerHandle {
     let cancellation = CancellationToken::new();
     let worker_cancellation = cancellation.child_token();
     let task_cancellation = cancellation.clone();
-    let control = Arc::new(MediaControl::new(spec.volume, spec.gain));
+    let role = spec.role;
+    let control = Arc::new(MediaControl::new(spec.volume, spec.gain, role));
     if spec.initial_paused {
         control.gate.pause();
     }
     let worker_control = Arc::clone(&control);
     let generation = spec.generation;
-    let role = spec.role;
     let event_tx = spec.events.clone();
     let worker_events = event_tx.clone();
     let worker = async move {
         let job = ProducerJob {
+            activation_started: std::time::Instant::now(),
             generation,
             track: spec.track,
             start_position_ms: spec.start_position_ms,
@@ -357,14 +426,7 @@ pub(super) fn spawn(spec: ProducerSpec) -> ProducerHandle {
             blocking_preloads: spec.blocking_preloads,
         };
         if job.track.is_live() {
-            run_live(
-                job,
-                spec.source,
-                spec.live_byte_budget,
-                spec.live_streams,
-                spec.live_preloads,
-            )
-            .await
+            run_live(job, spec.source, spec.live_byte_budget, spec.live_streams).await
         } else {
             run_artifact(job, spec.resolver).await
         }
@@ -372,6 +434,7 @@ pub(super) fn spawn(spec: ProducerSpec) -> ProducerHandle {
     let task = supervise_producer(
         worker,
         role,
+        Arc::clone(&control.current_role),
         generation,
         task_cancellation,
         event_tx,
@@ -389,7 +452,8 @@ pub(super) fn spawn(spec: ProducerSpec) -> ProducerHandle {
 
 fn supervise_producer<F>(
     future: F,
-    role: ProducerRole,
+    initial_role: ProducerRole,
+    current_role: Arc<AtomicBool>,
     generation: u64,
     cancellation: CancellationToken,
     events: mpsc::Sender<WorkerEvent>,
@@ -404,19 +468,19 @@ where
         let result = match worker.await {
             Ok(result) => result,
             Err(error) => Err(MusicStreamError::Internal(format!(
-                "{role:?} producer {generation} task failed: {error}"
+                "{initial_role:?} producer {generation} task failed: {error}"
             ))),
         };
         if let Err(error) = &result
             && !cancellation.is_cancelled()
         {
-            let event = match role {
-                ProducerRole::Current => WorkerEvent::CurrentFailed {
+            let event = match current_role.load(Ordering::Acquire) {
+                true => WorkerEvent::CurrentFailed {
                     generation,
                     code: error.code(),
                     message: error.to_string(),
                 },
-                ProducerRole::Next => WorkerEvent::NextFailed {
+                false => WorkerEvent::NextFailed {
                     generation,
                     code: error.code(),
                     message: error.to_string(),
@@ -433,6 +497,7 @@ where
 }
 
 struct ProducerJob {
+    activation_started: std::time::Instant,
     generation: u64,
     track: TrackSource,
     start_position_ms: u64,
@@ -452,7 +517,6 @@ struct ProducerJob {
 #[derive(Debug)]
 struct AdmissionPermit {
     _global: OwnedSemaphorePermit,
-    _preload: Option<OwnedSemaphorePermit>,
 }
 
 async fn run_artifact(job: ProducerJob, resolver: FileSourceResolver) -> Result<()> {
@@ -463,7 +527,9 @@ async fn run_artifact(job: ProducerJob, resolver: FileSourceResolver) -> Result<
         let source = resolver
             .resolve_url_playback(&job.track, Arc::clone(&job.control.gate), &job.cancellation)
             .await?;
+        record_source_ready(&job);
         let admission = acquire_blocking_job(&job).await?;
+        record_codec_start(&job);
         return match source {
             UrlPlaybackSource::Cached(artifact) => {
                 run_file_artifact(job, artifact, admission).await
@@ -476,7 +542,9 @@ async fn run_artifact(job: ProducerJob, resolver: FileSourceResolver) -> Result<
     let artifact = resolver
         .resolve(&job.track, &job.control.gate, &job.cancellation)
         .await?;
+    record_source_ready(&job);
     let admission = acquire_blocking_job(&job).await?;
+    record_codec_start(&job);
     run_file_artifact(job, artifact, admission).await
 }
 
@@ -487,7 +555,9 @@ async fn run_file_artifact(
 ) -> Result<()> {
     tokio::task::spawn_blocking(move || {
         let _admission = admission;
+        let decoder_started = std::time::Instant::now();
         let decoder = SymphoniaFileDecoder::open_at(artifact.path(), job.start_position_ms)?;
+        record_decoder_open(&job, decoder_started);
         let decoder = RubatoResamplingDecoder::new(
             decoder,
             RubatoResamplerConfig::new(AudioFormat {
@@ -496,7 +566,7 @@ async fn run_file_artifact(
             }),
         )?;
         let lease = Arc::new(CpuLease::new(
-            job.role,
+            Arc::clone(&job.control.current_role),
             job.cancellation.clone(),
             Arc::clone(&job.cpu_scheduler),
         ));
@@ -511,7 +581,7 @@ async fn run_progressive_url(
     source: ProgressiveUrlSource,
     admission: AdmissionPermit,
 ) -> Result<()> {
-    let hint = live_hint_extension(&job.track).map(str::to_owned);
+    let hint = decoder_hint(&job.track);
     let mut terminal = source.terminal;
     let subscription = source.subscription;
     let mut reader = source.reader;
@@ -519,14 +589,16 @@ async fn run_progressive_url(
     let control = Arc::clone(&job.control);
     control.attach_shared_url(subscription.control());
     let lease = Arc::new(CpuLease::new(
-        job.role,
+        Arc::clone(&job.control.current_role),
         job.cancellation.clone(),
         Arc::clone(&job.cpu_scheduler),
     ));
     reader.set_wait_observer(lease.clone());
     let mut cpu = tokio::task::spawn_blocking(move || {
         let _admission = admission;
+        let decoder_started = std::time::Instant::now();
         let decoder = SymphoniaStreamDecoder::open(reader, hint.as_deref())?;
+        record_decoder_open(&job, decoder_started);
         let decoder = RubatoResamplingDecoder::new(
             decoder,
             RubatoResamplerConfig::new(AudioFormat {
@@ -592,25 +664,33 @@ async fn run_live(
     source: SourceResolverConfig,
     live_byte_budget: Arc<tokio::sync::Semaphore>,
     live_streams: Arc<Semaphore>,
-    live_preloads: Arc<Semaphore>,
 ) -> Result<()> {
-    let _live_admission = acquire_live_stream(&job, live_streams, live_preloads).await?;
+    if matches!(job.role, ProducerRole::Next) {
+        return Err(MusicStreamError::Unsupported(
+            "live sources cannot run as preload producers".to_owned(),
+        ));
+    }
+    let _live_admission =
+        acquire_job_slot(live_streams, &job.control.gate, &job.cancellation).await?;
     let admission = acquire_blocking_job(&job).await?;
+    record_codec_start(&job);
     let stream = spawn_http_live_stream(&job.track, source.live_http, live_byte_budget)?;
-    let hint = live_hint_extension(&job.track).map(str::to_owned);
+    let hint = decoder_hint(&job.track);
     let source_cancellation = stream.cancellation.clone();
     let mut source_task = stream.task;
     let mut reader = stream.reader;
     let cancellation = job.cancellation.clone();
     let lease = Arc::new(CpuLease::new(
-        job.role,
+        Arc::clone(&job.control.current_role),
         job.cancellation.clone(),
         Arc::clone(&job.cpu_scheduler),
     ));
     reader.set_wait_observer(lease.clone());
     let mut cpu = tokio::task::spawn_blocking(move || {
         let _admission = admission;
+        let decoder_started = std::time::Instant::now();
         let decoder = SymphoniaStreamDecoder::open(reader, hint.as_deref())?;
+        record_decoder_open(&job, decoder_started);
         let decoder = RubatoResamplingDecoder::new(
             decoder,
             RubatoResamplerConfig::new(AudioFormat {
@@ -666,23 +746,6 @@ async fn run_live(
     }
 }
 
-async fn acquire_live_stream(
-    job: &ProducerJob,
-    live_streams: Arc<Semaphore>,
-    live_preloads: Arc<Semaphore>,
-) -> Result<AdmissionPermit> {
-    let preload = if matches!(job.role, ProducerRole::Next) {
-        Some(acquire_job_slot(live_preloads, &job.control.gate, &job.cancellation).await?)
-    } else {
-        None
-    };
-    let producer = acquire_job_slot(live_streams, &job.control.gate, &job.cancellation).await?;
-    Ok(AdmissionPermit {
-        _global: producer,
-        _preload: preload,
-    })
-}
-
 async fn stop_cpu_after_source_failure(task: &mut JoinHandle<Result<()>>) {
     if tokio::time::timeout(Duration::from_millis(250), &mut *task)
         .await
@@ -694,18 +757,10 @@ async fn stop_cpu_after_source_failure(task: &mut JoinHandle<Result<()>>) {
 
 async fn acquire_blocking_job(job: &ProducerJob) -> Result<AdmissionPermit> {
     let started = std::time::Instant::now();
-    let preload = if matches!(job.role, ProducerRole::Next) {
-        Some(
-            acquire_job_slot(
-                Arc::clone(&job.blocking_preloads),
-                &job.control.gate,
-                &job.cancellation,
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
+    let preload = acquire_preload_job_slot(job).await?;
+    if let Some(preload) = preload {
+        job.control.attach_preload_admission(preload);
+    }
     let producer = acquire_job_slot(
         Arc::clone(&job.blocking_producers),
         &job.control.gate,
@@ -714,13 +769,49 @@ async fn acquire_blocking_job(job: &ProducerJob) -> Result<AdmissionPermit> {
     .await?;
     metrics::histogram!(
         "music_stream.runtime.blocking_admission_wait_us",
-        "role" => role_name(job.role)
+        "role" => role_name(job.control.role())
     )
     .record(started.elapsed().as_micros() as f64);
-    Ok(AdmissionPermit {
-        _global: producer,
-        _preload: preload,
-    })
+    Ok(AdmissionPermit { _global: producer })
+}
+
+async fn acquire_preload_job_slot(job: &ProducerJob) -> Result<Option<OwnedSemaphorePermit>> {
+    let mut role = job.control.current_role_changed.subscribe();
+    loop {
+        if *role.borrow_and_update() {
+            return Ok(None);
+        }
+        if !job.control.gate.wait_async(&job.cancellation).await {
+            return Err(MusicStreamError::StreamClosed(
+                "producer cancelled before preload admission".to_owned(),
+            ));
+        }
+        let permit = Arc::clone(&job.blocking_preloads).acquire_owned();
+        tokio::pin!(permit);
+        tokio::select! {
+            _ = job.cancellation.cancelled() => {
+                return Err(MusicStreamError::StreamClosed(
+                    "producer cancelled before preload admission".to_owned(),
+                ));
+            }
+            _ = job.control.gate.wait_for_pause(&job.cancellation) => {}
+            changed = role.changed() => {
+                changed.map_err(|_| MusicStreamError::StreamClosed(
+                    "producer role state closed".to_owned(),
+                ))?;
+            }
+            result = &mut permit => {
+                let permit = result.map_err(|_| MusicStreamError::StreamClosed(
+                    "blocking preload admission was closed".to_owned(),
+                ))?;
+                return if job.control.current_role.load(Ordering::Acquire) {
+                    Ok(None)
+                } else {
+                    Ok(Some(permit))
+                };
+            }
+        }
+    }
 }
 
 async fn acquire_job_slot(
@@ -772,6 +863,7 @@ where
     let mut last_gain = None;
     let mut produced_ms = 0_u64;
     let mut ready_sent = false;
+    let mut first_opus_recorded = false;
     loop {
         if job.cancellation.is_cancelled() {
             return Ok(());
@@ -805,6 +897,15 @@ where
                 ));
             }
             job.output.send_blocking(frame, &job.cancellation)?;
+            if !first_opus_recorded {
+                metrics::histogram!(
+                    "music_stream.runtime.activation_to_first_opus_us",
+                    "role" => role_name(job.control.role()),
+                    "source" => source_kind_name(&job.track),
+                )
+                .record(job.activation_started.elapsed().as_micros() as f64);
+                first_opus_recorded = true;
+            }
             if !lease.acquire() {
                 return Err(MusicStreamError::StreamClosed(
                     "producer cancelled while waiting for CPU".to_owned(),
@@ -813,7 +914,7 @@ where
             produced_ms = produced_ms.saturating_add(duration_ms);
             metrics::counter!(
                 "music_stream.runtime.opus_frames",
-                "role" => role_name(job.role)
+                "role" => role_name(job.control.role())
             )
             .increment(1);
             if !ready_sent
@@ -829,12 +930,17 @@ where
                     .map_err(|_| {
                         MusicStreamError::StreamClosed("worker event loop closed".to_owned())
                     })?;
+                ready_sent = true;
+                if !job.control.promotion_gate.wait_blocking(&job.cancellation) {
+                    return Err(MusicStreamError::StreamClosed(
+                        "preloaded producer was cancelled before promotion".to_owned(),
+                    ));
+                }
                 if !lease.acquire() {
                     return Err(MusicStreamError::StreamClosed(
                         "producer cancelled while waiting for CPU".to_owned(),
                     ));
                 }
-                ready_sent = true;
             }
             Ok(())
         }) {
@@ -843,8 +949,11 @@ where
             Err(error) => return Err(error),
         };
         lease.release();
-        metrics::histogram!("music_stream.runtime.worker_turn_us", "role" => role_name(job.role))
-            .record(turn_started.elapsed().as_micros() as f64);
+        metrics::histogram!(
+            "music_stream.runtime.worker_turn_us",
+            "role" => role_name(job.control.role())
+        )
+        .record(turn_started.elapsed().as_micros() as f64);
         if report.source_ended {
             if produced_ms == 0 {
                 return Err(MusicStreamError::DecodeError(
@@ -871,19 +980,63 @@ fn role_name(role: ProducerRole) -> &'static str {
     }
 }
 
-fn live_hint_extension(source: &TrackSource) -> Option<&str> {
+fn source_kind_name(source: &TrackSource) -> &'static str {
+    match source.kind {
+        TrackKind::File => "file",
+        TrackKind::Url => "url",
+        TrackKind::Live => "live",
+    }
+}
+
+fn record_source_ready(job: &ProducerJob) {
+    metrics::histogram!(
+        "music_stream.runtime.activation_to_source_ready_us",
+        "role" => role_name(job.role),
+        "source" => source_kind_name(&job.track),
+    )
+    .record(job.activation_started.elapsed().as_micros() as f64);
+}
+
+fn record_codec_start(job: &ProducerJob) {
+    metrics::histogram!(
+        "music_stream.runtime.activation_to_codec_start_us",
+        "role" => role_name(job.role),
+        "source" => source_kind_name(&job.track),
+    )
+    .record(job.activation_started.elapsed().as_micros() as f64);
+}
+
+fn record_decoder_open(job: &ProducerJob, started: std::time::Instant) {
+    metrics::histogram!(
+        "music_stream.runtime.decoder_open_us",
+        "role" => role_name(job.role),
+        "source" => source_kind_name(&job.track),
+    )
+    .record(started.elapsed().as_micros() as f64);
+}
+
+fn decoder_hint(source: &TrackSource) -> Option<String> {
+    if let Some(hint) = source.format_hint.as_deref() {
+        let hint = hint.trim();
+        if !hint.is_empty()
+            && hint.len() <= 16
+            && hint.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Some(hint.to_ascii_lowercase());
+        }
+    }
     let path = source.url.as_deref()?.split(['?', '#']).next()?;
     let extension = path.rsplit('/').next()?.rsplit_once('.')?.1;
     (!extension.is_empty()
-        && extension.len() <= 8
+        && extension.len() <= 16
         && extension.bytes().all(|byte| byte.is_ascii_alphanumeric()))
-    .then_some(extension)
+    .then(|| extension.to_ascii_lowercase())
 }
 
 fn supports_progressive_url(source: &TrackSource) -> bool {
-    live_hint_extension(source).is_some_and(|extension| {
+    decoder_hint(source).is_some_and(|extension| {
         matches!(
-            extension.to_ascii_lowercase().as_str(),
+            extension.as_str(),
             "aac" | "flac" | "mp3" | "oga" | "ogg" | "opus" | "wav" | "wave"
         )
     })
@@ -892,6 +1045,7 @@ fn supports_progressive_url(source: &TrackSource) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::decode::{DecodedChunk, MemoryDecoder};
     use crate::source::{SourceArtifactCache, SourceDownloadRegistry, SourceRuntimeResources};
 
     #[tokio::test]
@@ -899,9 +1053,15 @@ mod tests {
         let (output, receiver) = opus_queue::bounded(40);
         let cancellation = CancellationToken::new();
         let (events, mut event_rx) = mpsc::channel(1);
+        let control = Arc::new(MediaControl::new(
+            VolumeLevel::default(),
+            GainLevel::default(),
+            ProducerRole::Current,
+        ));
         let task = supervise_producer(
             async { panic!("injected producer panic") },
             ProducerRole::Current,
+            Arc::clone(&control.current_role),
             9,
             cancellation.clone(),
             events,
@@ -911,10 +1071,7 @@ mod tests {
             role: ProducerRole::Current,
             generation: 9,
             receiver: Some(receiver),
-            control: Arc::new(MediaControl::new(
-                VolumeLevel::default(),
-                GainLevel::default(),
-            )),
+            control,
             cancellation,
             task: Some(task),
         };
@@ -933,6 +1090,130 @@ mod tests {
             .stop()
             .await
             .expect("reported panic is already handled");
+    }
+
+    #[tokio::test]
+    async fn promoted_producer_failure_is_reported_as_current() {
+        let (output, _receiver) = opus_queue::bounded(40);
+        let cancellation = CancellationToken::new();
+        let (events, mut event_rx) = mpsc::channel(1);
+        let (release, released) = tokio::sync::oneshot::channel();
+        let control = Arc::new(MediaControl::new(
+            VolumeLevel::default(),
+            GainLevel::default(),
+            ProducerRole::Next,
+        ));
+        let task = supervise_producer(
+            async move {
+                let _ = released.await;
+                Err(MusicStreamError::DecodeError("injected".to_owned()))
+            },
+            ProducerRole::Next,
+            Arc::clone(&control.current_role),
+            10,
+            cancellation,
+            events,
+            output,
+        );
+
+        control.promote_to_current();
+        release.send(()).expect("release producer");
+        assert!(matches!(
+            event_rx.recv().await.expect("failure event"),
+            WorkerEvent::CurrentFailed { generation: 10, .. }
+        ));
+        task.supervisor.await.expect("supervisor");
+    }
+
+    #[tokio::test]
+    async fn promotion_releases_preload_admission_and_promotes_shared_download() {
+        let preloads = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&preloads)
+            .acquire_owned()
+            .await
+            .expect("preload permit");
+        let flight = crate::source::SharedUrlFlight::new();
+        let subscription = flight.subscribe(false, false);
+        let control = MediaControl::new(
+            VolumeLevel::default(),
+            GainLevel::default(),
+            ProducerRole::Next,
+        );
+        control.attach_preload_admission(permit);
+        control.attach_shared_url(subscription.control());
+        assert_eq!(preloads.available_permits(), 0);
+        assert!(!*flight.current_priority.borrow());
+
+        control.promote_to_current();
+
+        assert_eq!(preloads.available_permits(), 1);
+        assert!(*flight.current_priority.borrow());
+        assert!(
+            control
+                .promotion_gate
+                .wait_async(&CancellationToken::new())
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn next_stops_encoding_at_prime_until_promotion() {
+        let (output, receiver) = opus_queue::bounded(400);
+        let cancellation = CancellationToken::new();
+        let control = Arc::new(MediaControl::new(
+            VolumeLevel::default(),
+            GainLevel::default(),
+            ProducerRole::Next,
+        ));
+        let (events, mut event_rx) = mpsc::channel(1);
+        let job = ProducerJob {
+            activation_started: std::time::Instant::now(),
+            generation: 11,
+            track: TrackSource {
+                id: "prime-test".to_owned(),
+                kind: TrackKind::File,
+                url: None,
+                path: Some("/unused".to_owned()),
+                format_hint: None,
+                seekable: Some(true),
+            },
+            start_position_ms: 0,
+            decode_batch_ms: 400,
+            opus: LibOpusEncoderConfig::default(),
+            control: Arc::clone(&control),
+            output,
+            cancellation: cancellation.clone(),
+            role: ProducerRole::Next,
+            next_prime_ms: Some(100),
+            events,
+            cpu_scheduler: Arc::new(CpuScheduler::with_maximum(1)),
+            blocking_producers: Arc::new(Semaphore::new(1)),
+            blocking_preloads: Arc::new(Semaphore::new(1)),
+        };
+        let decoder = MemoryDecoder::new([DecodedChunk {
+            sample_rate: SAMPLE_RATE,
+            channels: CHANNELS,
+            samples_interleaved: vec![0.0; 20 * FRAME_SAMPLES as usize * CHANNELS as usize],
+        }]);
+        let lease = Arc::new(CpuLease::new(
+            Arc::clone(&control.current_role),
+            cancellation.clone(),
+            Arc::clone(&job.cpu_scheduler),
+        ));
+        let worker = tokio::task::spawn_blocking(move || run_cpu(decoder, job, lease));
+
+        assert!(matches!(
+            event_rx.recv().await.expect("next ready"),
+            WorkerEvent::NextReady { generation: 11 }
+        ));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(receiver.buffered_ms(), 100);
+
+        cancellation.cancel();
+        worker
+            .await
+            .expect("worker join")
+            .expect("cancelled worker");
     }
 
     #[tokio::test]
@@ -992,12 +1273,14 @@ mod tests {
             false,
         );
         let job = ProducerJob {
+            activation_started: std::time::Instant::now(),
             generation: 1,
             track: TrackSource {
                 id: "slow-url".to_owned(),
                 kind: TrackKind::Url,
                 url: Some("http://127.0.0.1:9/audio.mp3".to_owned()),
                 path: None,
+                format_hint: None,
                 seekable: Some(true),
             },
             start_position_ms: 0,
@@ -1006,6 +1289,7 @@ mod tests {
             control: Arc::new(MediaControl::new(
                 VolumeLevel::default(),
                 GainLevel::default(),
+                ProducerRole::Current,
             )),
             output,
             cancellation: cancellation.clone(),
@@ -1033,10 +1317,12 @@ mod tests {
         let first_control = Arc::new(MediaControl::new(
             VolumeLevel::default(),
             GainLevel::default(),
+            ProducerRole::Current,
         ));
         let second_control = Arc::new(MediaControl::new(
             VolumeLevel::default(),
             GainLevel::default(),
+            ProducerRole::Current,
         ));
         first_control.attach_shared_url(first_subscription.control());
         second_control.attach_shared_url(second_subscription.control());
@@ -1070,26 +1356,39 @@ mod tests {
     }
 
     #[test]
-    fn progressive_url_policy_excludes_seek_dependent_mp4_containers() {
-        let source = |url: &str| TrackSource {
+    fn progressive_url_policy_prefers_explicit_format_hint_and_excludes_mp4() {
+        let source = |url: &str, format_hint: Option<&str>| TrackSource {
             id: url.to_owned(),
             kind: TrackKind::Url,
             url: Some(url.to_owned()),
             path: None,
+            format_hint: format_hint.map(str::to_owned),
             seekable: Some(true),
         };
 
         assert!(supports_progressive_url(&source(
-            "https://cdn.test/audio.mp3?sig=1"
+            "https://cdn.test/audio.mp3?sig=1",
+            None,
         )));
         assert!(supports_progressive_url(&source(
-            "https://cdn.test/audio.flac"
+            "https://cdn.test/audio.flac",
+            None,
         )));
         assert!(!supports_progressive_url(&source(
-            "https://cdn.test/audio.m4a"
+            "https://cdn.test/audio.m4a",
+            None,
         )));
         assert!(!supports_progressive_url(&source(
-            "https://cdn.test/opaque"
+            "https://cdn.test/opaque",
+            None,
+        )));
+        assert!(supports_progressive_url(&source(
+            "https://cdn.test/opaque?sig=1",
+            Some("MP3"),
+        )));
+        assert!(!supports_progressive_url(&source(
+            "https://cdn.test/audio.mp3",
+            Some("m4a"),
         )));
     }
 

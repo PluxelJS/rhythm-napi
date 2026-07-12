@@ -217,9 +217,9 @@ impl StreamActor {
             StreamCommand::Pause => self.pause(&mut output)?,
             StreamCommand::Stop => self.stop(&mut output),
             StreamCommand::Seek { seconds } => self.seek(seconds, &mut output)?,
-            StreamCommand::SetNext(next) => self.set_next(next, &mut output),
+            StreamCommand::SetNext(next) => self.set_next(next, &mut output)?,
             StreamCommand::SwitchTrack { current, next } => {
-                self.switch_track(current, next, &mut output);
+                self.switch_track(current, next, &mut output)?;
             }
             StreamCommand::RefreshCurrentSource { current } => {
                 self.refresh_current_source(current, &mut output)?;
@@ -415,18 +415,6 @@ impl StreamActor {
             ));
         }
         if matches!(self.play_state, PlayState::Playing | PlayState::Buffering) {
-            let live_next_generation = self
-                .next
-                .as_ref()
-                .filter(|next| next.task_active && next.source.is_live())
-                .map(|next| next.generation);
-            if let Some(generation) = live_next_generation {
-                output.actions.push(TaskAction::CancelNext { generation });
-                if let Some(next) = self.next.as_mut() {
-                    next.task_active = false;
-                    next.ready = false;
-                }
-            }
             if let Some(current) = self.current.as_ref()
                 && current.task_active
             {
@@ -498,7 +486,12 @@ impl StreamActor {
         Ok(())
     }
 
-    fn set_next(&mut self, next: Option<TrackSource>, output: &mut ActorEffects) {
+    fn set_next(&mut self, next: Option<TrackSource>, output: &mut ActorEffects) -> Result<()> {
+        if next.as_ref().is_some_and(TrackSource::is_live) {
+            return Err(MusicStreamError::Unsupported(
+                "live sources cannot be preloaded as next without a timeshift model".to_owned(),
+            ));
+        }
         match (self.next.as_ref(), next) {
             (None, None) => {}
             (Some(old), None) => {
@@ -528,6 +521,7 @@ impl StreamActor {
                 self.next = Some(slot);
             }
         }
+        Ok(())
     }
 
     fn switch_track(
@@ -535,7 +529,12 @@ impl StreamActor {
         current: TrackSource,
         next: Option<TrackSource>,
         output: &mut ActorEffects,
-    ) {
+    ) -> Result<()> {
+        if next.as_ref().is_some_and(TrackSource::is_live) {
+            return Err(MusicStreamError::Unsupported(
+                "live sources cannot be preloaded as next without a timeshift model".to_owned(),
+            ));
+        }
         let preserve_pause = self.play_state == PlayState::Paused;
         let old_current_generation = self.current.take().map(|slot| slot.generation);
         let old_next_generation = self.next.take().map(|slot| slot.generation);
@@ -577,6 +576,7 @@ impl StreamActor {
         } else {
             PlayState::Buffering
         };
+        Ok(())
     }
 
     fn refresh_current_source(
@@ -787,6 +787,7 @@ mod tests {
             kind: TrackKind::File,
             url: None,
             path: Some(format!("/tmp/{id}.mp3")),
+            format_hint: None,
             seekable: Some(true),
         }
     }
@@ -797,6 +798,7 @@ mod tests {
             kind: TrackKind::Url,
             url: Some(format!("https://example.test/{id}.mp3")),
             path: None,
+            format_hint: None,
             seekable: None,
         }
     }
@@ -807,6 +809,7 @@ mod tests {
             kind: TrackKind::Live,
             url: Some(url.to_owned()),
             path: None,
+            format_hint: None,
             seekable: Some(false),
         }
     }
@@ -817,6 +820,7 @@ mod tests {
             kind: TrackKind::Live,
             url: Some(url.to_owned()),
             path: None,
+            format_hint: None,
             seekable: Some(true),
         }
     }
@@ -1088,50 +1092,15 @@ mod tests {
     }
 
     #[test]
-    fn pausing_file_current_cancels_live_preload_and_resume_restarts_it() {
+    fn live_next_is_rejected_without_a_timeshift_model() {
         let live = live_track("live-next", "https://example.test/live");
-        let mut actor =
-            StreamActor::new("s1".to_owned(), Some(track("current")), Some(live.clone()));
+        let mut actor = StreamActor::new("s1".to_owned(), Some(track("current")), None);
         actor.handle_command(StreamCommand::Play).expect("play");
-        let current_generation = actor.current_generation();
-        let next_generation = actor.next.as_ref().expect("next").generation;
-
-        let paused = actor.handle_command(StreamCommand::Pause).expect("pause");
-
-        assert_eq!(paused.status.play_state, PlayState::Paused);
-        assert_eq!(
-            paused.actions,
-            vec![
-                TaskAction::CancelNext {
-                    generation: next_generation,
-                },
-                TaskAction::PauseCurrent {
-                    generation: current_generation,
-                },
-            ]
-        );
-        assert!(!actor.next.as_ref().expect("next retained").task_active);
-
-        actor.handle_worker_event(WorkerEvent::NextReady {
-            generation: next_generation,
-        });
-        actor.handle_worker_event(WorkerEvent::NextFailed {
-            generation: next_generation,
-            code: ErrorCode::InvalidSource,
-            message: "cancelled task finished late".to_owned(),
-        });
-        let retained = actor.next.as_ref().expect("cancelled next retained");
-        assert!(!retained.task_active);
-        assert!(!retained.ready);
-
-        let resumed = actor.handle_command(StreamCommand::Play).expect("resume");
-        assert!(resumed.actions.contains(&TaskAction::ResumeCurrent {
-            generation: current_generation,
-        }));
-        assert!(resumed.actions.contains(&TaskAction::PrepareNext {
-            generation: next_generation,
-            track: live,
-        }));
+        let error = actor
+            .handle_command(StreamCommand::SetNext(Some(live)))
+            .expect_err("live next must be rejected");
+        assert_eq!(error.code(), ErrorCode::Unsupported);
+        assert!(actor.next.is_none());
     }
 
     #[test]

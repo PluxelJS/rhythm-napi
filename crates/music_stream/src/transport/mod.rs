@@ -8,6 +8,7 @@ use crate::error::{MusicStreamError, Result};
 const RTP_HEADER_BYTES: usize = 12;
 const DEFAULT_MTU: usize = 1_200;
 const MIN_RTP_MTU: usize = 64;
+const MAX_RTP_DATAGRAM_BYTES: usize = 65_507;
 const MIN_OPUS_BITRATE_BPS: u32 = 500;
 const MAX_OPUS_BITRATE_BPS: u32 = 512_000;
 const NTP_UNIX_EPOCH_OFFSET_SECS: u64 = 2_208_988_800;
@@ -28,9 +29,14 @@ impl RtpEncryptionConfig {
         match self {
             Self::None => Ok(()),
             Self::External { mode, secret_key } => {
-                if mode.trim().is_empty() || secret_key.as_ref().is_some_and(Vec::is_empty) {
+                if mode.trim().is_empty()
+                    || mode.len() > 64
+                    || secret_key
+                        .as_ref()
+                        .is_some_and(|key| key.is_empty() || key.len() > 4_096)
+                {
                     return Err(MusicStreamError::InvalidConfig(
-                        "RTP protection mode and key must be non-empty".to_owned(),
+                        "RTP protection mode and key must fit bounded non-empty limits".to_owned(),
                     ));
                 }
                 Ok(())
@@ -85,6 +91,7 @@ impl RtpTransportConfig {
             || self.remote_rtcp_port == Some(0)
             || self.payload_type > 127
             || self.mtu < MIN_RTP_MTU
+            || self.mtu > MAX_RTP_DATAGRAM_BYTES
             || self.opus_bitrate_bps.is_some_and(|bitrate| {
                 !(MIN_OPUS_BITRATE_BPS..=MAX_OPUS_BITRATE_BPS).contains(&bitrate)
             })
@@ -148,7 +155,7 @@ impl Default for RtpPacketizerConfig {
 
 impl RtpPacketizerConfig {
     pub fn validate(&self) -> Result<()> {
-        if self.payload_type > 127 || self.mtu < MIN_RTP_MTU {
+        if self.payload_type > 127 || !(MIN_RTP_MTU..=MAX_RTP_DATAGRAM_BYTES).contains(&self.mtu) {
             return Err(MusicStreamError::InvalidConfig(
                 "invalid RTP packetizer configuration".to_owned(),
             ));
@@ -331,4 +338,19 @@ pub fn rtcp_round_trip_time_micros(
     let arrival = compact_ntp_timestamp(arrival);
     let elapsed = arrival.wrapping_sub(last_sender_report);
     (elapsed >= delay).then(|| rtcp_compact_duration_micros(elapsed - delay))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_rejects_mtu_larger_than_a_udp_datagram() {
+        let mut config = RtpTransportConfig::new("127.0.0.1", 5_000, 1);
+        config.mtu = MAX_RTP_DATAGRAM_BYTES + 1;
+        assert_eq!(
+            config.validate().expect_err("oversized MTU").code(),
+            crate::ErrorCode::InvalidConfig
+        );
+    }
 }

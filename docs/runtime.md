@@ -1,118 +1,230 @@
-# Runtime
+# 运行模型
 
-## 任务树
+## 任务结构
 
 ```text
-StreamRuntime
-  ├── worker-event loop
-  ├── persistent RTP/RTCP sender task
-  ├── current producer task
-  │     └── blocking CPU decode task
-  └── optional next producer task
-        └── blocking CPU decode task
+Streamer
+├── shared RuntimeResources
+├── shared URL flight supervisors
+└── StreamRuntime
+    ├── worker-event loop
+    ├── persistent RTP/RTCP sender task
+    ├── current producer supervisor
+    │   └── producer worker
+    │       └── optional blocking codec task
+    └── optional next producer supervisor
+        └── producer worker
+            └── optional blocking codec task
 ```
 
-producer task 负责 async source 准备，并通过 `spawn_blocking` 运行 codec。sender task 只做 queue receive、prebuffer、`sleep_until`、packetize 和 socket I/O。supervisor、producer、Opus queue 与 sender 分属独立模块。
+producer worker 先异步等待 source 和资源 admission，只有真正要进入 codec 阶段时才占用 blocking
+producer 额度并创建 `spawn_blocking`。blocking task 内部以短 turn 获取 CPU lease；在等待 source
+字节、满 Opus queue 或 worker event capacity 时释放 lease。
 
-producer只有在 async admission获得 blocking producer额度后才创建 `spawn_blocking` task；next还必须先获得更小的 preload额度，因此预载不能占满所有 blocking worker容量。CPU scheduler独立限制真正执行 codec的并行 turn并保持 current优先。
+sender task 独立执行 queue receive、prebuffer、`sleep_until`、packetize、UDP 和 RTCP。producer
+退出、panic 或失败由 supervisor 转换成 generation-scoped worker event；已经事件化的媒体失败在
+stop 时不会重复上报。supervisor 自身失败和退出超时才升级为 runtime failure。
 
-URL flight的HTTP和tempfile admission也区分current/preload：preload只能使用子额度，至少为
-current保留一个HTTP槽和四分之一tempfile预算。若current加入一个仍在排队的preload flight，
-该有限传输永久提升为current优先级，避免在partial response中途重新申请资源。
-live HTTP连接由 `maxConcurrentLiveStreams` 独立限制并同样为current保留一个位置；所有live
-byte bridge共享 `maxLiveBufferedBytes`，不再使用会混淆URL spool的泛化buffer名称。
+## 状态模型
 
-零起点 URL的HTTP task与stream decoder并行运行：writer按响应顺序写入growing tempfile，
-decoder达到prebuffer后即可驱动sender；HTTP完成只决定cache promotion，不再决定首包时间。
-seek起点非零时仍等待完整artifact并使用Symphonia准确seek。
+公开状态只有五种：
 
-decoder拥有独立文件reader；读取位置追上已写长度时在condvar等待并释放CPU lease，新的磁盘
-区间可见后再恢复调度。URL不再复制一份长期内存byte bridge，同一spool可扩展为多个从offset 0
-开始的reader，同时仍保持严格顺序和完整cache。sender记录
-`activation_to_prebuffer_us`作为端到端首缓冲延迟。
+| 状态 | 含义 |
+| --- | --- |
+| `idle` | runtime 存在，但当前没有可播放 generation；可等待宿主提供 next/current |
+| `buffering` | current 已启动但尚未达到 prebuffer，或 promotion 前仍在等待 ready |
+| `playing` | current 已 prebuffer 并由 sender 按实时节拍发送 |
+| `paused` | 宿主明确冻结了可暂停媒体；该意图跨 current/next 空窗和 generation 替换保留 |
+| `stopped` | runtime 已终止，sender 与 producer 已收敛，不再接受播放控制 |
+
+`Buffering` 不承诺正在占用 CPU，它也可能在等待 HTTP、tempfile、blocking admission 或足够的
+媒体字节。`Paused` 是用户意图，不是某个 task 的瞬时状态；seek、switch、refresh 和 promotion
+都不能隐式恢复播放。
+
+## 启动与首包
+
+启动按以下顺序发生：
+
+```text
+validate all configuration
+  → reserve stream identity
+  → bind persistent RTP/RTCP sender
+  → create actor and current producer
+  → attach current queue receiver to sender
+  → producer obtains source and builds codec pipeline
+  → queue reaches prebuffer threshold
+  → actor enters Playing
+  → sender emits first RTP packet
+```
+
+先绑定 sender 能让启动期 transport 错误同步失败，而不是在后台留下假 stream。URL 的 HTTP task
+与 stream decoder 并行；首包只依赖 probe、decode 和 prebuffer 所需字节，完整下载只决定 cache
+promotion。`activation_to_prebuffer_us` 记录从 generation 激活到 prebuffer ready 的时间。
+
+完整首包分解、渐进格式边界和优化判断见 [latency.md](latency.md)。
+
+默认媒体参数是 20 ms Opus frame、100 ms prebuffer、400 ms encoded capacity、200 ms next prime、
+80 ms decode batch 和 100 ms最大 playout lateness。这些值表达低延迟与抗抖动之间的默认折中，
+不是吞吐越大越好的缓存目标。
+
+## Current、next 与 promotion
+
+current 是 sender 当前消费的 generation。next 是独立 producer，它可以提前完成 source、decode、
+resample 和 encode，直到 queue 达到 `nextPrimeMs` 后报告 ready，然后在专用 promotion gate 上停止
+继续解码。提升时不重建 producer：同一 decoder/encoder 切换为 current CPU 优先级，释放
+blocking preload 子额并继续向已交给 sender 的 queue 生产。提升后的失败按 current failure
+上报，不能因 producer 的初始身份而错分为 next failure。
+
+current 正常结束时：
+
+- ready next 的 receiver 直接转交给 sender；
+- next 尚未 ready 时保留等待关系，不把未准备好的媒体强行激活；
+- 没有 next 时进入 idle 并产生 `nextNeeded`；
+- promotion 保持 RTP session、音量、增益和显式 pause 意图。
+
+next 失败只移除 next 并报告错误，不中断仍在播放的 current。current 失败则丢弃它的 backlog，
+按同样规则尝试 promotion；Rust 不决定失败后应该重播、跳过还是换节点。
+
+## Seek、switch 与 source refresh
+
+三者都会创建或替换 generation，但用途不同：
+
+- seek 保持 current 内容身份，取消旧 producer，并从目标时间创建新 generation；
+- switch 接受新的 current/next，是宿主主动改变播放内容；
+- source refresh 只允许相同稳定内容身份，用于 provider URL 过期后替换临时 URL。
+
+文件和有界 URL 默认 seekable。文件直接 seek；有界 URL 非零 seek 等待完整 artifact 后使用
+Symphonia accurate seek。live 永远 non-seekable。所有旧 generation 的异步结果都由 actor 丢弃。
+
+替换遵循“先建新、后覆盖旧”的可原子部分；若 sender activate 等不可回滚动作失败，runtime
+统一进入 stopped，而不是提交一半状态。
+
+## Pause 与恢复
+
+### File 和 bounded URL
+
+pause 冻结 sender 消费、current producer 和 next producer。已有 Opus queue 保持原位，RTP media
+timestamp 不因暂停的 wall-clock 时间推进。resume 先打开 producer gate，再等待 sender resume
+acknowledgement，从原媒体位置继续。
+
+有界 HTTP 的 active I/O timeout 只计算活跃读取时间。pause 保留同一个 pinned request/body future，
+恢复后继续当前 response；不能通过丢弃 reqwest future 模拟暂停，因为那会关闭请求并破坏容器流。
+
+shared URL flight 按 subscriber 聚合暂停：一个 stream 暂停会停止自己的 reader 和 producer；若仍
+有其他 active subscriber，物理 HTTP transfer 继续。只有所有 subscriber 都暂停时 transfer 才冻结，
+最后一个 subscriber 离开才取消传输并清理 partial spool。
+
+暂停期间设置 next、switch、seek 或 refresh 只改变 slot 和播放意图，不建立新连接或启动 codec；
+显式 resume 才分配资源。
+
+### Live
+
+live 没有持久 timeshift store，pause 后无法回到准确媒体位置，因此 pause 返回 `UNSUPPORTED`。
+系统不把“停止消费但继续下载并丢弃”伪装成 pause。live 同样不能 seek或作为 next preload；宿主
+需要切入 live时应把它作为新的 current，此时才建立接近 live edge的连接。
+
+## Admission 与资源优先级
+
+等待上游资源时不能先占住下游稀缺资源。bounded URL 的顺序固定为：
+
+```text
+tempfile worst-case quota
+  → HTTP connection slot
+  → growing spool publication
+  → blocking producer slot
+  → CPU turn
+```
+
+因此磁盘压力不占 HTTP 槽，慢网络不占 blocking worker，decoder 等新字节不占 CPU lease。
+
+`RuntimeResources` 为 current 保留资源：
+
+| 资源 | 总限制 | preload 约束 |
+| --- | --- | --- |
+| stream | `maxStreams` | 硬限制 active/starting runtime、sender task和UDP socket |
+| CPU turn | `maxCpuWorkers` | current 等待时 next 不重新获取；多核时至少留一个位置 |
+| blocking producer | `maxBlockingProducers` | next 受更小的 `maxBlockingPreloads` 限制 |
+| bounded HTTP | `maxConcurrentHttpDownloads` | 至少留一个 current 槽 |
+| live connection | `maxConcurrentLiveStreams` | 至少留一个 current 槽 |
+| tempfile | `maxTempfileBytes` | preload 最多使用四分之一预算 |
+| live bytes | `maxLiveBufferedBytes` | 所有 live bridge 按实际字节共享 |
+
+每个 source 的 `maxBytes` 不得超过 `Streamer` tempfile 预算的四分之一，单个 live bridge 也必须
+小于共享 live byte 预算。这些关系在启动前校验，避免运行中等待永远无法满足的 semaphore。
 
 ## 背压
 
-- live byte bridge 使用 byte-counting semaphore，容量是实际字节而不是 chunk 数量；过大的 HTTP chunk 会零拷贝切片后逐段进入 bridge。
-- Opus bridge 是唯一的 duration-bounded queue，容量直接使用 `encoded_capacity_ms`，不按对象数近似。
-- sender pause 后停止消费，producer 最终阻塞在同一个 queue。
-- next producer 填满预载窗口后阻塞，不会无限提前编码。
-- receiver 被切换或取消时，producer 的 blocking send 被唤醒并退出。
-
-## CPU 调度
-
-文件、tempfile 和 live producer 的 codec 阶段都通过统一 CPU scheduler。current 有优先权；preload 最多使用 `CPU-1` 的预算，至少为 current 保留一个执行位置。worker 在等待满 Opus queue 或 worker event queue 前释放 CPU lease，背压不会伪装成 CPU 占用。
-
-live 的 `StreamingByteReader` 只在真正进入 `blocking_recv` 前释放 lease，拿到网络字节后再参与调度；因此 Symphonia/Rubato/DSP/Opus 受统一预算约束，而网络 stall 不占 CPU 位置。等待 scheduler 的任务定期检查 cancellation，已取消 generation 不会残留在 current-priority waiter 中。
-
-## Pacing
-
-默认 Opus frame 是 20 ms、960 samples/channel、48 kHz。sender 每次 deadline 只发送一帧：
-Node调用方可通过 `startStream.buffer` 调整 `prebufferMs`、`encodedCapacityMs`、
-`nextPrimeMs`、`decodeBatchMs`和 `maxPlayoutLatenessMs`；所有媒体时长关系在启动前统一校验。
+背压沿着真实数据路径传播：
 
 ```text
-wait prebuffer
+UDP pacing
+  ← OpusQueue capacity
+  ← encoder / DSP / resampler / decoder
+  ← growing spool or live byte bridge
+  ← HTTP body
+```
+
+- Opus queue 按媒体毫秒计量，不按 frame 个数近似。
+- live bridge 按实际字节申请全局和每流 permit；超大 HTTP chunk 被零拷贝切片后分段进入。
+- next 达到 prime 窗口后停止生产，不无限提前解码整首歌。
+- receiver 被替换时关闭 queue 并唤醒 blocking producer。
+- wait observer 只在真正阻塞读取前释放 CPU lease，返回计算后重新参与调度。
+
+## 实时 pacing 与迟滞恢复
+
+sender 每个 deadline 最多发送一帧，绝不通过 burst 清空 backlog：
+
+```text
+wait for prebuffer
 deadline = now
 loop:
   sleep_until(deadline)
-  if lateness > max_playout_lateness:
-    drop stale frames while a newer frame is available
-    advance RTP timestamp and media position, not sequence
-  pop one frame
-  packetize with persistent sequence/timestamp
-  async UDP send
-  deadline += frame duration
-  if late: rebase to now + frame duration
+  while lateness exceeds limit and a newer frame exists:
+    drop oldest stale frame
+    advance RTP timestamp and media position
+  send one frame
+  increment sequence only after successful UDP send
+  schedule next frame deadline
 ```
 
-不会 burst 发送 backlog。默认最多保留 100 ms wall-clock迟滞；恢复时只丢弃已有后续帧的
-最旧 Opus frame，绝不丢掉暂时 starve 时唯一可播的帧。被丢媒体推进 timestamp和播放位置，
-但不消耗 sequence、packet/octet计数；首个实际 packet仍带 marker。underrun 后重新满足
-prebuffer，再从新的 wall-clock base恢复；RTP media clock不回退。progress和 metrics记录
-dropped frames/media、恢复次数及观测到的最大 lateness。
+丢弃的媒体推进 timestamp，因为接收端媒体时钟必须跳过那段时间；sequence 不推进，因为没有 RTP
+packet。唯一可播放帧不会因暂时 starve 被丢掉。underrun 后 sender 重新等待 prebuffer，并从新的
+wall-clock base 恢复，不倒退 RTP clock。
 
-packetizer 直接 marshal 到 sender 复用的 `BytesMut` 并原地发送，不再为每个 RTP packet 复制第二份 buffer。
+## 错误与监督
 
-## Pause 与 resume
+错误分为三层：
 
-- file 和有界 URL 的 pause 是 stream 级冻结：current、next preload、source transfer、decode、encode 和 RTP 同时停止。
-- 暂停状态下新增或替换的 producer 从创建起保持 paused，不会偷偷建连或预解码。
-- current 已结束而 next 尚未 ready 的空窗也受同一 pause gate 控制；next promotion 不会清除 Paused，seek/switch/refresh 也不会隐式恢复。
-- 有界 HTTP 的 `ioTimeoutMs` 只计算单次活跃网络 I/O；open/body-read future 在 pause 期间保持 pinned，只冻结并重置 deadline，resume 后继续同一 attempt/response。丢弃 reqwest future 会关闭已发送请求，因此禁止用 cancellation 模拟 pause。
-- 同内容URL共享一个registry-owned transfer。任一subscriber活跃时继续下载，全部paused才冻结；
-  单个subscriber取消只关闭自己的reader，最后一个subscriber退出才取消HTTP与删除partial spool。
-- 恢复顺序是先打开 producer gate，再等待 sender resume acknowledgement；已有 Opus queue 从原位置继续，RTP timestamp 不跨暂停推进。
-- live source 没有持久 timeshift store，无法可靠恢复暂停时刻，因此 pause 明确返回 `UNSUPPORTED`。
-- live 作为 next 预载时若 stream 暂停，会取消该 HTTP generation；resume 后从新响应重新预载，不在内存中伪造 timeshift。
-- 暂停期间的 seek/switch/refresh/setNext 只更新 slot，不创建 producer；显式 resume 才分配 source、CPU 和 queue 资源。
+- source/codec/发送错误：关联当前 generation，进入 actor 的正常失败与 promotion 逻辑；
+- runtime action 错误：状态无法安全提交，停止 current、next 和 sender 后进入 stopped；
+- supervisor/stop/shutdown 错误：表示任务没有按约定收敛，返回稳定 `INTERNAL` 或原始错误。
 
-## RTCP
+producer和sender panic都由独立 supervisor转换为 active generation的 `INTERNAL` failure event。
+source failure 与 decoder EOF
+近同时发生时，优先保留非取消型 source terminal code，避免鉴权或 timeout 被降级成 decode error。
+sender command、RTP/RTCP datagram和 stop 都有 deadline。
 
-- SR 默认每 5 秒发送。
-- mux 模式复用 RTP socket；非 mux 使用独立 RTCP socket和 remote RTCP port。
-- RR 解析结果进入 status snapshot。
-- rolling quality window 在等级变化时产生 `networkQualityChanged`。
+## 事件交付
 
-## 取消与 shutdown
+媒体 action 成功后才发布事件。每个事件分配 `Streamer` 内单调 sequence；callback与补偿队列中的
+同一事件使用同一 sequence，可可靠去重。callback 是低延迟通知，使用有界 non-blocking bridge；
+补偿队列按 stream合并旧 `stateChanged`/quality快照并保留关键事件供宿主 drain。宿主不能假设
+callback永不丢失，callback panic/异常也与媒体动作隔离。
 
-- activate、pause、resume、deactivate 和 shutdown 都有 sender acknowledgement；API 返回时控制动作已经生效。
-- command和 worker event先在 actor副本上规划，runtime action成功后才提交状态并发布事件。
-- generation替换由新 producer/receiver原子覆盖旧槽；创建或 activate失败时旧状态不会被提前取消。
-- 不可回滚的 runtime action失败会收敛 current/next/sender，并以原始错误进入 `Stopped`，禁止留下无任务的假 `Buffering`。
-- live cancellation 同时停止 HTTP task并关闭 byte bridge。
-- producer 正常等待退出，超时后才 abort 外层 task。
-- sender 的拥塞事件使用固定语义槽位：prebuffer、terminal 和 latest quality；关键状态不丢，quality 自动合并。
-- sender task由 handle监督；command、RTP/RTCP datagram和 shutdown都有 deadline。producer stop会报告 panic或退出超时，不再静默 abort。
-- `Streamer.shutdown()` 遍历所有 stream，停止 runtime并清空 cache/event registry。
+事件语义属于事实通知：`nextNeeded` 请求宿主提供策略结果，`sourceRefreshNeeded` 请求同内容的新
+source，`networkQualityChanged` 提供策略输入，`error` 报告本次 generation 失败。Rust 不在事件
+处理过程中执行 playlist 决策。
 
-## 临时文件磁盘治理
+Node 可见 status/event 中的 source 只包含 ID、kind、format hint 和 seekable 属性，不回显 URL
+或本地 path。HTTP 错误同样只输出稳定分类与 status code，不包含可能携带签名 query 的
+reqwest 原始文本。
 
-同一 `Streamer` 的 URL spool和完整 artifact cache共享 `maxTempfileBytes`。cache最多占预算一半；
-每个 HTTP attempt在开连接前按 `source.http.maxBytes` 做 async最坏值 admission，完成后缩减为
-实际文件大小。预留整个 attempt而不是边写边申请，可避免多个半成品互相占满剩余配额后
-全部等待的死锁。admission顺序固定为 tempfile quota、HTTP并发槽、growing spool、
-blocking decoder worker；磁盘压力或慢网络不会占用尚未创建的下游worker，磁盘等待也不会
-占住网络槽。quota以 1 MiB为粒度，并且只在后台实际删除 tempfile之后释放。
-`Streamer.shutdown()`在drop cache和所有flight后向cleanup worker发送barrier，确认文件删除和
-quota释放完成后才返回。
+## Stop 与 shutdown
+
+单流 stop取消 current/next，等待 producer收敛，关闭 sender，并在容量为 `maxStreams` 的 LRU中
+保留最近 stopped status供幂等查询。取消会穿透 pause gate、HTTP、CPU scheduler和Opus queue。
+
+`Streamer.shutdown()`进入不可逆但幂等的 closed状态，阻止新的媒体操作，并发停止所有active runtime，清空inactive status、
+事件和 source cache。tempfile 最后一个引用释放后由专用清理线程删除；shutdown 最后等待 cleanup
+barrier，只有文件真实删除且 quota 释放后才返回。宿主必须显式等待 shutdown，不能依赖进程退出或
+对象析构完成异步清理。

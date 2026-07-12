@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use napi::bindgen_prelude::Status;
@@ -14,7 +15,14 @@ pub(crate) type EventCallback =
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventQueue {
-    events: Arc<RwLock<VecDeque<StreamEvent>>>,
+    events: Arc<RwLock<VecDeque<QueuedStreamEvent>>>,
+    next_sequence: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct QueuedStreamEvent {
+    sequence: u64,
+    event: StreamEvent,
 }
 
 impl EventQueue {
@@ -23,31 +31,50 @@ impl EventQueue {
         callback: &Arc<RwLock<Option<EventCallback>>>,
         event: StreamEvent,
     ) {
+        let queued = QueuedStreamEvent {
+            sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed) + 1,
+            event,
+        };
         if let Ok(mut events) = self.events.write() {
+            if let Some(position) = events
+                .iter()
+                .rposition(|existing| coalesces(&existing.event, &queued.event))
+            {
+                events.remove(position);
+            }
             if events.len() == 4_096 {
                 let removable = events
                     .iter()
-                    .position(|event| matches!(event, StreamEvent::StateChanged { .. }))
+                    .position(|queued| {
+                        matches!(
+                            queued.event,
+                            StreamEvent::StateChanged { .. }
+                                | StreamEvent::NetworkQualityChanged { .. }
+                        )
+                    })
                     .unwrap_or(0);
                 events.remove(removable);
             }
-            events.push_back(event.clone());
+            events.push_back(queued.clone());
         }
         if let Ok(callback) = callback.read()
             && let Some(callback) = callback.as_ref()
         {
-            let _ = callback.call(event_output(event), ThreadsafeFunctionCallMode::NonBlocking);
+            let _ = callback.call(
+                event_output(queued),
+                ThreadsafeFunctionCallMode::NonBlocking,
+            );
         }
     }
 
-    pub(crate) fn drain(&self, stream_id: Option<&str>) -> Result<Vec<StreamEvent>> {
+    pub(crate) fn drain(&self, stream_id: Option<&str>) -> Result<Vec<QueuedStreamEvent>> {
         let mut events = self.events.write().map_err(lock_error)?;
         let Some(stream_id) = stream_id else {
             return Ok(std::mem::take(&mut *events).into());
         };
         let (drained, kept): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut *events)
             .into_iter()
-            .partition(|event| belongs_to(event, stream_id));
+            .partition(|queued| belongs_to(&queued.event, stream_id));
         *events = kept;
         Ok(drained.into())
     }
@@ -58,21 +85,42 @@ impl EventQueue {
     }
 }
 
-pub(crate) fn event_output(event: StreamEvent) -> StreamEventOutput {
-    match event {
-        StreamEvent::StreamStarted { stream_id } => base("streamStarted", stream_id),
-        StreamEvent::StreamStopped { stream_id } => base("streamStopped", stream_id),
+fn coalesces(existing: &StreamEvent, incoming: &StreamEvent) -> bool {
+    match (existing, incoming) {
+        (
+            StreamEvent::StateChanged { status: left },
+            StreamEvent::StateChanged { status: right },
+        ) => left.stream_id == right.stream_id,
+        (
+            StreamEvent::NetworkQualityChanged {
+                stream_id: left, ..
+            },
+            StreamEvent::NetworkQualityChanged {
+                stream_id: right, ..
+            },
+        ) => left == right,
+        _ => false,
+    }
+}
+
+pub(crate) fn event_output(queued: QueuedStreamEvent) -> StreamEventOutput {
+    let sequence = i64::try_from(queued.sequence).unwrap_or(i64::MAX);
+    match queued.event {
+        StreamEvent::StreamStarted { stream_id } => base(sequence, "streamStarted", stream_id),
+        StreamEvent::StreamStopped { stream_id } => base(sequence, "streamStopped", stream_id),
         StreamEvent::StateChanged { status } => StreamEventOutput {
+            sequence,
             r#type: "stateChanged".to_owned(),
             stream_id: Some(status.stream_id.clone()),
             status: Some(StreamStatusOutput::from(status)),
             ..empty()
         },
-        StreamEvent::NextNeeded { stream_id } => base("nextNeeded", stream_id),
+        StreamEvent::NextNeeded { stream_id } => base(sequence, "nextNeeded", stream_id),
         StreamEvent::SourceRefreshNeeded {
             stream_id,
             track_id,
         } => StreamEventOutput {
+            sequence,
             r#type: "sourceRefreshNeeded".to_owned(),
             stream_id: Some(stream_id),
             track_id: Some(track_id),
@@ -83,6 +131,7 @@ pub(crate) fn event_output(event: StreamEvent) -> StreamEventOutput {
             quality,
             snapshot,
         } => StreamEventOutput {
+            sequence,
             r#type: "networkQualityChanged".to_owned(),
             stream_id: Some(stream_id),
             quality: Some(
@@ -112,6 +161,7 @@ pub(crate) fn event_output(event: StreamEvent) -> StreamEventOutput {
             code,
             message,
         } => StreamEventOutput {
+            sequence,
             r#type: "error".to_owned(),
             stream_id: Some(stream_id),
             code: Some(code.as_str().to_owned()),
@@ -133,8 +183,9 @@ fn belongs_to(event: &StreamEvent, stream_id: &str) -> bool {
     }
 }
 
-fn base(kind: &str, stream_id: String) -> StreamEventOutput {
+fn base(sequence: i64, kind: &str, stream_id: String) -> StreamEventOutput {
     StreamEventOutput {
+        sequence,
         r#type: kind.to_owned(),
         stream_id: Some(stream_id),
         ..empty()
@@ -143,6 +194,7 @@ fn base(kind: &str, stream_id: String) -> StreamEventOutput {
 
 fn empty() -> StreamEventOutput {
     StreamEventOutput {
+        sequence: 0,
         r#type: String::new(),
         stream_id: None,
         track_id: None,
