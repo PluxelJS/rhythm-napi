@@ -6,8 +6,6 @@
 /dist/
 /crates/*/coverage/
 /crates/*/dist/
-/crates/*/index.js
-/crates/*/index.d.ts
 /crates/*/*.node
 *.node
 *.log
