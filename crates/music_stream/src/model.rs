@@ -31,16 +31,6 @@ impl TrackSource {
     }
 
     #[must_use]
-    pub fn is_artifact_backed(&self) -> bool {
-        matches!(self.kind, TrackKind::File | TrackKind::Url)
-    }
-
-    #[must_use]
-    pub fn can_preload_as_next(&self) -> bool {
-        self.is_artifact_backed()
-    }
-
-    #[must_use]
     pub fn is_seekable(&self) -> bool {
         match self.kind {
             TrackKind::Live => false,
@@ -52,14 +42,10 @@ impl TrackSource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlayState {
     Idle,
-    Starting,
     Buffering,
     Playing,
     Paused,
-    Switching,
-    Stopping,
     Stopped,
-    Error,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,60 +160,48 @@ pub struct StreamStatus {
     pub next: Option<TrackSource>,
     pub play_state: PlayState,
     pub time_played_ms: u64,
-    pub time_total_ms: Option<u64>,
     pub generation: u64,
     pub volume: VolumeLevel,
     pub gain: GainLevel,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WatermarkConfig {
+pub struct MediaBufferConfig {
     pub decode_batch_ms: u64,
-    pub decoded_low_water_ms: u64,
-    pub decoded_high_water_ms: u64,
-    pub encoded_low_water_ms: u64,
-    pub encoded_high_water_ms: u64,
+    pub encoded_capacity_ms: u64,
+    pub prebuffer_ms: u64,
     pub next_prime_ms: u64,
-    pub pause_encoded_limit_ms: u64,
+    /// Maximum wall-clock delay retained by the real-time sender before stale
+    /// encoded frames are discarded to catch up with the RTP timeline.
+    pub max_playout_lateness_ms: u64,
 }
 
-impl Default for WatermarkConfig {
+impl Default for MediaBufferConfig {
     fn default() -> Self {
         Self {
             decode_batch_ms: 80,
-            decoded_low_water_ms: 100,
-            decoded_high_water_ms: 250,
-            encoded_low_water_ms: 100,
-            encoded_high_water_ms: 400,
+            encoded_capacity_ms: 400,
+            prebuffer_ms: 100,
             next_prime_ms: 200,
-            pause_encoded_limit_ms: 2_000,
+            max_playout_lateness_ms: 100,
         }
     }
 }
 
-impl WatermarkConfig {
+impl MediaBufferConfig {
     pub fn validate(&self) -> crate::Result<()> {
-        if self.decode_batch_ms == 0 {
+        if self.decode_batch_ms == 0 || self.encoded_capacity_ms == 0 || self.prebuffer_ms == 0 {
             return Err(crate::MusicStreamError::InvalidConfig(
-                "decode_batch_ms must be greater than zero".to_owned(),
+                "media buffer durations must be greater than zero".to_owned(),
             ));
         }
-
-        if self.decoded_low_water_ms >= self.decoded_high_water_ms {
+        if self.prebuffer_ms > self.encoded_capacity_ms
+            || self.next_prime_ms > self.encoded_capacity_ms
+            || self.max_playout_lateness_ms > self.encoded_capacity_ms
+        {
             return Err(crate::MusicStreamError::InvalidConfig(
-                "decoded low water must be lower than decoded high water".to_owned(),
-            ));
-        }
-
-        if self.encoded_low_water_ms >= self.encoded_high_water_ms {
-            return Err(crate::MusicStreamError::InvalidConfig(
-                "encoded low water must be lower than encoded high water".to_owned(),
-            ));
-        }
-
-        if self.next_prime_ms > self.encoded_high_water_ms {
-            return Err(crate::MusicStreamError::InvalidConfig(
-                "next_prime_ms must not exceed encoded_high_water_ms".to_owned(),
+                "prebuffer, next prime, and maximum playout lateness must fit encoded capacity"
+                    .to_owned(),
             ));
         }
 
@@ -257,17 +231,12 @@ mod tests {
     }
 
     #[test]
-    fn artifact_backed_tracks_default_to_seekable_and_can_preload() {
+    fn bounded_tracks_default_to_seekable() {
         let file = source(TrackKind::File, None);
         let url = source(TrackKind::Url, None);
         let non_seekable_url = source(TrackKind::Url, Some(false));
-        let live = source(TrackKind::Live, None);
-
         assert!(file.is_seekable());
         assert!(url.is_seekable());
         assert!(!non_seekable_url.is_seekable());
-        assert!(file.can_preload_as_next());
-        assert!(url.can_preload_as_next());
-        assert!(!live.can_preload_as_next());
     }
 }

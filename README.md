@@ -1,35 +1,52 @@
 # Music Streamer
 
-Rust + napi-rs music decoding and RTP streaming addon.
+一个面向 Node.js 的 Rust 原生音频推流内核：读取本地文件、有界 HTTP 音频或 live HTTP 音频，解码并统一为 48 kHz PCM，编码为 Opus，然后按实时节拍发送 RTP/RTCP。
 
-This workspace is intentionally small:
+## 核心设计
 
 ```text
-crates/music_stream/       Rust core: source, audio, session, transport
-crates/music_stream_napi/  Node ABI boundary and npm package root
-docs/                      Design notes and implementation constraints
-voice_sender/              Old C++ reference project
+Node Promise API
+      │
+      ▼
+StreamRuntime / StreamActor
+      ├── current producer
+      ├── next preload producer
+      └── persistent RTP session
+
+async source I/O                 blocking CPU worker
+HTTP/file/live ────────────────> decode → resample → DSP → Opus
+                                                   │
+                                    duration-bounded Opus queue
+                                                   │
+                                                   ▼
+                                      async RTP/RTCP sender
 ```
 
-Core boundaries:
+- 每个 stream 只有一个长期存活的 RTP session；切歌和 seek 不重置 sequence、timestamp 或 SSRC。
+- source、timer、UDP 和 Node 边界使用 async。
+- Symphonia、Rubato、DSP 和 libopus 运行在 blocking CPU worker，绝不占用 RTP sender 调度。
+- current 与 next 只共享 immutable Opus frame，不共享 decoder 或 PCM scratch。
+- URL使用进程级磁盘预算下的共享growing spool，live与Opus桥接均有明确容量；暂停和预载通过聚合控制与背压停止生产。
+- current在CPU、blocking worker、HTTP、live连接和tempfile admission中均优先于next preload。
+- Rust 不维护 playlist、随机/循环模式、鉴权刷新、voice gateway 或业务重试策略。
 
-- TypeScript owns playlist, play mode, provider URL resolution, auth, and product policy.
-- `music_stream` owns realtime media work: source access, decode, DSP, resample, Opus, RTP/RTCP, state machine.
-- `music_stream_napi` maps napi types and native lifecycle. Its package scripts build the native addon and run Node smoke tests for the local-file, bounded HTTP URL, and live HTTP RTP paths.
-- RTP/RTCP wire format must use tested crates, not handwritten packet serialization.
-- Audio is a top-level module inside `music_stream`, not a separate crate until it has a real independent boundary.
+## Workspace
 
-Current implementation status is tracked in `docs/status.md`; new Codex sessions should start with `docs/handoff.md`, then use `docs/design-review.md` for the next design questions. The local-file, bounded HTTP URL, and live HTTP current paths are covered by tests, including real paced RTP playback, configurable source policies, bounded HTTP range resume, source artifact cache reuse, runtime metrics hooks, manual gain/gainDb control, ReplayGain recommendation, RTCP SR/RR feedback with quality-window events, N-API event callbacks, explicit shutdown, and the pause/seek/switch/next lifecycle. Remaining product-level work is mostly in TS/host policy: live auto recovery, network-quality actions, persistent cache ownership, broader codec/source corpus validation, and platform-specific RTP protection algorithms.
+```text
+crates/music_stream/       source、音频管线、状态机、RTP/RTCP runtime
+crates/music_stream_napi/  Node 类型映射、Promise API、事件 callback
+docs/                      当前实现契约
+```
 
-Checks:
+## 验证
 
 ```sh
-cargo update
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets --all-features
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --all-targets
 
 cd crates/music_stream_napi
-npm run build
 npm test
 ```
+
+设计入口见 [docs/index.md](docs/index.md)。

@@ -1,91 +1,40 @@
-pub mod audio;
-pub mod engine;
-pub mod error;
-pub mod event;
-pub mod lifecycle;
-pub mod model;
-pub mod quality;
-pub mod runtime;
-pub mod session;
-pub mod slot;
-pub mod source;
-pub mod transport;
+//! Deterministic media core for source resolution, audio processing, and RTP playout.
+//!
+//! Consumers use the crate-root exports below. Internal module layout is intentionally
+//! private so implementation refactors do not become downstream API changes.
 
-pub use audio::AudioFormat;
-pub use audio::decode::{
-    DecodePoll, DecodedChunk, DecoderBackend, MemoryDecoder, NormalizingDecoder,
-    StreamingPcmDecoder, StreamingPcmWriter,
-};
-#[cfg(feature = "decoder-symphonia")]
-pub use audio::decode::{SymphoniaFileDecoder, SymphoniaStreamDecoder};
+mod audio;
+mod control;
+mod error;
+mod event;
+mod model;
+mod quality;
+mod runtime;
+mod session;
+mod source;
+mod transport;
+
+pub use audio::decode::{DecodePoll, DecodedChunk, DecoderBackend};
 pub use audio::dsp::{
     ReplayGainConfig, ReplayGainMetadata, ReplayGainMode, ReplayGainRecommendation,
-    ReplayGainSource, VolumeConfig, apply_gain_in_place, apply_gain_with_soft_limit_in_place,
-    copy_f32_interleaved, db_to_linear, i16_to_f32_interleaved, recommend_replay_gain,
-    soft_limit_sample, to_stereo_interleaved,
+    ReplayGainSource, recommend_replay_gain,
 };
-pub use audio::frame::{
-    FrameAssembler, FrameQueue, OpusFrame, PcmFrame, QueueSnapshot, QueueWatermarks,
-};
+pub use audio::frame::{OpusFrame, PcmFrame};
 pub use audio::opus::{LibOpusEncoder, LibOpusEncoderConfig, OpusEncoderBackend};
 pub use audio::pipeline::{PipelineConfig, PlayoutPipeline, WorkerTurnReport};
-#[cfg(feature = "resampler-rubato")]
-pub use audio::resample::{RubatoResamplerConfig, RubatoResamplingDecoder};
-pub use engine::Engine;
 pub use error::{ErrorCode, MusicStreamError, Result};
 pub use event::StreamEvent;
-pub use lifecycle::{
-    GenerationScopedTask, GenerationTaskSlot, RuntimeTaskFailure, RuntimeTaskGroup,
-    RuntimeTaskShutdownReport,
-};
 pub use model::{
-    GainLevel, PlayState, StreamStatus, TrackKind, TrackSource, VolumeLevel, WatermarkConfig,
+    GainLevel, MediaBufferConfig, PlayState, StreamStatus, TrackKind, TrackSource, VolumeLevel,
 };
-pub use quality::RtcpNetworkQualityLevel;
-#[cfg(feature = "transport-rtp")]
-pub use quality::{
-    RtcpQualitySample, RtcpQualityWindow, RtcpQualityWindowConfig, RtcpQualityWindowSnapshot,
-};
-#[cfg(all(
-    feature = "decoder-symphonia",
-    feature = "resampler-rubato",
-    feature = "transport-rtp"
-))]
+pub use quality::{RtcpNetworkQualityLevel, RtcpQualityWindowSnapshot};
 pub use runtime::{
-    LocalFilePreload, LocalFilePreloadCompletion, LocalFilePreloadReport, LocalFileRtpPlayback,
-    LocalFileRtpPlaybackConfig, LocalFileRtpPlaybackProgress, LocalFileRtpPlaybackReport,
-    default_pipeline_config, spawn_live_stream_rtp_playback, spawn_local_file_preload,
-    spawn_local_file_rtp_playback, spawn_local_file_rtp_playback_from_driver,
+    RuntimeResourceLimits, RuntimeResources, StreamRuntime, StreamRuntimeConfig,
+    StreamRuntimeProgress, StreamRuntimeSnapshot,
 };
-pub use session::{
-    ActorOutput, DEFAULT_STREAM_ACTOR_MAILBOX_CAPACITY, StreamActor, StreamActorMailbox,
-    StreamActorMailboxHandle, StreamActorMailboxReply, StreamCommand, TaskAction, WorkerEvent,
-};
-#[cfg(all(feature = "decoder-symphonia", feature = "resampler-rubato"))]
-pub use slot::{
-    LiveStreamSlot, LiveStreamSlotConfig, LiveStreamSlotDriver, LocalFileSlot, LocalFileSlotConfig,
-    LocalFileSlotDriver, build_live_stream_slot, build_local_file_slot,
-    build_local_file_slot_with_resolver,
-};
-#[cfg(feature = "transport-rtp")]
-pub use slot::{RtpSlotDrainReport, RtpSlotRunReport, RtpSlotRunner, RtpSlotTickReport};
-pub use slot::{SlotDriver, SlotRole, SlotTurnReport};
+pub use session::StreamCommand;
 pub use source::{
-    FileSourceResolver, HttpLiveStream, HttpLiveStreamConfig, HttpLiveStreamReport,
-    HttpLiveStreamStopHandle, HttpSourceConfig, SharedSourceArtifactCache, SourceArtifact,
-    SourceArtifactCache, SourceArtifactKind, SourceResolver, SourceResolverConfig,
-    StreamingByteReader, StreamingByteSnapshot, StreamingByteWriter, resolve_http_temp_file,
-    resolve_http_temp_file_with_config, resolve_local_file, spawn_http_live_stream,
+    HttpLiveStreamConfig, HttpSourceConfig, SharedSourceArtifactCache, SourceArtifactCache,
+    SourceResolverConfig,
 };
-#[cfg(feature = "transport-rtp")]
-pub use transport::{
-    MemoryRtpPacketSink, PlaintextRtpPacketProtector, ProtectedRtpPacketSink,
-    RTP_OPUS_CLOCK_RATE_HZ, RtcpReceiverReportSnapshot, RtcpSenderReportPacket,
-    RtpEncryptionConfig, RtpPaceDecision, RtpPacer, RtpPacketProtector, RtpPacketSink,
-    RtpPacketized, RtpPacketizer, RtpPacketizerConfig, RtpSender, RtpSenderStep,
-    RtpTransportConfig, UdpRtcpPacketSink, UdpRtpPacketSink, build_rtcp_sender_report,
-    compact_ntp_timestamp, ntp_timestamp, parse_rtcp_receiver_reports,
-    parse_rtcp_receiver_reports_at, rtcp_compact_duration_micros, rtcp_round_trip_time_micros,
-    rtp_jitter_micros,
-};
-pub use transport::{SenderCore, SenderStep};
+pub use transport::{RtcpReceiverReportSnapshot, RtpEncryptionConfig, RtpTransportConfig};

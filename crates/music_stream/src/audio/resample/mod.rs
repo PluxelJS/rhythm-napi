@@ -1,6 +1,5 @@
 //! Sample-rate conversion and reusable resampler buffers.
 
-#[cfg(feature = "resampler-rubato")]
 mod rubato_backend {
     use std::collections::VecDeque;
 
@@ -84,6 +83,7 @@ mod rubato_backend {
         resampler: Option<Box<dyn Resampler<f32>>>,
         input_sample_rate: Option<u32>,
         pending_input: Vec<f32>,
+        pending_input_start: usize,
         pending_output: VecDeque<DecodedChunk>,
         output_scratch: Vec<f32>,
         trim_output_frames_remaining: usize,
@@ -124,6 +124,7 @@ mod rubato_backend {
                 resampler: None,
                 input_sample_rate: None,
                 pending_input: Vec::new(),
+                pending_input_start: 0,
                 pending_output: VecDeque::new(),
                 output_scratch: Vec::new(),
                 trim_output_frames_remaining: 0,
@@ -131,20 +132,6 @@ mod rubato_backend {
                 output_frames_emitted: 0,
                 source_ended: false,
             })
-        }
-
-        #[must_use]
-        pub fn target(&self) -> &AudioFormat {
-            &self.config.target
-        }
-
-        #[must_use]
-        pub fn inner(&self) -> &D {
-            &self.inner
-        }
-
-        pub fn into_inner(self) -> D {
-            self.inner
         }
     }
 
@@ -198,6 +185,7 @@ mod rubato_backend {
 
             self.ensure_resampler(input_sample_rate)?;
             self.input_frames_seen = self.input_frames_seen.saturating_add(frames);
+            self.compact_pending_input();
             self.pending_input.append(&mut normalized);
             self.process_full_chunks()
         }
@@ -301,8 +289,12 @@ mod rubato_backend {
             self.output_scratch
                 .resize(output_frames_next * channels, 0.0);
 
-            let input_adapter = InterleavedSlice::new(&self.pending_input, channels, input_frames)
-                .map_err(map_size_error)?;
+            let input_adapter = InterleavedSlice::new(
+                &self.pending_input[self.pending_input_start..],
+                channels,
+                input_frames,
+            )
+            .map_err(map_size_error)?;
             let mut output_adapter =
                 InterleavedSlice::new_mut(&mut self.output_scratch, channels, output_frames_next)
                     .map_err(map_size_error)?;
@@ -319,28 +311,21 @@ mod rubato_backend {
             let actual_input_used = partial_len.map_or(input_used, |len| len.min(input_frames));
             let consumed = actual_input_used * channels;
             if consumed > 0 {
-                self.pending_input.drain(0..consumed);
+                self.pending_input_start = self.pending_input_start.saturating_add(consumed);
             }
 
-            let valid_samples = output_written * channels;
-            let output = self.output_scratch[..valid_samples].to_vec();
-            self.push_output(output, output_written)
-        }
-
-        fn push_output(&mut self, samples: Vec<f32>, frames: usize) -> Result<()> {
-            if frames == 0 {
+            if output_written == 0 {
                 return Ok(());
             }
 
-            let channels = usize::from(self.config.target.channels);
-            if self.trim_output_frames_remaining >= frames {
-                self.trim_output_frames_remaining -= frames;
+            if self.trim_output_frames_remaining >= output_written {
+                self.trim_output_frames_remaining -= output_written;
                 return Ok(());
             }
 
             let skip_frames = self.trim_output_frames_remaining;
             self.trim_output_frames_remaining = 0;
-            let mut emit_frames = frames - skip_frames;
+            let mut emit_frames = output_written - skip_frames;
 
             if self.source_ended {
                 let remaining = self
@@ -358,14 +343,30 @@ mod rubato_backend {
             self.pending_output.push_back(DecodedChunk {
                 sample_rate: self.config.target.sample_rate,
                 channels: self.config.target.channels,
-                samples_interleaved: samples[start..end].to_vec(),
+                samples_interleaved: self.output_scratch[start..end].to_vec(),
             });
             self.output_frames_emitted = self.output_frames_emitted.saturating_add(emit_frames);
             Ok(())
         }
 
         fn pending_input_frames(&self) -> usize {
-            self.pending_input.len() / usize::from(self.config.target.channels)
+            self.pending_input
+                .len()
+                .saturating_sub(self.pending_input_start)
+                / usize::from(self.config.target.channels)
+        }
+
+        fn compact_pending_input(&mut self) {
+            if self.pending_input_start == self.pending_input.len() {
+                self.pending_input.clear();
+                self.pending_input_start = 0;
+            } else if self.pending_input_start >= self.pending_input.len() / 2 {
+                let remaining = self.pending_input.len() - self.pending_input_start;
+                self.pending_input
+                    .copy_within(self.pending_input_start.., 0);
+                self.pending_input.truncate(remaining);
+                self.pending_input_start = 0;
+            }
         }
 
         fn expected_output_frames(&self) -> Result<usize> {
@@ -462,5 +463,4 @@ mod rubato_backend {
     }
 }
 
-#[cfg(feature = "resampler-rubato")]
 pub use rubato_backend::{RubatoResamplerConfig, RubatoResamplingDecoder};

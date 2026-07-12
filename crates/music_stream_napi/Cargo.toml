@@ -13,12 +13,14 @@ workspace = true
 crate-type = ["cdylib"]
 
 [dependencies]
-metrics.workspace = true
 music_stream.workspace = true
 napi.workspace = true
 napi-derive.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
 
 [build-dependencies]
 napi-build = "2.2.3"
+
+[dev-dependencies]
+# Rust unit tests run without a Node host, so N-API symbols must use napi-rs' no-op shim.
+napi = { workspace = true, features = ["noop"] }

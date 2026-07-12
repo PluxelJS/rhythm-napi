@@ -3,8 +3,8 @@ use std::hint::black_box;
 use bytes::Bytes;
 use criterion::{Criterion, criterion_group, criterion_main};
 use music_stream::{
-    DecodePoll, DecodedChunk, DecoderBackend, OpusEncoderBackend, OpusFrame, PcmFrame,
-    PipelineConfig, PlayoutPipeline, Result, SenderStep, WatermarkConfig,
+    DecodePoll, DecodedChunk, DecoderBackend, LibOpusEncoder, LibOpusEncoderConfig,
+    OpusEncoderBackend, OpusFrame, PcmFrame, PipelineConfig, PlayoutPipeline, Result,
 };
 
 const SAMPLE_RATE: u32 = 48_000;
@@ -18,6 +18,30 @@ fn criterion_pipeline(c: &mut Criterion) {
     c.bench_function("pipeline/fake_worker_and_drain_5s", |b| {
         b.iter(|| run_fake_pipeline().expect("fake pipeline benchmark"))
     });
+    c.bench_function("pipeline/libopus_worker_and_drain_5s", |b| {
+        b.iter(|| run_libopus_pipeline().expect("libopus pipeline benchmark"))
+    });
+}
+
+fn run_libopus_pipeline() -> Result<(usize, usize)> {
+    let total_frames = usize::try_from(BENCH_SECONDS * 1_000 / FRAME_MS).unwrap_or(usize::MAX);
+    let decoder = ChunkedPcmDecoder::new(total_frames, CHUNK_FRAMES);
+    let encoder = LibOpusEncoder::new(LibOpusEncoderConfig::default())?;
+    let mut pipeline = PlayoutPipeline::new(decoder, encoder, pipeline_config())?;
+    let mut frames = 0;
+    let mut bytes = 0;
+    loop {
+        let report = pipeline.process_turn(|frame| {
+            frames += 1;
+            bytes += frame.payload.len();
+            black_box(frame);
+            Ok(())
+        })?;
+        if report.source_ended {
+            break;
+        }
+    }
+    Ok((frames, bytes))
 }
 
 fn run_fake_pipeline() -> Result<(usize, usize)> {
@@ -27,13 +51,15 @@ fn run_fake_pipeline() -> Result<(usize, usize)> {
     let mut sent_frames = 0;
     let mut payload_bytes = 0;
 
-    while !pipeline.is_playout_drained() {
-        pipeline.worker_turn()?;
-
-        while let SenderStep::Send { frame, .. } = pipeline.sender_step() {
+    loop {
+        let report = pipeline.process_turn(|frame| {
             payload_bytes += frame.payload.len();
             sent_frames += 1;
             black_box(frame);
+            Ok(())
+        })?;
+        if report.source_ended {
+            break;
         }
     }
 
@@ -46,16 +72,7 @@ fn pipeline_config() -> PipelineConfig {
         sample_rate: SAMPLE_RATE,
         channels: CHANNELS,
         frame_samples_per_channel: FRAME_SAMPLES_PER_CHANNEL,
-        watermarks: WatermarkConfig {
-            decode_batch_ms: 100,
-            decoded_low_water_ms: 20,
-            decoded_high_water_ms: 120,
-            encoded_low_water_ms: 20,
-            encoded_high_water_ms: 160,
-            next_prime_ms: 80,
-            pause_encoded_limit_ms: 2_000,
-        },
-        prebuffer_ms: 40,
+        decode_batch_ms: 100,
     }
 }
 
@@ -90,7 +107,7 @@ impl DecoderBackend for ChunkedPcmDecoder {
 struct BenchEncoder;
 
 impl OpusEncoderBackend for BenchEncoder {
-    fn encode(&mut self, frame: &PcmFrame) -> Result<OpusFrame> {
+    fn encode(&mut self, frame: &PcmFrame<'_>) -> Result<OpusFrame> {
         let mut payload = Vec::with_capacity(16);
         payload.extend_from_slice(&frame.track_position_samples.to_le_bytes());
         payload.extend_from_slice(&frame.samples_per_channel.to_le_bytes());

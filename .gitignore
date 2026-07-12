@@ -1,9 +1,7 @@
 /target/
 /node_modules/
 /crates/*/node_modules/
-/voice_sender/
 /.idea/
-/cmake-build-*/
 /coverage/
 /dist/
 /crates/*/coverage/

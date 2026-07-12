@@ -257,15 +257,15 @@ export function waitForDatagram(
 }
 
 export function waitForStatus<T>(
-  read: () => T,
+  read: () => T | Promise<T>,
   predicate: (status: T) => boolean,
   timeoutMs = 1_000,
 ): Promise<T> {
   const deadline = Date.now() + timeoutMs
   return new Promise((resolve, reject) => {
-    const poll = () => {
+    const poll = async () => {
       try {
-        const status = read()
+        const status = await read()
         if (predicate(status)) {
           resolve(status)
           return
@@ -278,9 +278,9 @@ export function waitForStatus<T>(
         reject(new Error('timed out waiting for status'))
         return
       }
-      setTimeout(poll, 20)
+      setTimeout(() => void poll(), 20)
     }
-    poll()
+    void poll()
   })
 }
 
@@ -322,9 +322,9 @@ export function closeSocket(socket: Socket): Promise<void> {
   })
 }
 
-export function stopStreamIfPresent(streamer: Streamer, streamId: string): void {
+export async function stopStreamIfPresent(streamer: Streamer, streamId: string): Promise<void> {
   try {
-    streamer.stopStream(streamId)
+    await streamer.stopStream(streamId)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     if (!message.includes('not found')) {

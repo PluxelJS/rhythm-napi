@@ -1,27 +1,28 @@
-use std::collections::VecDeque;
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::{MusicStreamError, Result};
 use crate::model::TrackSource;
 
-const LIVE_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+use super::{is_retryable_http, map_http_error, shared_http_client};
+
+const LIVE_HTTP_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+const LIVE_HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const LIVE_HTTP_BUFFER_BYTES: usize = 512 * 1024;
-const LIVE_HTTP_READ_CHUNK_BYTES: usize = 16 * 1024;
 const LIVE_HTTP_MAX_RETRIES: u8 = 2;
 const LIVE_HTTP_RETRY_BACKOFF: Duration = Duration::from_millis(250);
-const LIVE_HTTP_RETRIES_METRIC: &str = "music_stream.source.live_http_retries";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HttpLiveStreamConfig {
-    pub timeout: Duration,
+    pub open_timeout: Duration,
+    pub idle_timeout: Duration,
     pub max_buffered_bytes: usize,
-    pub read_chunk_bytes: usize,
     pub max_retries: u8,
     pub retry_backoff: Duration,
 }
@@ -29,9 +30,9 @@ pub struct HttpLiveStreamConfig {
 impl Default for HttpLiveStreamConfig {
     fn default() -> Self {
         Self {
-            timeout: LIVE_HTTP_TIMEOUT,
+            open_timeout: LIVE_HTTP_OPEN_TIMEOUT,
+            idle_timeout: LIVE_HTTP_IDLE_TIMEOUT,
             max_buffered_bytes: LIVE_HTTP_BUFFER_BYTES,
-            read_chunk_bytes: LIVE_HTTP_READ_CHUNK_BYTES,
             max_retries: LIVE_HTTP_MAX_RETRIES,
             retry_backoff: LIVE_HTTP_RETRY_BACKOFF,
         }
@@ -40,30 +41,18 @@ impl Default for HttpLiveStreamConfig {
 
 impl HttpLiveStreamConfig {
     pub fn validate(&self) -> Result<()> {
-        if self.timeout.is_zero() {
+        if self.open_timeout.is_zero()
+            || self.idle_timeout.is_zero()
+            || self.max_buffered_bytes == 0
+        {
             return Err(MusicStreamError::InvalidConfig(
-                "live HTTP source timeout must be greater than zero".to_owned(),
-            ));
-        }
-        if self.max_buffered_bytes == 0 {
-            return Err(MusicStreamError::InvalidConfig(
-                "live HTTP source max_buffered_bytes must be greater than zero".to_owned(),
-            ));
-        }
-        if self.read_chunk_bytes == 0 {
-            return Err(MusicStreamError::InvalidConfig(
-                "live HTTP source read_chunk_bytes must be greater than zero".to_owned(),
-            ));
-        }
-        if self.read_chunk_bytes > self.max_buffered_bytes {
-            return Err(MusicStreamError::InvalidConfig(
-                "live HTTP source read_chunk_bytes must not exceed max_buffered_bytes".to_owned(),
+                "live HTTP open timeout, idle timeout, and buffer size must be greater than zero"
+                    .to_owned(),
             ));
         }
         if self.max_retries > 0 && self.retry_backoff.is_zero() {
             return Err(MusicStreamError::InvalidConfig(
-                "live HTTP source retry_backoff must be greater than zero when retries are enabled"
-                    .to_owned(),
+                "live HTTP retry backoff must be non-zero when retries are enabled".to_owned(),
             ));
         }
         Ok(())
@@ -79,280 +68,124 @@ pub struct HttpLiveStreamReport {
 }
 
 #[derive(Debug)]
-pub struct HttpLiveStream {
-    reader: Option<StreamingByteReader>,
-    writer: StreamingByteWriter,
-    stop: Arc<AtomicBool>,
-    join: Option<JoinHandle<Result<HttpLiveStreamReport>>>,
+struct ByteChunk {
+    bytes: Bytes,
+    _stream_budget: OwnedSemaphorePermit,
+    _global_budget: OwnedSemaphorePermit,
 }
 
-#[derive(Clone, Debug)]
-pub struct HttpLiveStreamStopHandle {
-    writer: StreamingByteWriter,
-    stop: Arc<AtomicBool>,
+pub(crate) trait BlockingReadObserver: std::fmt::Debug + Send + Sync {
+    fn before_wait(&self);
+    fn after_wait(&self);
 }
 
-impl HttpLiveStream {
-    #[must_use]
-    pub fn reader(&self) -> Option<&StreamingByteReader> {
-        self.reader.as_ref()
-    }
-
-    #[must_use]
-    pub fn take_reader(&mut self) -> Option<StreamingByteReader> {
-        self.reader.take()
-    }
-
-    #[must_use]
-    pub fn is_finished(&self) -> bool {
-        self.join.as_ref().is_some_and(JoinHandle::is_finished)
-    }
-
-    #[must_use]
-    pub fn stop_handle(&self) -> HttpLiveStreamStopHandle {
-        HttpLiveStreamStopHandle {
-            writer: self.writer.clone(),
-            stop: Arc::clone(&self.stop),
-        }
-    }
-
-    pub fn stop(&self) {
-        self.stop_handle().stop();
-    }
-
-    pub fn join(mut self) -> Result<HttpLiveStreamReport> {
-        let Some(join) = self.join.take() else {
-            return Err(MusicStreamError::Internal(
-                "live HTTP stream join handle already consumed".to_owned(),
-            ));
-        };
-        join.join().map_err(|_| {
-            MusicStreamError::Internal("live HTTP stream worker panicked".to_owned())
-        })?
-    }
-}
-
-impl HttpLiveStreamStopHandle {
-    pub fn stop(&self) {
-        self.stop.store(true, Ordering::Release);
-        let _ = self.writer.close();
-    }
-}
-
-impl Drop for HttpLiveStream {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
-        let _ = self.writer.close();
-    }
-}
-
-pub fn spawn_http_live_stream(
-    source: &TrackSource,
-    config: HttpLiveStreamConfig,
-) -> Result<HttpLiveStream> {
-    config.validate()?;
-    if !source.is_live() {
-        return Err(MusicStreamError::InvalidSource(
-            "live HTTP stream requires a live track source".to_owned(),
-        ));
-    }
-    let url = source.url.clone().ok_or_else(|| {
-        MusicStreamError::InvalidSource("live track source requires url".to_owned())
-    })?;
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err(MusicStreamError::InvalidSource(
-            "live track source requires http or https URL".to_owned(),
-        ));
-    }
-
-    let (writer, reader) = StreamingByteReader::new(config.max_buffered_bytes)?;
-    let worker_writer = writer.clone();
-    let stop = Arc::new(AtomicBool::new(false));
-    let worker_stop = Arc::clone(&stop);
-    let handle = thread::Builder::new()
-        .name("music-stream-live-http".to_owned())
-        .spawn(move || run_http_live_stream(url, config, worker_writer, worker_stop))
-        .map_err(|error| MusicStreamError::Internal(error.to_string()))?;
-
-    Ok(HttpLiveStream {
-        reader: Some(reader),
-        writer,
-        stop,
-        join: Some(handle),
-    })
+#[derive(Debug)]
+enum ByteMessage {
+    Data(ByteChunk),
+    Failed(String),
 }
 
 #[derive(Debug)]
 pub struct StreamingByteReader {
-    shared: Arc<StreamingByteShared>,
+    receiver: mpsc::Receiver<ByteMessage>,
+    current: Option<ByteChunk>,
+    offset: usize,
+    wait_observer: Option<Arc<dyn BlockingReadObserver>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct StreamingByteWriter {
-    shared: Arc<StreamingByteShared>,
-}
-
-#[derive(Debug)]
-struct StreamingByteShared {
-    state: Mutex<StreamingByteState>,
-    readable: Condvar,
-    writable: Condvar,
-}
-
-#[derive(Debug)]
-struct StreamingByteState {
-    chunks: VecDeque<Bytes>,
-    front_offset: usize,
-    max_buffered_bytes: usize,
-    buffered_bytes: usize,
-    finished: bool,
-    closed: bool,
-    failure: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct StreamingByteSnapshot {
-    pub max_buffered_bytes: usize,
-    pub buffered_bytes: usize,
-    pub chunks: usize,
-    pub finished: bool,
-    pub closed: bool,
-    pub failed: bool,
+    sender: mpsc::Sender<ByteMessage>,
+    stream_budget: Arc<Semaphore>,
+    global_budget: Arc<Semaphore>,
+    max_chunk_bytes: usize,
 }
 
 impl StreamingByteReader {
+    #[cfg(test)]
     pub fn new(max_buffered_bytes: usize) -> Result<(StreamingByteWriter, Self)> {
-        if max_buffered_bytes == 0 {
+        Self::with_global_budget(
+            max_buffered_bytes,
+            Arc::new(Semaphore::new(max_buffered_bytes)),
+        )
+    }
+
+    pub(crate) fn with_global_budget(
+        max_buffered_bytes: usize,
+        global_budget: Arc<Semaphore>,
+    ) -> Result<(StreamingByteWriter, Self)> {
+        if max_buffered_bytes == 0 || max_buffered_bytes > u32::MAX as usize {
             return Err(MusicStreamError::InvalidConfig(
-                "streaming byte source max_buffered_bytes must be greater than zero".to_owned(),
+                "streaming byte budget must fit in a positive u32".to_owned(),
             ));
         }
-
-        let shared = Arc::new(StreamingByteShared {
-            state: Mutex::new(StreamingByteState {
-                chunks: VecDeque::new(),
-                front_offset: 0,
-                max_buffered_bytes,
-                buffered_bytes: 0,
-                finished: false,
-                closed: false,
-                failure: None,
-            }),
-            readable: Condvar::new(),
-            writable: Condvar::new(),
-        });
-
+        let (sender, receiver) = mpsc::channel(64);
         Ok((
             StreamingByteWriter {
-                shared: Arc::clone(&shared),
+                sender,
+                stream_budget: Arc::new(Semaphore::new(max_buffered_bytes)),
+                global_budget,
+                max_chunk_bytes: max_buffered_bytes,
             },
-            Self { shared },
+            Self {
+                receiver,
+                current: None,
+                offset: 0,
+                wait_observer: None,
+            },
         ))
     }
+}
 
-    #[must_use]
-    pub fn snapshot(&self) -> StreamingByteSnapshot {
-        self.shared
-            .state
-            .lock()
-            .map(|state| state.snapshot())
-            .unwrap_or_default()
-    }
-
-    pub fn close(&self) -> Result<()> {
-        let mut state = self.lock_state()?;
-        state.closed = true;
-        drop(state);
-        self.shared.readable.notify_all();
-        self.shared.writable.notify_all();
-        Ok(())
-    }
-
-    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, StreamingByteState>> {
-        self.shared.state.lock().map_err(|_| {
-            MusicStreamError::Internal("streaming byte source lock poisoned".to_owned())
-        })
+impl StreamingByteReader {
+    pub(crate) fn set_wait_observer(&mut self, observer: Arc<dyn BlockingReadObserver>) {
+        self.wait_observer = Some(observer);
     }
 }
 
 impl StreamingByteWriter {
-    #[must_use]
-    pub fn snapshot(&self) -> StreamingByteSnapshot {
-        self.shared
-            .state
-            .lock()
-            .map(|state| state.snapshot())
-            .unwrap_or_default()
-    }
-
-    pub fn try_push(&self, chunk: impl Into<Bytes>) -> Result<()> {
-        let chunk = chunk.into();
-        validate_streaming_byte_chunk(&chunk)?;
-        let mut state = self.lock_state()?;
-        state.ensure_open_for_write()?;
-        state.ensure_chunk_fits(chunk.len())?;
-        if !state.can_accept(chunk.len()) {
-            return Err(MusicStreamError::Busy(
-                "streaming byte source buffer high watermark reached".to_owned(),
-            ));
+    pub async fn push(&self, bytes: Bytes) -> Result<()> {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let end = offset.saturating_add(self.max_chunk_bytes).min(bytes.len());
+            self.push_one(bytes.slice(offset..end)).await?;
+            offset = end;
         }
-
-        state.push(chunk);
-        drop(state);
-        self.shared.readable.notify_all();
         Ok(())
     }
 
-    pub fn push_blocking(&self, chunk: impl Into<Bytes>) -> Result<()> {
-        let chunk = chunk.into();
-        validate_streaming_byte_chunk(&chunk)?;
-        let len = chunk.len();
-        let mut state = self.lock_state()?;
-        state.ensure_chunk_fits(len)?;
-        while !state.can_accept(len) {
-            state.ensure_open_for_write()?;
-            state = self.shared.writable.wait(state).map_err(|_| {
-                MusicStreamError::Internal("streaming byte source lock poisoned".to_owned())
+    async fn push_one(&self, bytes: Bytes) -> Result<()> {
+        let permits = u32::try_from(bytes.len()).map_err(|_| {
+            MusicStreamError::InvalidSource("live HTTP chunk is too large".to_owned())
+        })?;
+        let stream_permit = Arc::clone(&self.stream_budget)
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| MusicStreamError::StreamClosed("live byte bridge closed".to_owned()))?;
+        let global_wait_started = std::time::Instant::now();
+        let global_permit = Arc::clone(&self.global_budget)
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| {
+                MusicStreamError::StreamClosed("global live byte budget closed".to_owned())
             })?;
+        metrics::histogram!("music_stream.source.live_global_budget_wait_us")
+            .record(global_wait_started.elapsed().as_micros() as f64);
+        self.sender
+            .send(ByteMessage::Data(ByteChunk {
+                bytes,
+                _stream_budget: stream_permit,
+                _global_budget: global_permit,
+            }))
+            .await
+            .map_err(|_| MusicStreamError::StreamClosed("live byte bridge closed".to_owned()))
+    }
+
+    pub async fn fail(&self, message: impl Into<String>, cancellation: &CancellationToken) {
+        tokio::select! {
+            _ = cancellation.cancelled() => {}
+            _ = self.sender.send(ByteMessage::Failed(message.into())) => {}
         }
-        state.ensure_open_for_write()?;
-        state.push(chunk);
-        drop(state);
-        self.shared.readable.notify_all();
-        Ok(())
-    }
-
-    pub fn finish(&self) -> Result<()> {
-        let mut state = self.lock_state()?;
-        state.finished = true;
-        drop(state);
-        self.shared.readable.notify_all();
-        self.shared.writable.notify_all();
-        Ok(())
-    }
-
-    pub fn fail(&self, message: impl Into<String>) -> Result<()> {
-        let mut state = self.lock_state()?;
-        state.failure = Some(message.into());
-        drop(state);
-        self.shared.readable.notify_all();
-        self.shared.writable.notify_all();
-        Ok(())
-    }
-
-    pub fn close(&self) -> Result<()> {
-        let mut state = self.lock_state()?;
-        state.closed = true;
-        drop(state);
-        self.shared.readable.notify_all();
-        self.shared.writable.notify_all();
-        Ok(())
-    }
-
-    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, StreamingByteState>> {
-        self.shared.state.lock().map_err(|_| {
-            MusicStreamError::Internal("streaming byte source lock poisoned".to_owned())
-        })
     }
 }
 
@@ -361,210 +194,193 @@ impl Read for StreamingByteReader {
         if output.is_empty() {
             return Ok(0);
         }
-
-        let mut state = self
-            .shared
-            .state
-            .lock()
-            .map_err(|_| std::io::Error::other("streaming byte source lock poisoned"))?;
         loop {
-            if let Some(copied) = state.read_available(output) {
-                self.shared.writable.notify_all();
+            if let Some(current) = self.current.as_ref() {
+                let remaining = &current.bytes[self.offset..];
+                let copied = remaining.len().min(output.len());
+                output[..copied].copy_from_slice(&remaining[..copied]);
+                self.offset += copied;
+                if self.offset == current.bytes.len() {
+                    self.current = None;
+                    self.offset = 0;
+                }
                 return Ok(copied);
             }
-            if let Some(message) = state.failure.as_ref() {
-                return Err(std::io::Error::other(message.clone()));
+            if let Some(observer) = &self.wait_observer {
+                observer.before_wait();
             }
-            if state.finished || state.closed {
-                return Ok(0);
+            let message = self.receiver.blocking_recv();
+            if let Some(observer) = &self.wait_observer {
+                observer.after_wait();
             }
-
-            state = self
-                .shared
-                .readable
-                .wait(state)
-                .map_err(|_| std::io::Error::other("streaming byte source lock poisoned"))?;
+            match message {
+                Some(ByteMessage::Data(chunk)) => self.current = Some(chunk),
+                Some(ByteMessage::Failed(message)) => {
+                    return Err(std::io::Error::other(message));
+                }
+                None => return Ok(0),
+            }
         }
     }
 }
 
-impl StreamingByteState {
-    fn snapshot(&self) -> StreamingByteSnapshot {
-        StreamingByteSnapshot {
-            max_buffered_bytes: self.max_buffered_bytes,
-            buffered_bytes: self.buffered_bytes,
-            chunks: self.chunks.len(),
-            finished: self.finished,
-            closed: self.closed,
-            failed: self.failure.is_some(),
-        }
-    }
-
-    fn can_accept(&self, len: usize) -> bool {
-        self.buffered_bytes.saturating_add(len) <= self.max_buffered_bytes
-    }
-
-    fn ensure_chunk_fits(&self, len: usize) -> Result<()> {
-        if len > self.max_buffered_bytes {
-            return Err(MusicStreamError::InvalidSource(format!(
-                "streaming byte chunk exceeds buffer capacity of {} bytes",
-                self.max_buffered_bytes
-            )));
-        }
-        Ok(())
-    }
-
-    fn ensure_open_for_write(&self) -> Result<()> {
-        if self.closed || self.finished || self.failure.is_some() {
-            return Err(MusicStreamError::StreamClosed(
-                "streaming byte source is closed".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn push(&mut self, chunk: Bytes) {
-        self.buffered_bytes = self.buffered_bytes.saturating_add(chunk.len());
-        self.chunks.push_back(chunk);
-    }
-
-    fn read_available(&mut self, output: &mut [u8]) -> Option<usize> {
-        let front = self.chunks.front()?;
-        let available = front.len().saturating_sub(self.front_offset);
-        let copy_len = available.min(output.len());
-        output[..copy_len].copy_from_slice(&front[self.front_offset..self.front_offset + copy_len]);
-        self.front_offset += copy_len;
-        self.buffered_bytes = self.buffered_bytes.saturating_sub(copy_len);
-        if self.front_offset == front.len() {
-            self.chunks.pop_front();
-            self.front_offset = 0;
-        }
-        Some(copy_len)
-    }
+#[derive(Debug)]
+pub struct HttpLiveStream {
+    pub reader: StreamingByteReader,
+    pub cancellation: CancellationToken,
+    pub task: JoinHandle<Result<HttpLiveStreamReport>>,
 }
 
-fn validate_streaming_byte_chunk(chunk: &Bytes) -> Result<()> {
-    if chunk.is_empty() {
+pub fn spawn_http_live_stream(
+    source: &TrackSource,
+    config: HttpLiveStreamConfig,
+    global_byte_budget: Arc<Semaphore>,
+) -> Result<HttpLiveStream> {
+    config.validate()?;
+    if !source.is_live() {
         return Err(MusicStreamError::InvalidSource(
-            "streaming byte chunk must not be empty".to_owned(),
+            "live HTTP stream requires a live source".to_owned(),
         ));
     }
-    Ok(())
+    let url = source
+        .url
+        .clone()
+        .ok_or_else(|| MusicStreamError::InvalidSource("live source requires a URL".to_owned()))?;
+    let (writer, reader) =
+        StreamingByteReader::with_global_budget(config.max_buffered_bytes, global_byte_budget)?;
+    let cancellation = CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    let task = tokio::spawn(async move {
+        run_http_live_stream(url, config, writer, worker_cancellation).await
+    });
+    Ok(HttpLiveStream {
+        reader,
+        cancellation,
+        task,
+    })
 }
 
-fn run_http_live_stream(
+async fn run_http_live_stream(
     url: String,
     config: HttpLiveStreamConfig,
     writer: StreamingByteWriter,
-    stop: Arc<AtomicBool>,
+    cancellation: CancellationToken,
 ) -> Result<HttpLiveStreamReport> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(config.timeout)
-        .build()
-        .map_err(|error| MusicStreamError::InvalidSource(error.to_string()))?;
+    let client = shared_http_client();
+    let mut report = HttpLiveStreamReport::default();
 
-    let mut bytes_read = 0_u64;
-    let mut retries = 0_u8;
-    let mut buffer = vec![0_u8; config.read_chunk_bytes];
     loop {
-        if stop.load(Ordering::Acquire) {
-            let _ = writer.close();
-            return Ok(HttpLiveStreamReport {
-                bytes_read,
-                retries,
-                completed: false,
-                stopped: true,
-            });
+        if cancellation.is_cancelled() {
+            report.stopped = true;
+            return Ok(report);
         }
-
-        let mut response = match client
-            .get(&url)
-            .send()
-            .and_then(reqwest::blocking::Response::error_for_status)
-        {
+        let response = tokio::select! {
+            _ = cancellation.cancelled() => {
+                report.stopped = true;
+                return Ok(report);
+            }
+            response = open_live_response(&client, &url, config.open_timeout) => response,
+        };
+        let mut response = match response {
             Ok(response) => response,
-            Err(error) => {
-                let retryable = is_retryable_live_http_request_error(&error);
-                let mapped = map_live_http_error(error);
-                if retryable && retries < config.max_retries {
-                    if wait_live_retry(&stop, config.retry_backoff) {
-                        retries += 1;
-                        metrics::counter!(LIVE_HTTP_RETRIES_METRIC).increment(1);
-                        continue;
+            Err(error) if error.retryable && report.retries < config.max_retries => {
+                report.retries += 1;
+                metrics::counter!("music_stream.source.live_http_retries").increment(1);
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        report.stopped = true;
+                        return Ok(report);
                     }
-                    let _ = writer.close();
-                    return Ok(HttpLiveStreamReport {
-                        bytes_read,
-                        retries,
-                        completed: false,
-                        stopped: true,
-                    });
+                    _ = tokio::time::sleep(config.retry_backoff) => {}
                 }
-                let _ = writer.fail(mapped.to_string());
-                return Err(mapped);
+                continue;
+            }
+            Err(error) => {
+                writer.fail(error.error.to_string(), &cancellation).await;
+                return Err(error.error);
             }
         };
 
         loop {
-            if stop.load(Ordering::Acquire) {
-                let _ = writer.close();
-                return Ok(HttpLiveStreamReport {
-                    bytes_read,
-                    retries,
-                    completed: false,
-                    stopped: true,
-                });
-            }
-
-            let read = match response.read(&mut buffer) {
-                Ok(read) => read,
-                Err(error) => {
-                    let mapped = MusicStreamError::InvalidSource(error.to_string());
-                    if retries < config.max_retries {
-                        if wait_live_retry(&stop, config.retry_backoff) {
-                            retries += 1;
-                            metrics::counter!(LIVE_HTTP_RETRIES_METRIC).increment(1);
-                            break;
+            let chunk = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    report.stopped = true;
+                    return Ok(report);
+                }
+                chunk = tokio::time::timeout(config.idle_timeout, response.chunk()) => chunk,
+            };
+            match chunk {
+                Ok(Ok(Some(bytes))) => {
+                    report.bytes_read = report
+                        .bytes_read
+                        .saturating_add(bytes.len().try_into().unwrap_or(u64::MAX));
+                    tokio::select! {
+                        _ = cancellation.cancelled() => {
+                            report.stopped = true;
+                            return Ok(report);
                         }
-                        let _ = writer.close();
-                        return Ok(HttpLiveStreamReport {
-                            bytes_read,
-                            retries,
-                            completed: false,
-                            stopped: true,
-                        });
+                        pushed = writer.push(bytes) => pushed?,
                     }
-                    let _ = writer.fail(mapped.to_string());
+                }
+                Ok(Ok(None)) => {
+                    if report.bytes_read == 0 && report.retries < config.max_retries {
+                        report.retries += 1;
+                        metrics::counter!("music_stream.source.live_http_retries").increment(1);
+                        tokio::select! {
+                            _ = cancellation.cancelled() => {
+                                report.stopped = true;
+                                return Ok(report);
+                            }
+                            _ = tokio::time::sleep(config.retry_backoff) => {}
+                        }
+                        break;
+                    }
+                    if report.bytes_read == 0 {
+                        let error = MusicStreamError::InvalidSource(
+                            "live HTTP response ended before media bytes".to_owned(),
+                        );
+                        writer.fail(error.to_string(), &cancellation).await;
+                        return Err(error);
+                    }
+                    report.completed = true;
+                    return Ok(report);
+                }
+                Ok(Err(_error))
+                    if report.bytes_read == 0 && report.retries < config.max_retries =>
+                {
+                    report.retries += 1;
+                    metrics::counter!("music_stream.source.live_http_retries").increment(1);
+                    tokio::select! {
+                        _ = cancellation.cancelled() => {
+                            report.stopped = true;
+                            return Ok(report);
+                        }
+                        _ = tokio::time::sleep(config.retry_backoff) => {}
+                    }
+                    break;
+                }
+                Ok(Err(error)) => {
+                    let mapped = map_http_error(error);
+                    writer.fail(mapped.to_string(), &cancellation).await;
                     return Err(mapped);
                 }
-            };
-            if read == 0 {
-                writer.finish()?;
-                return Ok(HttpLiveStreamReport {
-                    bytes_read,
-                    retries,
-                    completed: true,
-                    stopped: false,
-                });
-            }
-
-            match writer.push_blocking(Bytes::copy_from_slice(&buffer[..read])) {
-                Ok(()) => {
-                    bytes_read = bytes_read.saturating_add(read.try_into().unwrap_or(u64::MAX));
+                Err(_) if report.bytes_read == 0 && report.retries < config.max_retries => {
+                    report.retries += 1;
+                    metrics::counter!("music_stream.source.live_http_retries").increment(1);
+                    tokio::select! {
+                        _ = cancellation.cancelled() => {
+                            report.stopped = true;
+                            return Ok(report);
+                        }
+                        _ = tokio::time::sleep(config.retry_backoff) => {}
+                    }
+                    break;
                 }
-                Err(error)
-                    if stop.load(Ordering::Acquire)
-                        || matches!(error, MusicStreamError::StreamClosed(_)) =>
-                {
-                    return Ok(HttpLiveStreamReport {
-                        bytes_read,
-                        retries,
-                        completed: false,
-                        stopped: true,
-                    });
-                }
-                Err(error) => {
-                    let _ = writer.fail(error.to_string());
+                Err(_) => {
+                    let error = MusicStreamError::SourceTimeout(
+                        "live HTTP body stalled past the idle deadline".to_owned(),
+                    );
+                    writer.fail(error.to_string(), &cancellation).await;
                     return Err(error);
                 }
             }
@@ -572,333 +388,260 @@ fn run_http_live_stream(
     }
 }
 
-fn map_live_http_error(error: reqwest::Error) -> MusicStreamError {
-    if error.is_timeout() {
-        return MusicStreamError::SourceTimeout(error.to_string());
-    }
-    if error
-        .status()
-        .is_some_and(|status| matches!(status.as_u16(), 401 | 403))
-    {
-        return MusicStreamError::SourceAuthExpired(error.to_string());
-    }
-    MusicStreamError::InvalidSource(error.to_string())
+#[derive(Debug)]
+struct LiveOpenError {
+    error: MusicStreamError,
+    retryable: bool,
 }
 
-fn is_retryable_live_http_request_error(error: &reqwest::Error) -> bool {
-    if error.is_timeout() {
-        return true;
-    }
-
-    match error.status().map(|status| status.as_u16()) {
-        Some(401 | 403) => false,
-        Some(408 | 429) => true,
-        Some(500..=599) => true,
-        Some(400..=499) => false,
-        Some(_) => false,
-        None => true,
-    }
-}
-
-fn wait_live_retry(stop: &AtomicBool, backoff: Duration) -> bool {
-    if backoff.is_zero() {
-        return !stop.load(Ordering::Acquire);
-    }
-
-    let deadline = Instant::now() + backoff;
-    while Instant::now() < deadline {
-        if stop.load(Ordering::Acquire) {
-            return false;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        thread::sleep(remaining.min(Duration::from_millis(10)));
-    }
-    !stop.load(Ordering::Acquire)
+async fn open_live_response(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+) -> std::result::Result<reqwest::Response, LiveOpenError> {
+    let response = tokio::time::timeout(timeout, client.get(url).send())
+        .await
+        .map_err(|_| LiveOpenError {
+            error: MusicStreamError::SourceTimeout(
+                "live HTTP response did not open before the deadline".to_owned(),
+            ),
+            retryable: true,
+        })?
+        .map_err(|error| LiveOpenError {
+            retryable: is_retryable_http(&error),
+            error: map_http_error(error),
+        })?;
+    response.error_for_status().map_err(|error| LiveOpenError {
+        retryable: is_retryable_http(&error),
+        error: map_http_error(error),
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
     use super::*;
-    use crate::model::{TrackKind, TrackSource};
-    use bytes::Bytes;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::sync::mpsc;
 
-    fn live_track(url: impl Into<String>) -> TrackSource {
-        TrackSource {
-            id: "live-a".to_owned(),
-            kind: TrackKind::Live,
-            url: Some(url.into()),
-            path: None,
-            seekable: Some(false),
+    #[derive(Debug, Default)]
+    struct CountingWaitObserver {
+        before: AtomicUsize,
+        after: AtomicUsize,
+    }
+
+    impl BlockingReadObserver for CountingWaitObserver {
+        fn before_wait(&self) {
+            self.before.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn after_wait(&self) {
+            self.after.fetch_add(1, Ordering::Relaxed);
         }
     }
 
-    fn serve_live_http_chunks(chunks: Vec<Vec<u8>>) -> (String, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind live HTTP test server");
-        let addr = listener
-            .local_addr()
-            .expect("live HTTP test server address");
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept live HTTP request");
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request);
-            let headers = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+    #[tokio::test]
+    async fn byte_bridge_splits_oversized_chunks_and_preserves_bytes() {
+        let (writer, mut reader) = StreamingByteReader::new(4).expect("bridge");
+        let blocked = tokio::spawn(async move { writer.push(Bytes::from_static(b"abcdef")).await });
+        tokio::task::spawn_blocking(move || {
+            let mut output = [0_u8; 6];
+            reader.read_exact(&mut output).expect("read");
+            assert_eq!(&output, b"abcdef");
+        })
+        .await
+        .expect("reader task");
+        blocked.await.expect("writer task").expect("unblocked push");
+    }
+
+    #[tokio::test]
+    async fn live_bridges_share_the_runtime_wide_byte_budget() {
+        let global = Arc::new(Semaphore::new(4));
+        let (first_writer, mut first_reader) =
+            StreamingByteReader::with_global_budget(4, Arc::clone(&global)).expect("first bridge");
+        let (second_writer, _second_reader) =
+            StreamingByteReader::with_global_budget(4, Arc::clone(&global)).expect("second bridge");
+        first_writer
+            .push(Bytes::from_static(b"abcd"))
+            .await
+            .expect("fill global budget");
+        let blocked =
+            tokio::spawn(async move { second_writer.push(Bytes::from_static(b"e")).await });
+        tokio::task::yield_now().await;
+        assert!(!blocked.is_finished());
+
+        tokio::task::spawn_blocking(move || {
+            let mut output = [0_u8; 4];
+            first_reader.read_exact(&mut output).expect("release bytes");
+            assert_eq!(&output, b"abcd");
+        })
+        .await
+        .expect("reader task");
+
+        tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .expect("global budget did not release")
+            .expect("writer task")
+            .expect("second push");
+    }
+
+    #[tokio::test]
+    async fn wait_observer_wraps_only_blocking_channel_receives() {
+        let (writer, mut reader) = StreamingByteReader::new(4).expect("bridge");
+        let observer = Arc::new(CountingWaitObserver::default());
+        reader.set_wait_observer(observer.clone());
+        writer.push(Bytes::from_static(b"ab")).await.expect("push");
+        tokio::task::spawn_blocking(move || {
+            let mut byte = [0_u8; 1];
+            reader.read_exact(&mut byte).expect("first byte");
+            assert_eq!(byte, [b'a']);
+            assert_eq!(observer.before.load(Ordering::Relaxed), 1);
+            assert_eq!(observer.after.load(Ordering::Relaxed), 1);
+            reader.read_exact(&mut byte).expect("second byte");
+            assert_eq!(byte, [b'b']);
+            assert_eq!(observer.before.load(Ordering::Relaxed), 1);
+            assert_eq!(observer.after.load(Ordering::Relaxed), 1);
+        })
+        .await
+        .expect("reader");
+    }
+
+    #[tokio::test]
+    async fn live_body_may_outlive_the_open_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 1_024];
+            let _ = stream.read(&mut request).await;
             stream
-                .write_all(headers.as_bytes())
-                .expect("write live headers");
-            for chunk in chunks {
-                stream.write_all(&chunk).expect("write live chunk");
-                stream.flush().expect("flush live chunk");
-            }
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\na")
+                .await
+                .expect("first body byte");
+            stream.flush().await.expect("flush");
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            stream.write_all(b"b").await.expect("second body byte");
         });
-        (format!("http://{addr}/live"), handle)
-    }
-
-    fn serve_live_http_status(status: u16) -> (String, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind live HTTP test server");
-        let addr = listener
-            .local_addr()
-            .expect("live HTTP test server address");
-        let handle = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept live HTTP request");
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request);
-            let response = format!("HTTP/1.1 {status} test\r\nContent-Length: 0\r\n\r\n");
-            stream
-                .write_all(response.as_bytes())
-                .expect("write live error");
-            stream.flush().expect("flush live error");
+        let (writer, mut reader) = StreamingByteReader::new(16).expect("bridge");
+        let cancellation = CancellationToken::new();
+        let reader_task = tokio::task::spawn_blocking(move || {
+            let mut output = Vec::new();
+            reader.read_to_end(&mut output).expect("read body");
+            output
         });
-        (format!("http://{addr}/live"), handle)
-    }
-
-    fn serve_live_http_status_then_chunks(
-        status: u16,
-        chunks: Vec<Vec<u8>>,
-    ) -> (String, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind live HTTP test server");
-        let addr = listener
-            .local_addr()
-            .expect("live HTTP test server address");
-        let handle = thread::spawn(move || {
-            let (mut first, _) = listener.accept().expect("accept first live HTTP request");
-            let mut request = [0_u8; 1024];
-            let _ = first.read(&mut request);
-            let response = format!("HTTP/1.1 {status} test\r\nContent-Length: 0\r\n\r\n");
-            first
-                .write_all(response.as_bytes())
-                .expect("write retryable live error");
-            first.flush().expect("flush retryable live error");
-            drop(first);
-
-            let (mut second, _) = listener.accept().expect("accept retry live HTTP request");
-            let _ = second.set_read_timeout(Some(Duration::from_secs(2)));
-            let mut request = [0_u8; 1024];
-            let _ = second.read(&mut request);
-            second
-                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
-                .expect("write retry live headers");
-            for chunk in chunks {
-                second.write_all(&chunk).expect("write retry live chunk");
-                second.flush().expect("flush retry live chunk");
-            }
-        });
-        (format!("http://{addr}/live"), handle)
-    }
-
-    #[test]
-    fn streaming_byte_source_try_push_enforces_byte_budget() {
-        let (writer, mut reader) = StreamingByteReader::new(4).expect("streaming bytes");
-        writer
-            .try_push(Bytes::from_static(b"abcd"))
-            .expect("push fills buffer");
-
-        let error = writer
-            .try_push(Bytes::from_static(b"e"))
-            .expect_err("buffer full");
-        assert_eq!(error.code(), crate::error::ErrorCode::Busy);
-        assert_eq!(writer.snapshot().buffered_bytes, 4);
-
-        let mut output = [0_u8; 2];
-        reader.read_exact(&mut output).expect("read partial");
-        assert_eq!(&output, b"ab");
-        assert_eq!(writer.snapshot().buffered_bytes, 2);
-
-        writer
-            .try_push(Bytes::from_static(b"ef"))
-            .expect("push after drain");
-        assert_eq!(writer.snapshot().buffered_bytes, 4);
-    }
-
-    #[test]
-    fn streaming_byte_reader_blocks_until_writer_pushes_and_finishes() {
-        let (writer, mut reader) = StreamingByteReader::new(16).expect("streaming bytes");
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let handle = thread::spawn(move || {
-            ready_tx.send(()).expect("ready");
-            let mut output = [0_u8; 5];
-            reader.read_exact(&mut output).expect("read pushed bytes");
-            assert_eq!(&output, b"hello");
-            let mut eof = [0_u8; 1];
-            assert_eq!(reader.read(&mut eof).expect("eof"), 0);
-        });
-
-        ready_rx.recv().expect("reader waiting");
-        thread::sleep(Duration::from_millis(20));
-        writer
-            .try_push(Bytes::from_static(b"hello"))
-            .expect("push bytes");
-        writer.finish().expect("finish");
-        handle.join().expect("reader thread");
-    }
-
-    #[test]
-    fn streaming_byte_blocking_push_waits_for_reader_capacity() {
-        let (writer, mut reader) = StreamingByteReader::new(4).expect("streaming bytes");
-        writer
-            .try_push(Bytes::from_static(b"abcd"))
-            .expect("fill buffer");
-        let blocking_writer = writer.clone();
-        let (started_tx, started_rx) = mpsc::channel();
-        let handle = thread::spawn(move || {
-            started_tx.send(()).expect("started");
-            blocking_writer
-                .push_blocking(Bytes::from_static(b"ef"))
-                .expect("blocking push");
-        });
-
-        started_rx.recv().expect("writer started");
-        thread::sleep(Duration::from_millis(20));
-        assert_eq!(writer.snapshot().buffered_bytes, 4);
-
-        let mut output = [0_u8; 2];
-        reader.read_exact(&mut output).expect("drain capacity");
-        assert_eq!(&output, b"ab");
-        handle.join().expect("blocking writer");
-        assert_eq!(writer.snapshot().buffered_bytes, 4);
-
-        let mut rest = [0_u8; 4];
-        reader.read_exact(&mut rest).expect("read rest");
-        assert_eq!(&rest, b"cdef");
-    }
-
-    #[test]
-    fn streaming_byte_reader_reports_writer_failure() {
-        let (writer, mut reader) = StreamingByteReader::new(16).expect("streaming bytes");
-        writer.fail("upstream disconnected").expect("fail");
-
-        let mut output = [0_u8; 1];
-        let error = reader.read(&mut output).expect_err("failure");
-        assert_eq!(error.kind(), std::io::ErrorKind::Other);
-        assert!(error.to_string().contains("upstream disconnected"));
-        assert!(writer.snapshot().failed);
-    }
-
-    #[test]
-    fn http_live_stream_reads_chunks_into_bounded_reader() {
-        let (url, server) = serve_live_http_chunks(vec![b"hel".to_vec(), b"lo".to_vec()]);
-        let mut live = spawn_http_live_stream(
-            &live_track(url),
+        let report = run_http_live_stream(
+            format!("http://{address}/live"),
             HttpLiveStreamConfig {
-                timeout: Duration::from_secs(2),
+                open_timeout: Duration::from_millis(20),
+                idle_timeout: Duration::from_secs(1),
                 max_buffered_bytes: 16,
-                read_chunk_bytes: 4,
                 max_retries: 0,
                 retry_backoff: Duration::from_millis(1),
             },
+            writer,
+            cancellation,
         )
-        .expect("spawn live stream");
-        let mut reader = live.take_reader().expect("reader");
-        let mut output = Vec::new();
-        reader.read_to_end(&mut output).expect("read live stream");
-        let report = live.join().expect("join live stream");
-        server.join().expect("live server");
+        .await
+        .expect("live stream");
 
-        assert_eq!(output, b"hello");
-        assert_eq!(report.bytes_read, 5);
         assert!(report.completed);
-        assert!(!report.stopped);
+        assert_eq!(report.bytes_read, 2);
+        assert_eq!(reader_task.await.expect("reader"), b"ab");
+        server.await.expect("server");
     }
 
-    #[test]
-    fn http_live_stream_retries_retryable_status_before_failing_reader() {
-        let (url, server) =
-            serve_live_http_status_then_chunks(503, vec![b"re".to_vec(), b"try".to_vec()]);
-        let mut live = spawn_http_live_stream(
-            &live_track(url),
+    #[tokio::test]
+    async fn live_body_idle_timeout_reports_source_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 1_024];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
+                .await
+                .expect("headers");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let (writer, mut reader) = StreamingByteReader::new(16).expect("bridge");
+        let cancellation = CancellationToken::new();
+        let reader_task = tokio::task::spawn_blocking(move || {
+            let mut output = Vec::new();
+            reader.read_to_end(&mut output)
+        });
+
+        let error = run_http_live_stream(
+            format!("http://{address}/live"),
             HttpLiveStreamConfig {
-                timeout: Duration::from_secs(2),
+                open_timeout: Duration::from_secs(1),
+                idle_timeout: Duration::from_millis(20),
                 max_buffered_bytes: 16,
-                read_chunk_bytes: 4,
-                max_retries: 1,
-                retry_backoff: Duration::from_millis(1),
-            },
-        )
-        .expect("spawn live stream");
-        let mut reader = live.take_reader().expect("reader");
-        let mut output = Vec::new();
-        reader
-            .read_to_end(&mut output)
-            .expect("read retried live stream");
-        let report = live.join().expect("join retried live stream");
-        server.join().expect("live retry server");
-
-        assert_eq!(output, b"retry");
-        assert_eq!(report.bytes_read, 5);
-        assert_eq!(report.retries, 1);
-        assert!(report.completed);
-        assert!(!report.stopped);
-    }
-
-    #[test]
-    fn http_live_stream_stop_unblocks_backpressured_writer() {
-        let (url, server) = serve_live_http_chunks(vec![vec![b'x'; 64 * 1024]]);
-        let live = spawn_http_live_stream(
-            &live_track(url),
-            HttpLiveStreamConfig {
-                timeout: Duration::from_secs(2),
-                max_buffered_bytes: 1024,
-                read_chunk_bytes: 1024,
                 max_retries: 0,
                 retry_backoff: Duration::from_millis(1),
             },
+            writer,
+            cancellation,
         )
-        .expect("spawn live stream");
+        .await
+        .expect_err("idle body must time out");
 
-        wait_for_condition(Duration::from_secs(2), || {
-            live.reader()
-                .is_some_and(|reader| reader.snapshot().buffered_bytes == 1024)
-        });
-        live.stop();
-        let report = live.join().expect("join stopped live stream");
-        server.join().expect("live server");
-
-        assert!(report.stopped);
-        assert!(!report.completed);
+        assert_eq!(error.code(), crate::error::ErrorCode::SourceTimeout);
+        assert!(reader_task.await.expect("reader").is_err());
+        server.await.expect("server");
     }
 
-    #[test]
-    fn http_live_stream_maps_auth_expiry() {
-        let (url, server) = serve_live_http_status(403);
-        let live = spawn_http_live_stream(&live_track(url), HttpLiveStreamConfig::default())
-            .expect("spawn live stream");
-        let error = live.join().expect_err("auth failure");
-        server.join().expect("live server");
-
-        assert_eq!(error.code(), crate::error::ErrorCode::SourceAuthExpired);
-    }
-
-    fn wait_for_condition(timeout: Duration, condition: impl Fn() -> bool) {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if condition() {
-                return;
+    #[tokio::test]
+    async fn partial_live_body_failure_is_not_concatenated_with_a_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let server_connections = Arc::clone(&connections);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            server_connections.fetch_add(1, Ordering::Relaxed);
+            let mut request = [0_u8; 1_024];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nopus")
+                .await
+                .expect("partial body");
+            drop(stream);
+            if tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_ok()
+            {
+                server_connections.fetch_add(1, Ordering::Relaxed);
             }
-            thread::sleep(Duration::from_millis(5));
-        }
-        assert!(condition(), "condition was not met before timeout");
+        });
+        let (writer, mut reader) = StreamingByteReader::new(16).expect("bridge");
+        let cancellation = CancellationToken::new();
+        let reader_task = tokio::task::spawn_blocking(move || {
+            let mut output = Vec::new();
+            let result = reader.read_to_end(&mut output);
+            (output, result)
+        });
+        let result = run_http_live_stream(
+            format!("http://{address}/live"),
+            HttpLiveStreamConfig {
+                open_timeout: Duration::from_secs(1),
+                idle_timeout: Duration::from_secs(1),
+                max_buffered_bytes: 16,
+                max_retries: 2,
+                retry_backoff: Duration::from_millis(1),
+            },
+            writer,
+            cancellation,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let (output, read_result) = reader_task.await.expect("reader");
+        assert_eq!(output, b"opus");
+        assert!(read_result.is_err());
+        server.await.expect("server");
+        assert_eq!(connections.load(Ordering::Relaxed), 1);
     }
 }

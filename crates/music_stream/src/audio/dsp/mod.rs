@@ -190,108 +190,6 @@ impl VolumeConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct PcmLevelSnapshot {
-    pub frames: u64,
-    pub samples: u64,
-    pub peak: f32,
-    pub peak_dbfs: f32,
-    pub rms: f32,
-    pub rms_dbfs: f32,
-}
-
-impl PcmLevelSnapshot {
-    #[must_use]
-    pub fn recommended_gain_db_for_peak(self, target_peak_dbfs: f32) -> Option<f32> {
-        if self.samples == 0
-            || self.peak <= 0.0
-            || !target_peak_dbfs.is_finite()
-            || target_peak_dbfs > 0.0
-        {
-            return None;
-        }
-        Some((target_peak_dbfs - self.peak_dbfs).clamp(-60.0, 12.0))
-    }
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct PcmLevelMeter {
-    frames: u64,
-    samples: u64,
-    peak: f32,
-    sum_squares: f64,
-}
-
-impl PcmLevelMeter {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn reset(&mut self) {
-        *self = Self::default();
-    }
-
-    pub fn update_interleaved(&mut self, samples: &[f32], channels: u16) -> Result<()> {
-        if channels == 0 {
-            return Err(MusicStreamError::InvalidConfig(
-                "channel count must be greater than zero".to_owned(),
-            ));
-        }
-        let channels = usize::from(channels);
-        if !samples.len().is_multiple_of(channels) {
-            return Err(MusicStreamError::InvalidConfig(
-                "interleaved sample count must be divisible by channel count".to_owned(),
-            ));
-        }
-
-        self.frames = self
-            .frames
-            .saturating_add((samples.len() / channels).try_into().unwrap_or(u64::MAX));
-        self.samples = self
-            .samples
-            .saturating_add(samples.len().try_into().unwrap_or(u64::MAX));
-        for sample in samples.iter().copied().filter(|sample| sample.is_finite()) {
-            let abs = sample.abs();
-            self.peak = self.peak.max(abs);
-            self.sum_squares += f64::from(sample) * f64::from(sample);
-        }
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn snapshot(&self) -> PcmLevelSnapshot {
-        if self.samples == 0 {
-            return PcmLevelSnapshot {
-                peak_dbfs: DB_FLOOR,
-                rms_dbfs: DB_FLOOR,
-                ..PcmLevelSnapshot::default()
-            };
-        }
-
-        let rms = (self.sum_squares / self.samples as f64).sqrt() as f32;
-        PcmLevelSnapshot {
-            frames: self.frames,
-            samples: self.samples,
-            peak: self.peak,
-            peak_dbfs: amplitude_to_dbfs(self.peak),
-            rms,
-            rms_dbfs: amplitude_to_dbfs(rms),
-        }
-    }
-}
-
-pub fn i16_to_f32_interleaved(input: &[i16], output: &mut Vec<f32>) {
-    output.clear();
-    output.reserve(input.len());
-    output.extend(input.iter().map(|sample| f32::from(*sample) / 32768.0));
-}
-
-pub fn copy_f32_interleaved(input: &[f32], output: &mut Vec<f32>) {
-    output.clear();
-    output.extend_from_slice(input);
-}
-
 pub fn to_stereo_interleaved(input: &[f32], channels: u16, output: &mut Vec<f32>) -> Result<()> {
     if channels == 0 {
         return Err(MusicStreamError::InvalidConfig(
@@ -435,17 +333,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn converts_i16_to_normalized_f32() {
-        let mut output = Vec::new();
-        i16_to_f32_interleaved(&[0, 16_384, -32_768, 32_767], &mut output);
-
-        assert_eq!(output[0], 0.0);
-        assert_eq!(output[1], 0.5);
-        assert_eq!(output[2], -1.0);
-        assert!(output[3] > 0.999);
-    }
-
-    #[test]
     fn expands_mono_to_stereo() {
         let mut output = Vec::new();
         to_stereo_interleaved(&[0.25, -0.5], 1, &mut output).expect("mono");
@@ -510,48 +397,6 @@ mod tests {
         assert!(samples[1] > 0.95);
         assert!(samples[2] >= -1.0);
         assert!(samples[2] < -0.95);
-    }
-
-    #[test]
-    fn pcm_level_meter_reports_peak_rms_and_headroom_gain() {
-        let mut meter = PcmLevelMeter::new();
-        meter
-            .update_interleaved(&[0.5, -0.5, 0.25, -0.25], 2)
-            .expect("levels");
-
-        let snapshot = meter.snapshot();
-        assert_eq!(snapshot.frames, 2);
-        assert_eq!(snapshot.samples, 4);
-        assert!((snapshot.peak - 0.5).abs() < 0.000_001);
-        assert!((snapshot.peak_dbfs + 6.020_6).abs() < 0.001);
-        assert!(snapshot.rms_dbfs < snapshot.peak_dbfs);
-
-        let gain = snapshot
-            .recommended_gain_db_for_peak(-1.0)
-            .expect("headroom gain");
-        assert!((gain - 5.020_6).abs() < 0.001);
-    }
-
-    #[test]
-    fn pcm_level_meter_rejects_misaligned_interleaved_samples() {
-        let mut meter = PcmLevelMeter::new();
-        let error = meter
-            .update_interleaved(&[0.1, 0.2, 0.3], 2)
-            .expect_err("misaligned samples");
-        assert_eq!(error.code(), crate::error::ErrorCode::InvalidConfig);
-    }
-
-    #[test]
-    fn pcm_level_meter_does_not_recommend_gain_for_silence() {
-        let mut meter = PcmLevelMeter::new();
-        meter
-            .update_interleaved(&[0.0, 0.0, 0.0, 0.0], 2)
-            .expect("silence");
-
-        let snapshot = meter.snapshot();
-        assert_eq!(snapshot.peak_dbfs, DB_FLOOR);
-        assert_eq!(snapshot.rms_dbfs, DB_FLOOR);
-        assert_eq!(snapshot.recommended_gain_db_for_peak(-1.0), None);
     }
 
     #[test]

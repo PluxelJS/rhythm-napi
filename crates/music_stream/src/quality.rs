@@ -6,7 +6,6 @@
 
 use std::collections::VecDeque;
 
-#[cfg(feature = "transport-rtp")]
 use crate::transport::RtcpReceiverReportSnapshot;
 
 const DEFAULT_RTCP_QUALITY_WINDOW_REPORTS: usize = 32;
@@ -40,7 +39,6 @@ pub struct RtcpQualitySample {
     pub round_trip_time_micros: Option<u64>,
 }
 
-#[cfg(feature = "transport-rtp")]
 impl From<RtcpReceiverReportSnapshot> for RtcpQualitySample {
     fn from(snapshot: RtcpReceiverReportSnapshot) -> Self {
         Self {
@@ -194,7 +192,7 @@ fn average_u64(values: &[u64]) -> Option<u64> {
     ))
 }
 
-#[cfg(all(test, feature = "transport-rtp"))]
+#[cfg(test)]
 mod tests {
     use super::{
         RtcpNetworkQualityLevel, RtcpQualitySample, RtcpQualityWindow, RtcpQualityWindowConfig,

@@ -3,6 +3,18 @@ use napi_derive::napi;
 
 #[derive(Debug)]
 #[napi(object)]
+pub struct RuntimeResourceLimitsInput {
+    pub max_cpu_workers: Option<u32>,
+    pub max_blocking_producers: Option<u32>,
+    pub max_blocking_preloads: Option<u32>,
+    pub max_concurrent_http_downloads: Option<u32>,
+    pub max_concurrent_live_streams: Option<u32>,
+    pub max_live_buffered_bytes: Option<i64>,
+    pub max_tempfile_bytes: Option<i64>,
+}
+
+#[derive(Debug)]
+#[napi(object)]
 pub struct TrackSourceInput {
     pub id: String,
     pub kind: String,
@@ -11,7 +23,7 @@ pub struct TrackSourceInput {
     pub seekable: Option<bool>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[napi(object)]
 pub struct StreamStatusOutput {
     pub stream_id: String,
@@ -19,7 +31,6 @@ pub struct StreamStatusOutput {
     pub next: Option<TrackSourceOutput>,
     pub play_state: String,
     pub time_played_ms: i64,
-    pub time_total_ms: Option<i64>,
     pub generation: i64,
     pub volume: f64,
     pub gain_db: f64,
@@ -36,7 +47,7 @@ pub struct StreamStatusBatchItemOutput {
     pub message: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[napi(object)]
 pub struct TrackSourceOutput {
     pub id: String,
@@ -66,7 +77,7 @@ pub struct StreamEventOutput {
     pub status: Option<StreamStatusOutput>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[napi(object)]
 pub struct RtcpReceiverReportOutput {
     pub reports_received: u32,
@@ -166,17 +177,19 @@ impl std::fmt::Debug for RtpTransportConfigInput {
 #[derive(Debug)]
 #[napi(object)]
 pub struct HttpSourceConfigInput {
-    pub timeout_ms: Option<i64>,
+    pub io_timeout_ms: Option<i64>,
     pub max_bytes: Option<i64>,
     pub cache_temp_files: Option<bool>,
+    pub max_retries: Option<u32>,
+    pub retry_backoff_ms: Option<i64>,
 }
 
 #[derive(Debug)]
 #[napi(object)]
 pub struct HttpLiveSourceConfigInput {
-    pub timeout_ms: Option<i64>,
+    pub open_timeout_ms: Option<i64>,
+    pub idle_timeout_ms: Option<i64>,
     pub max_buffered_bytes: Option<i64>,
-    pub read_chunk_bytes: Option<i64>,
     pub max_retries: Option<u32>,
     pub retry_backoff_ms: Option<i64>,
 }
@@ -191,17 +204,19 @@ pub struct SourceResolverConfigInput {
 #[derive(Debug)]
 #[napi(object)]
 pub struct HttpSourceConfigOutput {
-    pub timeout_ms: i64,
+    pub io_timeout_ms: i64,
     pub max_bytes: i64,
     pub cache_temp_files: bool,
+    pub max_retries: u32,
+    pub retry_backoff_ms: i64,
 }
 
 #[derive(Debug)]
 #[napi(object)]
 pub struct HttpLiveSourceConfigOutput {
-    pub timeout_ms: i64,
+    pub open_timeout_ms: i64,
+    pub idle_timeout_ms: i64,
     pub max_buffered_bytes: i64,
-    pub read_chunk_bytes: i64,
     pub max_retries: u32,
     pub retry_backoff_ms: i64,
 }
@@ -215,12 +230,23 @@ pub struct SourceResolverConfigOutput {
 
 #[derive(Debug)]
 #[napi(object)]
+pub struct MediaBufferConfigInput {
+    pub decode_batch_ms: Option<i64>,
+    pub encoded_capacity_ms: Option<i64>,
+    pub prebuffer_ms: Option<i64>,
+    pub next_prime_ms: Option<i64>,
+    pub max_playout_lateness_ms: Option<i64>,
+}
+
+#[derive(Debug)]
+#[napi(object)]
 pub struct StartStreamInput {
     pub stream_id: String,
     pub current: TrackSourceInput,
     pub next: Option<TrackSourceInput>,
     pub transport: RtpTransportConfigInput,
     pub source: Option<SourceResolverConfigInput>,
+    pub buffer: Option<MediaBufferConfigInput>,
     pub volume: Option<f64>,
     pub gain_db: Option<f64>,
 }

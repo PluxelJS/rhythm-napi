@@ -1,18 +1,14 @@
 //! Audio demuxing and decoding backends.
 
+#[cfg(test)]
 use std::collections::VecDeque;
-#[cfg(feature = "decoder-symphonia")]
 use std::io::Read;
-#[cfg(feature = "decoder-symphonia")]
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
 use crate::Result;
-use crate::audio::AudioFormat;
-use crate::audio::dsp::to_stereo_interleaved;
-#[cfg(feature = "decoder-symphonia")]
 use crate::error::MusicStreamError;
-use crate::error::MusicStreamError as Error;
+
+const MAX_CONSECUTIVE_DECODE_ERRORS: usize = 32;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecodedChunk {
@@ -52,89 +48,13 @@ pub trait DecoderBackend {
     fn poll_decode(&mut self) -> Result<DecodePoll>;
 }
 
-#[derive(Debug)]
-pub struct NormalizingDecoder<D> {
-    inner: D,
-    target: AudioFormat,
-}
-
-impl<D> NormalizingDecoder<D> {
-    pub fn new(inner: D, target: AudioFormat) -> Result<Self> {
-        if target.sample_rate == 0 {
-            return Err(Error::InvalidConfig(
-                "target sample_rate must be greater than zero".to_owned(),
-            ));
-        }
-        if target.channels == 0 {
-            return Err(Error::InvalidConfig(
-                "target channels must be greater than zero".to_owned(),
-            ));
-        }
-
-        Ok(Self { inner, target })
-    }
-
-    #[must_use]
-    pub fn target(&self) -> &AudioFormat {
-        &self.target
-    }
-
-    #[must_use]
-    pub fn inner(&self) -> &D {
-        &self.inner
-    }
-
-    pub fn into_inner(self) -> D {
-        self.inner
-    }
-}
-
-impl<D> DecoderBackend for NormalizingDecoder<D>
-where
-    D: DecoderBackend,
-{
-    fn poll_decode(&mut self) -> Result<DecodePoll> {
-        match self.inner.poll_decode()? {
-            DecodePoll::Chunk(chunk) => self.normalize_chunk(chunk).map(DecodePoll::Chunk),
-            DecodePoll::NeedMore => Ok(DecodePoll::NeedMore),
-            DecodePoll::End => Ok(DecodePoll::End),
-        }
-    }
-}
-
-impl<D> NormalizingDecoder<D> {
-    fn normalize_chunk(&mut self, mut chunk: DecodedChunk) -> Result<DecodedChunk> {
-        if chunk.sample_rate != self.target.sample_rate {
-            return Err(Error::ResampleError(format!(
-                "decoded sample rate {} does not match target {}",
-                chunk.sample_rate, self.target.sample_rate
-            )));
-        }
-
-        if chunk.channels == self.target.channels {
-            return Ok(chunk);
-        }
-
-        if self.target.channels != 2 {
-            return Err(Error::Unsupported(format!(
-                "channel normalization to {} channels is not supported",
-                self.target.channels
-            )));
-        }
-
-        let mut normalized = Vec::new();
-        to_stereo_interleaved(&chunk.samples_interleaved, chunk.channels, &mut normalized)?;
-        chunk.channels = self.target.channels;
-        chunk.samples_interleaved = normalized;
-        Ok(chunk)
-    }
-}
-
+#[cfg(test)]
 #[derive(Clone, Debug)]
-pub struct MemoryDecoder {
+pub(crate) struct MemoryDecoder {
     chunks: VecDeque<DecodedChunk>,
 }
 
+#[cfg(test)]
 impl MemoryDecoder {
     #[must_use]
     pub fn new(chunks: impl IntoIterator<Item = DecodedChunk>) -> Self {
@@ -144,6 +64,7 @@ impl MemoryDecoder {
     }
 }
 
+#[cfg(test)]
 impl DecoderBackend for MemoryDecoder {
     fn poll_decode(&mut self) -> Result<DecodePoll> {
         if let Some(chunk) = self.chunks.pop_front() {
@@ -153,386 +74,34 @@ impl DecoderBackend for MemoryDecoder {
         Ok(DecodePoll::End)
     }
 }
-
-#[derive(Debug)]
-pub struct StreamingPcmDecoder {
-    shared: Arc<Mutex<StreamingPcmState>>,
-}
-
-#[derive(Clone, Debug)]
-pub struct StreamingPcmWriter {
-    shared: Arc<Mutex<StreamingPcmState>>,
-}
-
-#[derive(Debug)]
-struct StreamingPcmState {
-    chunks: VecDeque<DecodedChunk>,
-    max_buffered_ms: u64,
-    buffered_ms: u64,
-    finished: bool,
-}
-
-impl StreamingPcmDecoder {
-    pub fn new(max_buffered_ms: u64) -> Result<Self> {
-        if max_buffered_ms == 0 {
-            return Err(Error::InvalidConfig(
-                "streaming decoder max_buffered_ms must be greater than zero".to_owned(),
-            ));
-        }
-
-        Ok(Self::from_shared(Arc::new(Mutex::new(StreamingPcmState {
-            chunks: VecDeque::new(),
-            max_buffered_ms,
-            buffered_ms: 0,
-            finished: false,
-        }))))
-    }
-
-    fn from_shared(shared: Arc<Mutex<StreamingPcmState>>) -> Self {
-        Self { shared }
-    }
-
-    #[must_use]
-    pub fn writer(&self) -> StreamingPcmWriter {
-        StreamingPcmWriter {
-            shared: Arc::clone(&self.shared),
-        }
-    }
-
-    #[must_use]
-    pub fn max_buffered_ms(&self) -> u64 {
-        self.snapshot().max_buffered_ms
-    }
-
-    #[must_use]
-    pub fn buffered_ms(&self) -> u64 {
-        self.snapshot().buffered_ms
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.snapshot().len
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    #[must_use]
-    pub fn is_finished(&self) -> bool {
-        self.snapshot().finished
-    }
-
-    #[must_use]
-    pub fn can_accept(&self, chunk: &DecodedChunk) -> bool {
-        self.writer().can_accept(chunk)
-    }
-
-    pub fn try_push(&self, chunk: DecodedChunk) -> Result<()> {
-        self.writer().try_push(chunk)
-    }
-
-    pub fn finish(&self) -> Result<()> {
-        self.writer().finish()
-    }
-
-    fn snapshot(&self) -> StreamingPcmSnapshot {
-        self.shared
-            .lock()
-            .map(|state| state.snapshot())
-            .unwrap_or_default()
-    }
-
-    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, StreamingPcmState>> {
-        self.shared
-            .lock()
-            .map_err(|_| Error::Internal("streaming decoder lock poisoned".to_owned()))
-    }
-}
-
-impl StreamingPcmWriter {
-    #[must_use]
-    pub fn max_buffered_ms(&self) -> u64 {
-        self.snapshot().max_buffered_ms
-    }
-
-    #[must_use]
-    pub fn buffered_ms(&self) -> u64 {
-        self.snapshot().buffered_ms
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.snapshot().len
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    #[must_use]
-    pub fn is_finished(&self) -> bool {
-        self.snapshot().finished
-    }
-
-    #[must_use]
-    pub fn can_accept(&self, chunk: &DecodedChunk) -> bool {
-        let Ok(duration_ms) = StreamingPcmState::validated_duration_ms(chunk) else {
-            return false;
-        };
-        self.shared
-            .lock()
-            .is_ok_and(|state| state.can_accept_duration(duration_ms))
-    }
-
-    pub fn try_push(&self, chunk: DecodedChunk) -> Result<()> {
-        let mut state = self.lock_state()?;
-        state.try_push(chunk)
-    }
-
-    pub fn finish(&self) -> Result<()> {
-        let mut state = self.lock_state()?;
-        state.finished = true;
-        Ok(())
-    }
-
-    fn snapshot(&self) -> StreamingPcmSnapshot {
-        self.shared
-            .lock()
-            .map(|state| state.snapshot())
-            .unwrap_or_default()
-    }
-
-    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, StreamingPcmState>> {
-        self.shared
-            .lock()
-            .map_err(|_| Error::Internal("streaming decoder lock poisoned".to_owned()))
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct StreamingPcmSnapshot {
-    max_buffered_ms: u64,
-    buffered_ms: u64,
-    len: usize,
-    finished: bool,
-}
-
-impl StreamingPcmState {
-    fn snapshot(&self) -> StreamingPcmSnapshot {
-        StreamingPcmSnapshot {
-            max_buffered_ms: self.max_buffered_ms,
-            buffered_ms: self.buffered_ms,
-            len: self.chunks.len(),
-            finished: self.finished,
-        }
-    }
-
-    fn try_push(&mut self, chunk: DecodedChunk) -> Result<()> {
-        if self.finished {
-            return Err(Error::StreamClosed(
-                "streaming decoder has already been finished".to_owned(),
-            ));
-        }
-
-        let duration_ms = Self::validated_duration_ms(&chunk)?;
-        if !self.can_accept_duration(duration_ms) {
-            return Err(Error::Busy(
-                "streaming decoder buffer high watermark reached".to_owned(),
-            ));
-        }
-
-        self.buffered_ms = self.buffered_ms.saturating_add(duration_ms);
-        self.chunks.push_back(chunk);
-        Ok(())
-    }
-
-    fn pop_poll(&mut self) -> DecodePoll {
-        if let Some(chunk) = self.chunks.pop_front() {
-            self.buffered_ms = self.buffered_ms.saturating_sub(chunk.duration_ms());
-            return DecodePoll::Chunk(chunk);
-        }
-
-        if self.finished {
-            DecodePoll::End
-        } else {
-            DecodePoll::NeedMore
-        }
-    }
-
-    fn can_accept_duration(&self, duration_ms: u64) -> bool {
-        self.buffered_ms.saturating_add(duration_ms) <= self.max_buffered_ms
-    }
-
-    fn validated_duration_ms(chunk: &DecodedChunk) -> Result<u64> {
-        validate_decoded_chunk(chunk)?;
-        let duration_ms = chunk.duration_ms();
-        if duration_ms == 0 {
-            return Err(Error::InvalidSource(
-                "streaming decoded chunk duration must be at least 1ms".to_owned(),
-            ));
-        }
-        Ok(duration_ms)
-    }
-}
-
-impl DecoderBackend for StreamingPcmDecoder {
-    fn poll_decode(&mut self) -> Result<DecodePoll> {
-        Ok(self.lock_state()?.pop_poll())
-    }
-}
-
-fn validate_decoded_chunk(chunk: &DecodedChunk) -> Result<()> {
-    if chunk.sample_rate == 0 {
-        return Err(Error::InvalidSource(
-            "decoded chunk sample_rate must be greater than zero".to_owned(),
-        ));
-    }
-    if chunk.channels == 0 {
-        return Err(Error::InvalidSource(
-            "decoded chunk channels must be greater than zero".to_owned(),
-        ));
-    }
-    if chunk.samples_interleaved.is_empty() {
-        return Err(Error::InvalidSource(
-            "decoded chunk samples must not be empty".to_owned(),
-        ));
-    }
-    if !chunk
-        .samples_interleaved
-        .len()
-        .is_multiple_of(usize::from(chunk.channels))
-    {
-        return Err(Error::InvalidSource(
-            "decoded chunk sample count must be divisible by channel count".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod streaming_tests {
-    use super::*;
-
-    fn chunk(frames_per_channel: usize) -> DecodedChunk {
-        DecodedChunk {
-            sample_rate: 48_000,
-            channels: 2,
-            samples_interleaved: vec![0.0; frames_per_channel * 2],
-        }
-    }
-
-    #[test]
-    fn streaming_decoder_returns_need_more_until_finished() {
-        let mut decoder = StreamingPcmDecoder::new(100).expect("decoder");
-
-        assert_eq!(decoder.poll_decode().expect("poll"), DecodePoll::NeedMore);
-
-        decoder.try_push(chunk(960)).expect("push");
-        assert_eq!(decoder.buffered_ms(), 20);
-        assert!(matches!(
-            decoder.poll_decode().expect("chunk"),
-            DecodePoll::Chunk(_)
-        ));
-        assert_eq!(decoder.buffered_ms(), 0);
-        assert_eq!(
-            decoder.poll_decode().expect("need more"),
-            DecodePoll::NeedMore
-        );
-
-        decoder.finish().expect("finish");
-        assert_eq!(decoder.poll_decode().expect("end"), DecodePoll::End);
-    }
-
-    #[test]
-    fn streaming_decoder_enforces_millisecond_buffer_budget() {
-        let decoder = StreamingPcmDecoder::new(40).expect("decoder");
-        decoder.try_push(chunk(960)).expect("push 20ms");
-        decoder.try_push(chunk(960)).expect("push 40ms");
-
-        let error = decoder.try_push(chunk(960)).expect_err("full");
-        assert_eq!(error.code(), crate::error::ErrorCode::Busy);
-        assert_eq!(decoder.buffered_ms(), 40);
-        assert_eq!(decoder.len(), 2);
-    }
-
-    #[test]
-    fn streaming_decoder_rejects_push_after_finish() {
-        let decoder = StreamingPcmDecoder::new(40).expect("decoder");
-        decoder.finish().expect("finish");
-
-        let error = decoder.try_push(chunk(960)).expect_err("closed");
-        assert_eq!(error.code(), crate::error::ErrorCode::StreamClosed);
-    }
-
-    #[test]
-    fn streaming_writer_can_feed_decoder_after_split() {
-        let mut decoder = StreamingPcmDecoder::new(40).expect("decoder");
-        let writer = decoder.writer();
-
-        writer.try_push(chunk(960)).expect("writer push");
-        assert_eq!(writer.buffered_ms(), 20);
-        assert!(matches!(
-            decoder.poll_decode().expect("decode"),
-            DecodePoll::Chunk(_)
-        ));
-        assert_eq!(writer.buffered_ms(), 0);
-        writer.finish().expect("finish");
-        assert_eq!(decoder.poll_decode().expect("end"), DecodePoll::End);
-    }
-
-    #[test]
-    fn streaming_decoder_rejects_invalid_chunks() {
-        let decoder = StreamingPcmDecoder::new(40).expect("decoder");
-        let mut invalid = chunk(960);
-        invalid.channels = 0;
-
-        let error = decoder.try_push(invalid).expect_err("invalid");
-        assert_eq!(error.code(), crate::error::ErrorCode::InvalidSource);
-    }
-}
-
-#[cfg(feature = "decoder-symphonia")]
 pub struct SymphoniaFileDecoder {
     format: SymphoniaFormatReader,
     decoder: SymphoniaAudioDecoder,
     track_id: u32,
-    scratch: Vec<f32>,
+    decode_errors: DecodeErrorBudget,
 }
-
-#[cfg(feature = "decoder-symphonia")]
 impl std::fmt::Debug for SymphoniaFileDecoder {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SymphoniaFileDecoder")
             .field("track_id", &self.track_id)
-            .field("scratch_len", &self.scratch.len())
             .finish_non_exhaustive()
     }
 }
-
-#[cfg(feature = "decoder-symphonia")]
 pub struct SymphoniaStreamDecoder {
     format: SymphoniaFormatReader,
     decoder: SymphoniaAudioDecoder,
     track_id: u32,
-    scratch: Vec<f32>,
+    decode_errors: DecodeErrorBudget,
 }
-
-#[cfg(feature = "decoder-symphonia")]
 impl std::fmt::Debug for SymphoniaStreamDecoder {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("SymphoniaStreamDecoder")
             .field("track_id", &self.track_id)
-            .field("scratch_len", &self.scratch.len())
             .finish_non_exhaustive()
     }
 }
-
-#[cfg(feature = "decoder-symphonia")]
 impl SymphoniaFileDecoder {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         use std::fs::File;
@@ -555,7 +124,7 @@ impl SymphoniaFileDecoder {
             format,
             decoder,
             track_id,
-            scratch: Vec::new(),
+            decode_errors: DecodeErrorBudget::default(),
         })
     }
 
@@ -587,20 +156,16 @@ impl SymphoniaFileDecoder {
         Ok(())
     }
 }
-
-#[cfg(feature = "decoder-symphonia")]
 impl DecoderBackend for SymphoniaFileDecoder {
     fn poll_decode(&mut self) -> Result<DecodePoll> {
         poll_symphonia_decode(
             &mut self.format,
             &mut self.decoder,
             self.track_id,
-            &mut self.scratch,
+            &mut self.decode_errors,
         )
     }
 }
-
-#[cfg(feature = "decoder-symphonia")]
 impl SymphoniaStreamDecoder {
     pub fn open(
         reader: impl Read + Send + Sync + 'static,
@@ -619,24 +184,20 @@ impl SymphoniaStreamDecoder {
             format,
             decoder,
             track_id,
-            scratch: Vec::new(),
+            decode_errors: DecodeErrorBudget::default(),
         })
     }
 }
-
-#[cfg(feature = "decoder-symphonia")]
 impl DecoderBackend for SymphoniaStreamDecoder {
     fn poll_decode(&mut self) -> Result<DecodePoll> {
         poll_symphonia_decode(
             &mut self.format,
             &mut self.decoder,
             self.track_id,
-            &mut self.scratch,
+            &mut self.decode_errors,
         )
     }
 }
-
-#[cfg(feature = "decoder-symphonia")]
 fn open_symphonia_decoder(
     mss: symphonia::core::io::MediaSourceStream<'static>,
     hint: &symphonia::core::formats::probe::Hint,
@@ -673,13 +234,11 @@ fn open_symphonia_decoder(
 
     Ok((format, decoder, track_id))
 }
-
-#[cfg(feature = "decoder-symphonia")]
 fn poll_symphonia_decode(
     format: &mut SymphoniaFormatReader,
     decoder: &mut SymphoniaAudioDecoder,
     track_id: u32,
-    scratch: &mut Vec<f32>,
+    decode_errors: &mut DecodeErrorBudget,
 ) -> Result<DecodePoll> {
     use symphonia::core::errors::Error as SymphoniaError;
 
@@ -704,16 +263,23 @@ fn poll_symphonia_decode(
 
         match decoder.decode(&packet) {
             Ok(audio_buf) => {
-                scratch.resize(audio_buf.samples_interleaved(), 0.0);
-                audio_buf.copy_to_slice_interleaved(&mut *scratch);
+                decode_errors.reset();
+                let mut samples_interleaved = vec![0.0; audio_buf.samples_interleaved()];
+                audio_buf.copy_to_slice_interleaved(&mut samples_interleaved);
                 let spec = audio_buf.spec();
                 return Ok(DecodePoll::Chunk(DecodedChunk {
                     sample_rate: spec.rate(),
                     channels: spec.channels().count() as u16,
-                    samples_interleaved: scratch.clone(),
+                    samples_interleaved,
                 }));
             }
-            Err(SymphoniaError::IoError(_)) | Err(SymphoniaError::DecodeError(_)) => {
+            Err(error)
+                if matches!(
+                    error,
+                    SymphoniaError::IoError(_) | SymphoniaError::DecodeError(_)
+                ) =>
+            {
+                decode_errors.record(&error)?;
                 continue;
             }
             Err(SymphoniaError::ResetRequired) => {
@@ -725,16 +291,29 @@ fn poll_symphonia_decode(
     }
 }
 
-#[cfg(feature = "decoder-symphonia")]
+#[derive(Debug, Default)]
+struct DecodeErrorBudget {
+    consecutive: usize,
+}
+
+impl DecodeErrorBudget {
+    fn record(&mut self, error: &symphonia::core::errors::Error) -> Result<()> {
+        self.consecutive = self.consecutive.saturating_add(1);
+        if self.consecutive > MAX_CONSECUTIVE_DECODE_ERRORS {
+            return Err(MusicStreamError::DecodeError(format!(
+                "decoder exceeded {MAX_CONSECUTIVE_DECODE_ERRORS} consecutive corrupt packets: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.consecutive = 0;
+    }
+}
 type SymphoniaFormatReader = Box<dyn symphonia::core::formats::FormatReader>;
-
-#[cfg(feature = "decoder-symphonia")]
 type SymphoniaAudioDecoder = Box<dyn symphonia::core::codecs::audio::AudioDecoder>;
-
-#[cfg(feature = "decoder-symphonia")]
 type SymphoniaDecoderParts = (SymphoniaFormatReader, SymphoniaAudioDecoder, u32);
-
-#[cfg(feature = "decoder-symphonia")]
 fn map_symphonia_error(error: symphonia::core::errors::Error) -> MusicStreamError {
     use symphonia::core::errors::Error as SymphoniaError;
 
@@ -756,69 +335,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn memory_decoder_yields_chunks_then_end() {
-        let chunk = DecodedChunk {
-            sample_rate: 48_000,
-            channels: 2,
-            samples_interleaved: vec![0.0; 960 * 2],
-        };
-        let mut decoder = MemoryDecoder::new([chunk.clone()]);
-
+    fn consecutive_decode_error_budget_is_bounded() {
+        let mut budget = DecodeErrorBudget::default();
+        let error = symphonia::core::errors::Error::DecodeError("corrupt");
+        for _ in 0..MAX_CONSECUTIVE_DECODE_ERRORS {
+            budget.record(&error).expect("within budget");
+        }
         assert_eq!(
-            decoder.poll_decode().expect("chunk"),
-            DecodePoll::Chunk(chunk)
+            budget.record(&error).expect_err("budget exceeded").code(),
+            crate::error::ErrorCode::DecodeError
         );
-        assert_eq!(decoder.poll_decode().expect("end"), DecodePoll::End);
-        assert_eq!(decoder.poll_decode().expect("end again"), DecodePoll::End);
+        budget.reset();
+        budget.record(&error).expect("reset budget");
     }
-
-    #[test]
-    fn normalizing_decoder_expands_mono_to_target_stereo() {
-        let source = DecodedChunk {
-            sample_rate: 48_000,
-            channels: 1,
-            samples_interleaved: vec![0.25, -0.5],
-        };
-        let mut decoder = NormalizingDecoder::new(
-            MemoryDecoder::new([source]),
-            AudioFormat {
-                sample_rate: 48_000,
-                channels: 2,
-            },
-        )
-        .expect("normalizer");
-
-        let chunk = match decoder.poll_decode().expect("decode") {
-            DecodePoll::Chunk(chunk) => chunk,
-            other => panic!("unexpected decode poll: {other:?}"),
-        };
-
-        assert_eq!(chunk.sample_rate, 48_000);
-        assert_eq!(chunk.channels, 2);
-        assert_eq!(chunk.samples_interleaved, vec![0.25, 0.25, -0.5, -0.5]);
-    }
-
-    #[test]
-    fn normalizing_decoder_rejects_sample_rate_mismatch_until_resampler_is_inserted() {
-        let source = DecodedChunk {
-            sample_rate: 44_100,
-            channels: 2,
-            samples_interleaved: vec![0.0; 2],
-        };
-        let mut decoder = NormalizingDecoder::new(
-            MemoryDecoder::new([source]),
-            AudioFormat {
-                sample_rate: 48_000,
-                channels: 2,
-            },
-        )
-        .expect("normalizer");
-
-        let error = decoder.poll_decode().expect_err("sample rate mismatch");
-        assert_eq!(error.code(), crate::error::ErrorCode::ResampleError);
-    }
-
-    #[cfg(feature = "decoder-symphonia")]
     #[test]
     fn symphonia_file_decoder_reads_generated_wav() {
         let temp = tempfile::Builder::new()
@@ -838,8 +367,6 @@ mod tests {
         assert_eq!(chunk.samples_per_channel(), 960);
         assert_eq!(decoder.poll_decode().expect("end"), DecodePoll::End);
     }
-
-    #[cfg(feature = "decoder-symphonia")]
     #[test]
     fn symphonia_file_decoder_can_open_at_time_offset() {
         let temp = tempfile::Builder::new()
@@ -859,10 +386,8 @@ mod tests {
         assert!(!chunk.samples_interleaved.is_empty());
         assert_ne!(chunk.samples_interleaved[0], 0.0);
     }
-
-    #[cfg(feature = "decoder-symphonia")]
-    #[test]
-    fn symphonia_stream_decoder_reads_non_seekable_streaming_bytes() {
+    #[tokio::test]
+    async fn symphonia_stream_decoder_reads_non_seekable_streaming_bytes() {
         let temp = tempfile::Builder::new()
             .suffix(".wav")
             .tempfile()
@@ -872,23 +397,26 @@ mod tests {
         let (writer, reader) =
             crate::source::StreamingByteReader::new(bytes.len() + 1024).expect("byte pipe");
         writer
-            .try_push(bytes::Bytes::from(bytes))
+            .push(bytes::Bytes::from(bytes))
+            .await
             .expect("push wav bytes");
-        writer.finish().expect("finish byte stream");
+        drop(writer);
 
-        let mut decoder = SymphoniaStreamDecoder::open(reader, Some("wav")).expect("decoder");
-        let chunk = match decoder.poll_decode().expect("decode") {
-            DecodePoll::Chunk(chunk) => chunk,
-            other => panic!("expected chunk, got {other:?}"),
-        };
+        tokio::task::spawn_blocking(move || {
+            let mut decoder = SymphoniaStreamDecoder::open(reader, Some("wav")).expect("decoder");
+            let chunk = match decoder.poll_decode().expect("decode") {
+                DecodePoll::Chunk(chunk) => chunk,
+                other => panic!("expected chunk, got {other:?}"),
+            };
 
-        assert_eq!(chunk.sample_rate, 48_000);
-        assert_eq!(chunk.channels, 2);
-        assert_eq!(chunk.samples_per_channel(), 960);
-        assert_eq!(decoder.poll_decode().expect("end"), DecodePoll::End);
+            assert_eq!(chunk.sample_rate, 48_000);
+            assert_eq!(chunk.channels, 2);
+            assert_eq!(chunk.samples_per_channel(), 960);
+            assert_eq!(decoder.poll_decode().expect("end"), DecodePoll::End);
+        })
+        .await
+        .expect("decode task");
     }
-
-    #[cfg(feature = "decoder-symphonia")]
     fn write_test_wav(path: &Path, samples_per_channel: usize) -> std::io::Result<()> {
         use std::io::Write;
 

@@ -26,22 +26,22 @@ impl ErrorCode {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::InvalidSource => "InvalidSource",
-            Self::SourceTimeout => "SourceTimeout",
-            Self::SourceAuthExpired => "SourceAuthExpired",
-            Self::NotSeekable => "NotSeekable",
-            Self::UnsupportedFormat => "UnsupportedFormat",
-            Self::DecodeError => "DecodeError",
-            Self::ResampleError => "ResampleError",
-            Self::EncodeError => "EncodeError",
-            Self::RtpSendError => "RtpSendError",
-            Self::StreamClosed => "StreamClosed",
-            Self::Busy => "Busy",
-            Self::Internal => "Internal",
-            Self::StreamNotFound => "StreamNotFound",
-            Self::StreamAlreadyExists => "StreamAlreadyExists",
-            Self::InvalidConfig => "InvalidConfig",
-            Self::Unsupported => "Unsupported",
+            Self::InvalidSource => "INVALID_SOURCE",
+            Self::SourceTimeout => "SOURCE_TIMEOUT",
+            Self::SourceAuthExpired => "SOURCE_AUTH_EXPIRED",
+            Self::NotSeekable => "NOT_SEEKABLE",
+            Self::UnsupportedFormat => "UNSUPPORTED_FORMAT",
+            Self::DecodeError => "DECODE_ERROR",
+            Self::ResampleError => "RESAMPLE_ERROR",
+            Self::EncodeError => "ENCODE_ERROR",
+            Self::RtpSendError => "RTP_SEND_ERROR",
+            Self::StreamClosed => "STREAM_CLOSED",
+            Self::Busy => "BUSY",
+            Self::Internal => "INTERNAL",
+            Self::StreamNotFound => "STREAM_NOT_FOUND",
+            Self::StreamAlreadyExists => "STREAM_ALREADY_EXISTS",
+            Self::InvalidConfig => "INVALID_CONFIG",
+            Self::Unsupported => "UNSUPPORTED",
         }
     }
 }
@@ -123,9 +123,9 @@ mod tests {
 
     #[test]
     fn error_code_strings_are_stable_for_bindings() {
-        assert_eq!(ErrorCode::InvalidSource.as_str(), "InvalidSource");
-        assert_eq!(ErrorCode::SourceAuthExpired.as_str(), "SourceAuthExpired");
-        assert_eq!(ErrorCode::StreamNotFound.as_str(), "StreamNotFound");
-        assert_eq!(ErrorCode::Unsupported.as_str(), "Unsupported");
+        assert_eq!(ErrorCode::InvalidSource.as_str(), "INVALID_SOURCE");
+        assert_eq!(ErrorCode::SourceAuthExpired.as_str(), "SOURCE_AUTH_EXPIRED");
+        assert_eq!(ErrorCode::StreamNotFound.as_str(), "STREAM_NOT_FOUND");
+        assert_eq!(ErrorCode::Unsupported.as_str(), "UNSUPPORTED");
     }
 }

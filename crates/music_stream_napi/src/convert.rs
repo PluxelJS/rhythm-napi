@@ -1,19 +1,98 @@
 use std::time::Duration;
 
 use music_stream::{
-    GainLevel, HttpLiveStreamConfig, HttpSourceConfig, LocalFileRtpPlaybackProgress,
-    MusicStreamError, ReplayGainConfig, ReplayGainMetadata, ReplayGainMode,
-    ReplayGainRecommendation, ReplayGainSource, RtcpReceiverReportSnapshot, RtpEncryptionConfig,
-    RtpTransportConfig, SourceResolverConfig, TrackSource,
+    GainLevel, HttpLiveStreamConfig, HttpSourceConfig, MediaBufferConfig, MusicStreamError,
+    ReplayGainConfig, ReplayGainMetadata, ReplayGainMode, ReplayGainRecommendation,
+    ReplayGainSource, RtcpReceiverReportSnapshot, RtpEncryptionConfig, RtpTransportConfig,
+    RuntimeResourceLimits, SourceResolverConfig, StreamRuntimeProgress, TrackSource,
 };
 
 use crate::types::*;
 
 const DEFAULT_MUSIC_OPUS_BITRATE_BPS: u32 = 128_000;
 
+pub(crate) fn media_buffer_config_from_input(
+    input: Option<MediaBufferConfigInput>,
+) -> std::result::Result<MediaBufferConfig, MusicStreamError> {
+    let mut config = MediaBufferConfig::default();
+    let Some(input) = input else {
+        return Ok(config);
+    };
+    if let Some(value) = input.decode_batch_ms {
+        config.decode_batch_ms = positive_millis(value, "buffer.decodeBatchMs")?;
+    }
+    if let Some(value) = input.encoded_capacity_ms {
+        config.encoded_capacity_ms = positive_millis(value, "buffer.encodedCapacityMs")?;
+    }
+    if let Some(value) = input.prebuffer_ms {
+        config.prebuffer_ms = positive_millis(value, "buffer.prebufferMs")?;
+    }
+    if let Some(value) = input.next_prime_ms {
+        config.next_prime_ms = non_negative_millis(value, "buffer.nextPrimeMs")?;
+    }
+    if let Some(value) = input.max_playout_lateness_ms {
+        config.max_playout_lateness_ms = non_negative_millis(value, "buffer.maxPlayoutLatenessMs")?;
+    }
+    config.validate()?;
+    Ok(config)
+}
+
+fn positive_millis(value: i64, name: &str) -> std::result::Result<u64, MusicStreamError> {
+    if value <= 0 {
+        return Err(MusicStreamError::InvalidConfig(format!(
+            "{name} must be greater than zero"
+        )));
+    }
+    Ok(value as u64)
+}
+
+fn non_negative_millis(value: i64, name: &str) -> std::result::Result<u64, MusicStreamError> {
+    u64::try_from(value)
+        .map_err(|_| MusicStreamError::InvalidConfig(format!("{name} must be non-negative")))
+}
+
+pub(crate) fn runtime_resource_limits_from_input(
+    input: Option<RuntimeResourceLimitsInput>,
+) -> std::result::Result<RuntimeResourceLimits, MusicStreamError> {
+    let mut limits = RuntimeResourceLimits::default();
+    let Some(input) = input else {
+        return Ok(limits);
+    };
+    if let Some(value) = input.max_cpu_workers {
+        limits.max_cpu_workers = value as usize;
+    }
+    if let Some(value) = input.max_blocking_producers {
+        limits.max_blocking_producers = value as usize;
+    }
+    if let Some(value) = input.max_blocking_preloads {
+        limits.max_blocking_preloads = value as usize;
+    }
+    if let Some(value) = input.max_concurrent_http_downloads {
+        limits.max_concurrent_http_downloads = value as usize;
+    }
+    if let Some(value) = input.max_concurrent_live_streams {
+        limits.max_concurrent_live_streams = value as usize;
+    }
+    if let Some(value) = input.max_live_buffered_bytes {
+        limits.max_live_buffered_bytes = usize::try_from(value).map_err(|_| {
+            MusicStreamError::InvalidConfig(
+                "maxLiveBufferedBytes must fit in a positive usize".to_owned(),
+            )
+        })?;
+    }
+    if let Some(value) = input.max_tempfile_bytes {
+        limits.max_tempfile_bytes = u64::try_from(value).map_err(|_| {
+            MusicStreamError::InvalidConfig(
+                "maxTempfileBytes must fit in a positive u64".to_owned(),
+            )
+        })?;
+    }
+    Ok(limits)
+}
+
 impl StreamStatusOutput {
-    pub(crate) fn apply_progress(&mut self, progress: LocalFileRtpPlaybackProgress) {
-        self.time_played_ms = i64::try_from(progress.stream_position_ms).unwrap_or(i64::MAX);
+    pub(crate) fn apply_progress(&mut self, progress: StreamRuntimeProgress) {
+        self.time_played_ms = i64::try_from(progress.stream_position_ms()).unwrap_or(i64::MAX);
         self.receiver_report = progress.latest_receiver_report.map(Into::into);
     }
 }
@@ -33,13 +112,13 @@ pub(crate) fn source_config_from_input(
         return Ok(config);
     };
     if let Some(http) = input.http {
-        if let Some(timeout_ms) = http.timeout_ms {
-            if timeout_ms <= 0 {
+        if let Some(io_timeout_ms) = http.io_timeout_ms {
+            if io_timeout_ms <= 0 {
                 return Err(MusicStreamError::InvalidConfig(
-                    "source.http.timeoutMs must be greater than zero".to_owned(),
+                    "source.http.ioTimeoutMs must be greater than zero".to_owned(),
                 ));
             }
-            config.http.timeout = Duration::from_millis(timeout_ms as u64);
+            config.http.io_timeout = Duration::from_millis(io_timeout_ms as u64);
         }
         if let Some(max_bytes) = http.max_bytes {
             if max_bytes <= 0 {
@@ -52,15 +131,36 @@ pub(crate) fn source_config_from_input(
         if let Some(cache_temp_files) = http.cache_temp_files {
             config.http.cache_temp_files = cache_temp_files;
         }
-    }
-    if let Some(live_http) = input.live_http {
-        if let Some(timeout_ms) = live_http.timeout_ms {
-            if timeout_ms <= 0 {
+        if let Some(max_retries) = http.max_retries {
+            config.http.max_retries = u8::try_from(max_retries).map_err(|_| {
+                MusicStreamError::InvalidConfig("source.http.maxRetries must fit in u8".to_owned())
+            })?;
+        }
+        if let Some(retry_backoff_ms) = http.retry_backoff_ms {
+            if retry_backoff_ms < 0 {
                 return Err(MusicStreamError::InvalidConfig(
-                    "source.liveHttp.timeoutMs must be greater than zero".to_owned(),
+                    "source.http.retryBackoffMs must be non-negative".to_owned(),
                 ));
             }
-            config.live_http.timeout = Duration::from_millis(timeout_ms as u64);
+            config.http.retry_backoff = Duration::from_millis(retry_backoff_ms as u64);
+        }
+    }
+    if let Some(live_http) = input.live_http {
+        if let Some(open_timeout_ms) = live_http.open_timeout_ms {
+            if open_timeout_ms <= 0 {
+                return Err(MusicStreamError::InvalidConfig(
+                    "source.liveHttp.openTimeoutMs must be greater than zero".to_owned(),
+                ));
+            }
+            config.live_http.open_timeout = Duration::from_millis(open_timeout_ms as u64);
+        }
+        if let Some(idle_timeout_ms) = live_http.idle_timeout_ms {
+            if idle_timeout_ms <= 0 {
+                return Err(MusicStreamError::InvalidConfig(
+                    "source.liveHttp.idleTimeoutMs must be greater than zero".to_owned(),
+                ));
+            }
+            config.live_http.idle_timeout = Duration::from_millis(idle_timeout_ms as u64);
         }
         if let Some(max_buffered_bytes) = live_http.max_buffered_bytes {
             if max_buffered_bytes <= 0 {
@@ -68,15 +168,12 @@ pub(crate) fn source_config_from_input(
                     "source.liveHttp.maxBufferedBytes must be greater than zero".to_owned(),
                 ));
             }
-            config.live_http.max_buffered_bytes = max_buffered_bytes as usize;
-        }
-        if let Some(read_chunk_bytes) = live_http.read_chunk_bytes {
-            if read_chunk_bytes <= 0 {
-                return Err(MusicStreamError::InvalidConfig(
-                    "source.liveHttp.readChunkBytes must be greater than zero".to_owned(),
-                ));
-            }
-            config.live_http.read_chunk_bytes = read_chunk_bytes as usize;
+            config.live_http.max_buffered_bytes =
+                usize::try_from(max_buffered_bytes).map_err(|_| {
+                    MusicStreamError::InvalidConfig(
+                        "source.liveHttp.maxBufferedBytes must fit in usize".to_owned(),
+                    )
+                })?;
         }
         if let Some(max_retries) = live_http.max_retries {
             if max_retries > u32::from(u8::MAX) {
@@ -175,7 +272,6 @@ impl From<music_stream::StreamStatus> for StreamStatusOutput {
             next: value.next.map(Into::into),
             play_state: format!("{:?}", value.play_state).to_ascii_lowercase(),
             time_played_ms: value.time_played_ms as i64,
-            time_total_ms: value.time_total_ms.map(|value| value as i64),
             generation: value.generation as i64,
             volume: f64::from(value.volume.as_unit()),
             gain_db: f64::from(value.gain.as_db()),
@@ -318,9 +414,15 @@ impl From<RtpTransportConfig> for RtpTransportConfigOutput {
 impl From<HttpSourceConfig> for HttpSourceConfigOutput {
     fn from(value: HttpSourceConfig) -> Self {
         Self {
-            timeout_ms: value.timeout.as_millis().try_into().unwrap_or(i64::MAX),
+            io_timeout_ms: value.io_timeout.as_millis().try_into().unwrap_or(i64::MAX),
             max_bytes: value.max_bytes.try_into().unwrap_or(i64::MAX),
             cache_temp_files: value.cache_temp_files,
+            max_retries: u32::from(value.max_retries),
+            retry_backoff_ms: value
+                .retry_backoff
+                .as_millis()
+                .try_into()
+                .unwrap_or(i64::MAX),
         }
     }
 }
@@ -328,9 +430,17 @@ impl From<HttpSourceConfig> for HttpSourceConfigOutput {
 impl From<HttpLiveStreamConfig> for HttpLiveSourceConfigOutput {
     fn from(value: HttpLiveStreamConfig) -> Self {
         Self {
-            timeout_ms: value.timeout.as_millis().try_into().unwrap_or(i64::MAX),
+            open_timeout_ms: value
+                .open_timeout
+                .as_millis()
+                .try_into()
+                .unwrap_or(i64::MAX),
+            idle_timeout_ms: value
+                .idle_timeout
+                .as_millis()
+                .try_into()
+                .unwrap_or(i64::MAX),
             max_buffered_bytes: value.max_buffered_bytes.try_into().unwrap_or(i64::MAX),
-            read_chunk_bytes: value.read_chunk_bytes.try_into().unwrap_or(i64::MAX),
             max_retries: u32::from(value.max_retries),
             retry_backoff_ms: value
                 .retry_backoff
