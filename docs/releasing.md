@@ -36,10 +36,12 @@ gh secret set NPM_TOKEN --env npm --repo Kokoro-js/rhythm-napi
 
 ## 首次发布 0.1.0
 
-仓库已经存在 `v0.1.0`，不要重复创建 tag。启动并等待发布：
+确认 main 分支 CI 成功后，从最新 main 创建并推送首个发布 tag。推送 tag 会自动启动发布：
 
 ```sh
-gh workflow run release.yml --repo Kokoro-js/rhythm-napi -f tag=v0.1.0
+git pull --ff-only origin main
+git tag -a v0.1.0 -m "Release @rhythm-app/streamer 0.1.0"
+git push origin v0.1.0
 RUN_ID=$(gh run list --repo Kokoro-js/rhythm-napi --workflow release.yml \
   --limit 1 --json databaseId --jq '.[0].databaseId')
 gh run watch "$RUN_ID" --repo Kokoro-js/rhythm-napi --exit-status
