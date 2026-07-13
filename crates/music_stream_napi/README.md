@@ -13,8 +13,9 @@ timestamp. Playlist policy, provider authentication, URL refresh, and gateway ne
 the Node host.
 
 Bounded HTTP sources can start playback before the response completes. Give signed URLs without an
-extension an accurate `formatHint`. Live sources are current-only and do not support pause, seek, or
-next preload because the runtime deliberately has no implicit timeshift store.
+extension an accurate `formatHint`. Per-source `headers` support authenticated HTTP media without
+projecting credentials in status or events. Live sources are current-only and do not support pause,
+seek, or next preload because the runtime deliberately has no implicit timeshift store.
 
 All lifecycle methods return Promises. Await `shutdown()` before process exit; shutdown is idempotent
 and permanently closes the instance. Promise errors begin with a stable media error code followed by

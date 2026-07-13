@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TrackKind {
     File,
@@ -18,6 +20,8 @@ pub struct TrackSource {
     /// It describes the bytes, not the spelling of a temporary URL.
     pub format_hint: Option<String>,
     pub seekable: Option<bool>,
+    /// Per-source HTTP request headers. They stay server-side and are never projected in status.
+    pub headers: BTreeMap<String, String>,
 }
 
 impl TrackSource {
@@ -63,6 +67,7 @@ impl TrackSource {
                 "format hint must contain 1 to 16 ASCII letters or digits".to_owned(),
             ));
         }
+        validate_source_headers(self)?;
         Ok(())
     }
 
@@ -88,6 +93,56 @@ impl TrackSource {
             TrackKind::File | TrackKind::Url => self.seekable.unwrap_or(true),
         }
     }
+}
+
+fn validate_source_headers(source: &TrackSource) -> crate::Result<()> {
+    const MAX_HEADERS: usize = 16;
+    const MAX_HEADER_BYTES: usize = 16 * 1024;
+    if source.kind == TrackKind::File && !source.headers.is_empty() {
+        return Err(crate::MusicStreamError::InvalidSource(
+            "file sources cannot contain HTTP headers".to_owned(),
+        ));
+    }
+    if source.headers.len() > MAX_HEADERS
+        || source
+            .headers
+            .iter()
+            .map(|(name, value)| name.len().saturating_add(value.len()))
+            .sum::<usize>()
+            > MAX_HEADER_BYTES
+    {
+        return Err(crate::MusicStreamError::InvalidSource(
+            "source headers exceed configured limits".to_owned(),
+        ));
+    }
+    for (name, value) in &source.headers {
+        let normalized = name.to_ascii_lowercase();
+        if is_forbidden_source_header(&normalized)
+            || reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err()
+            || reqwest::header::HeaderValue::from_str(value).is_err()
+        {
+            return Err(crate::MusicStreamError::InvalidSource(format!(
+                "unsupported source header: {name}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_forbidden_source_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "content-length"
+            | "host"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "range"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -283,6 +338,7 @@ mod tests {
             path: Some("/tmp/audio.wav".to_owned()),
             format_hint: None,
             seekable,
+            headers: Default::default(),
         }
     }
 
@@ -301,6 +357,19 @@ mod tests {
         assert!(file.is_seekable());
         assert!(url.is_seekable());
         assert!(!non_seekable_url.is_seekable());
+    }
+
+    #[test]
+    fn source_headers_are_bounded_and_cannot_override_transport_framing() {
+        let mut source = source(TrackKind::Url, None);
+        source
+            .headers
+            .insert("referer".to_owned(), "https://example.test/".to_owned());
+        source.validate().expect("referer");
+        source
+            .headers
+            .insert("host".to_owned(), "attacker.test".to_owned());
+        assert!(source.validate().is_err());
     }
 
     #[test]

@@ -23,7 +23,7 @@ pub use audio::frame::{OpusFrame, PcmFrame};
 pub use audio::opus::{LibOpusEncoder, LibOpusEncoderConfig, OpusEncoderBackend};
 pub use audio::pipeline::{PipelineConfig, PlayoutPipeline, WorkerTurnReport};
 pub use error::{ErrorCode, MusicStreamError, Result};
-pub use event::StreamEvent;
+pub use event::{SourceRole, StreamEvent};
 pub use model::{
     GainLevel, MediaBufferConfig, PlayState, StreamStatus, TrackKind, TrackSource, VolumeLevel,
 };

@@ -4,7 +4,7 @@
 //! track slots for one realtime stream.
 
 use crate::error::{ErrorCode, MusicStreamError, Result};
-use crate::event::StreamEvent;
+use crate::event::{SourceRole, StreamEvent};
 use crate::model::{GainLevel, PlayState, StreamStatus, TrackSource, VolumeLevel};
 use crate::quality::{RtcpNetworkQualityLevel, RtcpQualityWindowSnapshot};
 
@@ -303,6 +303,7 @@ impl StreamActor {
                         output.events.push(StreamEvent::SourceRefreshNeeded {
                             stream_id: self.stream_id.clone(),
                             track_id: next.source.id.clone(),
+                            source_role: SourceRole::Next,
                         });
                     }
                     self.next = None;
@@ -732,6 +733,7 @@ impl StreamActor {
             output.events.push(StreamEvent::SourceRefreshNeeded {
                 stream_id: self.stream_id.clone(),
                 track_id: current.source.id.clone(),
+                source_role: SourceRole::Current,
             });
         }
         output.events.push(StreamEvent::Error {
@@ -789,6 +791,7 @@ mod tests {
             path: Some(format!("/tmp/{id}.mp3")),
             format_hint: None,
             seekable: Some(true),
+            headers: Default::default(),
         }
     }
 
@@ -800,6 +803,7 @@ mod tests {
             path: None,
             format_hint: None,
             seekable: None,
+            headers: Default::default(),
         }
     }
 
@@ -811,6 +815,7 @@ mod tests {
             path: None,
             format_hint: None,
             seekable: Some(false),
+            headers: Default::default(),
         }
     }
 
@@ -822,6 +827,7 @@ mod tests {
             path: None,
             format_hint: None,
             seekable: Some(true),
+            headers: Default::default(),
         }
     }
 
@@ -1274,8 +1280,10 @@ mod tests {
         assert!(output.events.iter().any(|event| {
             matches!(
                 event,
-                StreamEvent::SourceRefreshNeeded { stream_id, track_id }
-                    if stream_id == "s1" && track_id == "current"
+                StreamEvent::SourceRefreshNeeded { stream_id, track_id, source_role }
+                    if stream_id == "s1"
+                        && track_id == "current"
+                        && *source_role == SourceRole::Current
             )
         }));
         assert!(output.events.iter().any(|event| {
@@ -1371,8 +1379,10 @@ mod tests {
         assert!(output.events.iter().any(|event| {
             matches!(
                 event,
-                StreamEvent::SourceRefreshNeeded { stream_id, track_id }
-                    if stream_id == "s1" && track_id == "next"
+                StreamEvent::SourceRefreshNeeded { stream_id, track_id, source_role }
+                    if stream_id == "s1"
+                        && track_id == "next"
+                        && *source_role == SourceRole::Next
             )
         }));
         assert!(actor.next.is_none());

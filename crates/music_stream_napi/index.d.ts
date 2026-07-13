@@ -170,6 +170,7 @@ export interface StreamEventOutput {
   type: 'streamStarted' | 'streamStopped' | 'stateChanged' | 'nextNeeded' | 'sourceRefreshNeeded' | 'networkQualityChanged' | 'error'
   streamId?: string
   trackId?: string
+  sourceRole?: 'current' | 'next'
   quality?: 'good' | 'degraded' | 'poor'
   qualitySamples?: number
   latestLossPercent?: number
@@ -211,6 +212,7 @@ export interface TrackSourceInput {
   path?: string
   formatHint?: string
   seekable?: boolean
+  headers?: Record<string, string>
 }
 
 export interface TrackSourceOutput {

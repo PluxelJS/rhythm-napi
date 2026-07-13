@@ -47,6 +47,7 @@ fn file_track(id: &str, path: &Path) -> TrackSource {
         path: Some(path.display().to_string()),
         format_hint: None,
         seekable: Some(true),
+        headers: Default::default(),
     }
 }
 
@@ -265,6 +266,7 @@ async fn stalled_live_decode_never_blocks_rtp_deadlines() {
         path: None,
         format_hint: None,
         seekable: Some(false),
+        headers: Default::default(),
     };
     let runtime = runtime_for("stalled-live", live, None, &receiver, 11).await;
     let started = tokio::time::Instant::now();
@@ -473,6 +475,7 @@ async fn pause_during_url_download_excludes_paused_time_from_io_timeout() {
             path: None,
             format_hint: Some("wav".to_owned()),
             seekable: Some(true),
+            headers: Default::default(),
         },
         None,
         StreamRuntimeConfig::new(transport, source_config),
@@ -556,6 +559,7 @@ async fn progressive_url_sends_rtp_before_http_download_completes() {
             path: None,
             format_hint: Some("wav".to_owned()),
             seekable: Some(true),
+            headers: Default::default(),
         },
         None,
         StreamRuntimeConfig::new(transport, SourceResolverConfig::default()),
@@ -612,6 +616,7 @@ async fn next_url_added_while_paused_starts_no_download_until_resume() {
             path: None,
             format_hint: None,
             seekable: Some(true),
+            headers: Default::default(),
         })))
         .await
         .expect("set next");
@@ -676,6 +681,7 @@ async fn switching_to_url_while_paused_preserves_pause_and_defers_download() {
                 path: None,
                 format_hint: None,
                 seekable: Some(true),
+                headers: Default::default(),
             },
             next: None,
         })

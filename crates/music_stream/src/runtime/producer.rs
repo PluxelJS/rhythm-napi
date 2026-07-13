@@ -1176,6 +1176,7 @@ mod tests {
                 path: Some("/unused".to_owned()),
                 format_hint: None,
                 seekable: Some(true),
+                headers: Default::default(),
             },
             start_position_ms: 0,
             decode_batch_ms: 400,
@@ -1282,6 +1283,7 @@ mod tests {
                 path: None,
                 format_hint: None,
                 seekable: Some(true),
+                headers: Default::default(),
             },
             start_position_ms: 0,
             decode_batch_ms: 80,
@@ -1364,6 +1366,7 @@ mod tests {
             path: None,
             format_hint: format_hint.map(str::to_owned),
             seekable: Some(true),
+            headers: Default::default(),
         };
 
         assert!(supports_progressive_url(&source(

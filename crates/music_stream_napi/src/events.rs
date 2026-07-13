@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock};
 use napi::bindgen_prelude::Status;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 
-use music_stream::{RtcpNetworkQualityLevel, StreamEvent};
+use music_stream::{RtcpNetworkQualityLevel, SourceRole, StreamEvent};
 
 use crate::types::{StreamEventOutput, StreamStatusOutput};
 use crate::{Result, lock_error};
@@ -119,11 +119,19 @@ pub(crate) fn event_output(queued: QueuedStreamEvent) -> StreamEventOutput {
         StreamEvent::SourceRefreshNeeded {
             stream_id,
             track_id,
+            source_role,
         } => StreamEventOutput {
             sequence,
             r#type: "sourceRefreshNeeded".to_owned(),
             stream_id: Some(stream_id),
             track_id: Some(track_id),
+            source_role: Some(
+                match source_role {
+                    SourceRole::Current => "current",
+                    SourceRole::Next => "next",
+                }
+                .to_owned(),
+            ),
             ..empty()
         },
         StreamEvent::NetworkQualityChanged {
@@ -198,6 +206,7 @@ fn empty() -> StreamEventOutput {
         r#type: String::new(),
         stream_id: None,
         track_id: None,
+        source_role: None,
         quality: None,
         quality_samples: None,
         latest_loss_percent: None,

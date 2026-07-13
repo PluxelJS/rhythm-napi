@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
@@ -168,9 +169,13 @@ impl SourceDownloadRegistry {
 
 fn download_flight_key(source: &TrackSource, config: &HttpSourceConfig) -> String {
     let stable_key = source.stable_key();
+    let mut request_hasher = DefaultHasher::new();
+    source.url.hash(&mut request_hasher);
+    source.headers.hash(&mut request_hasher);
     format!(
-        "{}:{stable_key}:{}:{:?}:{}:{:?}:{}",
+        "{}:{stable_key}:{:016x}:{}:{:?}:{}:{:?}:{}",
         stable_key.len(),
+        request_hasher.finish(),
         config.max_bytes,
         config.io_timeout,
         config.max_retries,
@@ -1250,7 +1255,11 @@ async fn download_http_artifact_once(
         "artifact"
     };
     let response = {
-        let response = client.get(url).send();
+        let mut request = client.get(url);
+        for (name, value) in &source.headers {
+            request = request.header(name, value);
+        }
+        let response = request.send();
         tokio::pin!(response);
         let deadline = tokio::time::sleep(config.io_timeout);
         tokio::pin!(deadline);
@@ -1534,6 +1543,14 @@ mod tests {
             download_flight_key(&source, &first),
             download_flight_key(&source, &second)
         );
+        let mut authenticated = source.clone();
+        authenticated
+            .headers
+            .insert("referer".to_owned(), "https://example.test/".to_owned());
+        assert_ne!(
+            download_flight_key(&source, &first),
+            download_flight_key(&authenticated, &first)
+        );
         assert_eq!(
             download_flight_key(&source, &first),
             download_flight_key(&source, &first)
@@ -1587,6 +1604,7 @@ mod tests {
             path: Some(file.path().display().to_string()),
             format_hint: None,
             seekable: Some(true),
+            headers: Default::default(),
         };
         let artifact = resolve_local_file(&source).await.expect("resolve");
         assert_eq!(artifact.len_bytes, 5);
@@ -2188,6 +2206,46 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn bounded_http_sends_validated_per_source_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 2_048];
+            let length = stream.read(&mut request).await.expect("request");
+            let request = String::from_utf8_lossy(&request[..length]).to_ascii_lowercase();
+            assert!(request.contains("referer: https://www.example.test/"));
+            assert!(request.contains("user-agent: rhythm-test"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\naudio")
+                .await
+                .expect("response");
+        });
+        let mut source = url_source(format!("http://{address}/audio"));
+        source.headers.extend([
+            ("referer".to_owned(), "https://www.example.test/".to_owned()),
+            ("user-agent".to_owned(), "rhythm-test".to_owned()),
+        ]);
+        source.validate().expect("source headers");
+
+        let artifact = download_http_artifact(
+            &source,
+            &HttpSourceConfig::default(),
+            reqwest::Client::new(),
+            &PauseGate::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("download");
+
+        assert_eq!(
+            tokio::fs::read(artifact.path()).await.expect("read"),
+            b"audio"
+        );
+        server.await.expect("server");
+    }
+
     fn url_source(url: String) -> TrackSource {
         TrackSource {
             id: "http-test".to_owned(),
@@ -2196,6 +2254,7 @@ mod tests {
             path: None,
             format_hint: None,
             seekable: Some(true),
+            headers: Default::default(),
         }
     }
 

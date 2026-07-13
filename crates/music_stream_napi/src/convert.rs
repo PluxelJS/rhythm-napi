@@ -268,6 +268,7 @@ impl TryFrom<TrackSourceInput> for TrackSource {
             path: value.path,
             format_hint,
             seekable,
+            headers: value.headers.unwrap_or_default().into_iter().collect(),
         })
     }
 }
@@ -521,10 +522,14 @@ fn checked_f32(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     #[test]
     fn track_format_hint_is_normalized_and_validated() {
+        let headers =
+            HashMap::from([("referer".to_owned(), "https://www.example.test/".to_owned())]);
         let track = TrackSource::try_from(TrackSourceInput {
             id: "opaque".to_owned(),
             kind: "url".to_owned(),
@@ -532,9 +537,14 @@ mod tests {
             path: None,
             format_hint: Some(" MP3 ".to_owned()),
             seekable: None,
+            headers: Some(headers),
         })
         .expect("format hint");
         assert_eq!(track.format_hint.as_deref(), Some("mp3"));
+        assert_eq!(
+            track.headers.get("referer").map(String::as_str),
+            Some("https://www.example.test/")
+        );
 
         let error = TrackSource::try_from(TrackSourceInput {
             id: "invalid".to_owned(),
@@ -543,6 +553,7 @@ mod tests {
             path: None,
             format_hint: Some("audio/mpeg".to_owned()),
             seekable: None,
+            headers: None,
         })
         .expect_err("MIME types are not format hints");
         assert_eq!(error.code(), music_stream::ErrorCode::InvalidSource);

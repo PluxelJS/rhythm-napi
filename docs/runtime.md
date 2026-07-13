@@ -211,8 +211,9 @@ sender command、RTP/RTCP datagram和 stop 都有 deadline。
 补偿队列按 stream合并旧 `stateChanged`/quality快照并保留关键事件供宿主 drain。宿主不能假设
 callback永不丢失，callback panic/异常也与媒体动作隔离。
 
-事件语义属于事实通知：`nextNeeded` 请求宿主提供策略结果，`sourceRefreshNeeded` 请求同内容的新
-source，`networkQualityChanged` 提供策略输入，`error` 报告本次 generation 失败。Rust 不在事件
+事件语义属于事实通知：`nextNeeded` 请求宿主提供策略结果，`sourceRefreshNeeded` 通过
+`sourceRole=current|next` 请求对应 slot 的同内容新 source，`networkQualityChanged` 提供策略输入，
+`error` 报告本次 generation 失败。Rust 不在事件
 处理过程中执行 playlist 决策。
 
 Node 可见 status/event 中的 source 只包含 ID、kind、format hint 和 seekable 属性，不回显 URL

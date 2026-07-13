@@ -246,12 +246,13 @@ pub fn spawn_http_live_stream(
         .url
         .clone()
         .ok_or_else(|| MusicStreamError::InvalidSource("live source requires a URL".to_owned()))?;
+    let headers = source.headers.clone();
     let (writer, reader) =
         StreamingByteReader::with_global_budget(config.max_buffered_bytes, global_byte_budget)?;
     let cancellation = CancellationToken::new();
     let worker_cancellation = cancellation.clone();
     let task = tokio::spawn(async move {
-        run_http_live_stream(url, config, writer, worker_cancellation).await
+        run_http_live_stream(url, headers, config, writer, worker_cancellation).await
     });
     Ok(HttpLiveStream {
         reader,
@@ -262,6 +263,7 @@ pub fn spawn_http_live_stream(
 
 async fn run_http_live_stream(
     url: String,
+    headers: std::collections::BTreeMap<String, String>,
     config: HttpLiveStreamConfig,
     writer: StreamingByteWriter,
     cancellation: CancellationToken,
@@ -280,7 +282,7 @@ async fn run_http_live_stream(
                 report.stopped = true;
                 return Ok(report);
             }
-            response = open_live_response(&client, &url, config.open_timeout) => response,
+            response = open_live_response(&client, &url, &headers, config.open_timeout) => response,
         };
         let mut response = match response {
             Ok(response) => {
@@ -406,9 +408,14 @@ struct LiveOpenError {
 async fn open_live_response(
     client: &reqwest::Client,
     url: &str,
+    headers: &std::collections::BTreeMap<String, String>,
     timeout: Duration,
 ) -> std::result::Result<reqwest::Response, LiveOpenError> {
-    let response = tokio::time::timeout(timeout, client.get(url).send())
+    let mut request = client.get(url);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let response = tokio::time::timeout(timeout, request.send())
         .await
         .map_err(|_| LiveOpenError {
             error: MusicStreamError::SourceTimeout(
@@ -542,6 +549,7 @@ mod tests {
         });
         let report = run_http_live_stream(
             format!("http://{address}/live"),
+            Default::default(),
             HttpLiveStreamConfig {
                 open_timeout: Duration::from_millis(20),
                 idle_timeout: Duration::from_secs(1),
@@ -584,6 +592,7 @@ mod tests {
 
         let error = run_http_live_stream(
             format!("http://{address}/live"),
+            Default::default(),
             HttpLiveStreamConfig {
                 open_timeout: Duration::from_secs(1),
                 idle_timeout: Duration::from_millis(20),
@@ -634,6 +643,7 @@ mod tests {
         });
         let result = run_http_live_stream(
             format!("http://{address}/live"),
+            Default::default(),
             HttpLiveStreamConfig {
                 open_timeout: Duration::from_secs(1),
                 idle_timeout: Duration::from_secs(1),

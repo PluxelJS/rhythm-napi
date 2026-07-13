@@ -33,6 +33,10 @@ type _EventTypeContract = Assert<Equal<
   | 'networkQualityChanged'
   | 'error'
 >>
+type _SourceRoleContract = Assert<Equal<
+  StreamEventOutput['sourceRole'],
+  'current' | 'next' | undefined
+>>
 type _ErrorCodeContract = Assert<Equal<
   NonNullable<StreamEventOutput['code']>,
   NonNullable<StreamStatusBatchItemOutput['code']>

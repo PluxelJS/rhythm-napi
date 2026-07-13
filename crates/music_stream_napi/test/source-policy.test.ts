@@ -65,7 +65,9 @@ test('HTTP authorization failure is reported asynchronously', async () => {
       events.push(...streamer.drainEvents(streamId))
     }
     expect(
-      events.some((event) => event.type === 'sourceRefreshNeeded'),
+      events.some(
+        (event) => event.type === 'sourceRefreshNeeded' && event.sourceRole === 'current',
+      ),
       JSON.stringify(events),
     ).toBe(true)
     expect(

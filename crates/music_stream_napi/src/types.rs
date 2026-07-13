@@ -1,5 +1,6 @@
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
+use std::collections::HashMap;
 
 #[derive(Debug)]
 #[napi(object)]
@@ -24,6 +25,7 @@ pub struct TrackSourceInput {
     pub path: Option<String>,
     pub format_hint: Option<String>,
     pub seekable: Option<bool>,
+    pub headers: Option<HashMap<String, String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +76,8 @@ pub struct StreamEventOutput {
     pub r#type: String,
     pub stream_id: Option<String>,
     pub track_id: Option<String>,
+    #[napi(ts_type = "'current' | 'next'")]
+    pub source_role: Option<String>,
     #[napi(ts_type = "'good' | 'degraded' | 'poor'")]
     pub quality: Option<String>,
     pub quality_samples: Option<u32>,

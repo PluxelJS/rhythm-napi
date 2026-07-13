@@ -2,6 +2,12 @@ use crate::error::ErrorCode;
 use crate::model::StreamStatus;
 use crate::quality::{RtcpNetworkQualityLevel, RtcpQualityWindowSnapshot};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceRole {
+    Current,
+    Next,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum StreamEvent {
     StreamStarted {
@@ -19,6 +25,7 @@ pub enum StreamEvent {
     SourceRefreshNeeded {
         stream_id: String,
         track_id: String,
+        source_role: SourceRole,
     },
     NetworkQualityChanged {
         stream_id: String,
