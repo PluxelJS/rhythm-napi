@@ -113,6 +113,7 @@ export interface RtpTransportConfigInput {
   audioPt?: number
   bitrate?: number
   rtcpMux?: boolean
+  rtpKeepaliveIntervalMs?: number
   mtu?: number
   localIp?: string
   localPort?: number
@@ -130,6 +131,7 @@ export interface RtpTransportConfigOutput {
   mtu: number
   rtcpMux: boolean
   opusBitrateBps?: number
+  rtpKeepaliveIntervalMs?: number
   encryptionMode: string
 }
 

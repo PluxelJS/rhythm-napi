@@ -9,16 +9,21 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use super::StreamRuntimeProgress;
 use super::opus_queue::OpusQueueReceiver;
+use crate::audio::frame::OpusFrame;
 use crate::error::{MusicStreamError, Result};
 use crate::quality::{RtcpNetworkQualityLevel, RtcpQualityWindow};
 use crate::session::WorkerEvent;
 use crate::transport::{
-    RtpPacketizer, RtpTransportConfig, build_rtcp_sender_report, parse_rtcp_receiver_reports,
+    RTP_OPUS_CLOCK_RATE_HZ, RtpPacketizer, RtpTransportConfig, build_rtcp_sender_report,
+    parse_rtcp_receiver_reports,
 };
 
 const SENDER_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const DATAGRAM_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 const SENDER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+const OPUS_FRAME_SAMPLES: u32 = 960;
+const OPUS_FRAME_DURATION_MS: u64 = 20;
+const OPUS_SILENCE_PAYLOAD: &[u8] = &[0xf8, 0xff, 0xfe];
 
 #[derive(Clone, Debug)]
 pub(super) struct SenderHandle {
@@ -270,6 +275,71 @@ struct ActiveMedia {
     first_packet_started: Option<Instant>,
 }
 
+#[derive(Debug)]
+struct RtpClock {
+    next_timestamp: u32,
+    next_instant: Option<Instant>,
+}
+
+impl RtpClock {
+    fn new(next_timestamp: u32) -> Self {
+        Self {
+            next_timestamp,
+            next_instant: None,
+        }
+    }
+
+    fn timestamp(&self) -> u32 {
+        self.next_timestamp
+    }
+
+    /// Moves the transport clock over a discontinuous-transmission gap without
+    /// changing media progress. The next real packet can therefore start a new
+    /// talkspurt at the current receiver clock instead of reusing a stale RTP
+    /// timestamp from before the gap.
+    fn sync_to(&mut self, now: Instant) {
+        let Some(next_instant) = self.next_instant else {
+            return;
+        };
+        if now <= next_instant {
+            return;
+        }
+        self.next_timestamp = self
+            .next_timestamp
+            .wrapping_add(samples_for_duration(now.duration_since(next_instant)));
+        self.next_instant = Some(now);
+    }
+
+    fn projected_timestamp(&self, now: Instant) -> u32 {
+        let Some(next_instant) = self.next_instant else {
+            return self.next_timestamp;
+        };
+        if now >= next_instant {
+            self.next_timestamp
+                .wrapping_add(samples_for_duration(now.duration_since(next_instant)))
+        } else {
+            self.next_timestamp
+                .wrapping_sub(samples_for_duration(next_instant.duration_since(now)))
+        }
+    }
+
+    fn advance_samples(&mut self, samples: u32, now: Instant) {
+        self.next_timestamp = self.next_timestamp.wrapping_add(samples);
+        let next_instant = self.next_instant.get_or_insert(now);
+        *next_instant += duration_for_samples(samples);
+    }
+}
+
+fn samples_for_duration(duration: Duration) -> u32 {
+    let samples = duration.as_nanos() * u128::from(RTP_OPUS_CLOCK_RATE_HZ)
+        / Duration::from_secs(1).as_nanos();
+    samples as u32
+}
+
+fn duration_for_samples(samples: u32) -> Duration {
+    Duration::from_nanos(u64::from(samples) * 1_000_000_000 / u64::from(RTP_OPUS_CLOCK_RATE_HZ))
+}
+
 struct SenderRuntime {
     config: RtpTransportConfig,
     prebuffer_ms: u64,
@@ -306,7 +376,7 @@ async fn run_sender(
     let mut active: Option<ActiveMedia> = None;
     let mut paused = false;
     let mut sequence = rand::random::<u16>();
-    let mut rtp_timestamp = rand::random::<u32>();
+    let mut rtp_clock = RtpClock::new(rand::random::<u32>());
     let mut packets_sent = 0_u64;
     let mut bytes_sent = 0_u64;
     let mut octets_sent = 0_u64;
@@ -319,6 +389,11 @@ async fn run_sender(
     let mut quality_window = RtcpQualityWindow::default();
     let mut quality_level: Option<RtcpNetworkQualityLevel> = None;
     let mut pending_events = PendingWorkerEvents::default();
+    let mut keepalive = config.rtp_keepalive_interval.map(tokio::time::interval);
+    if let Some(keepalive) = keepalive.as_mut() {
+        keepalive.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        keepalive.tick().await;
+    }
     let mut rtcp = tokio::time::interval(rtcp_interval);
     rtcp.set_missed_tick_behavior(MissedTickBehavior::Skip);
     rtcp.tick().await;
@@ -412,6 +487,7 @@ async fn run_sender(
                         if let Some(media) = active.as_mut().filter(|media| media.generation == generation) {
                             paused = false;
                             media.deadline = Some(Instant::now());
+                            media.first_packet = true;
                             if !media.started {
                                 let activation_started = Instant::now();
                                 media.activation_started = Some(activation_started);
@@ -459,7 +535,7 @@ async fn run_sender(
                     recovered = true;
                     dropped_frames = dropped_frames.saturating_add(1);
                     dropped_media_ms = dropped_media_ms.saturating_add(stale.duration_ms);
-                    rtp_timestamp = rtp_timestamp.wrapping_add(stale.samples_per_channel);
+                    rtp_clock.advance_samples(stale.samples_per_channel, Instant::now());
                     media.media_sent_ms = media.media_sent_ms.saturating_add(stale.duration_ms);
                     scheduled_deadline += Duration::from_millis(stale.duration_ms.max(1));
                     metrics::counter!("music_stream.runtime.late_frames_dropped").increment(1);
@@ -473,6 +549,7 @@ async fn run_sender(
                 let Some(mut frame) = media.receiver.try_recv() else {
                     metrics::counter!("music_stream.runtime.underruns").increment(1);
                     media.started = false;
+                    media.first_packet = true;
                     media.deadline = None;
                     continue;
                 };
@@ -480,12 +557,13 @@ async fn run_sender(
                 if is_first_packet {
                     frame.marker = true;
                     media.first_packet = false;
+                    rtp_clock.sync_to(Instant::now());
                 }
                 let duration_ms = frame.duration_ms;
                 let samples = frame.samples_per_channel;
                 let payload_len = frame.payload.len();
                 let mut send_failure = None;
-                match packetizer.packetize(frame, rtp_timestamp, sequence, &mut scratch) {
+                match packetizer.packetize(frame, rtp_clock.timestamp(), sequence, &mut scratch) {
                     Ok(()) => match tokio::time::timeout(
                         DATAGRAM_SEND_TIMEOUT,
                         socket.send(&scratch),
@@ -506,7 +584,7 @@ async fn run_sender(
                                 .record(started.elapsed().as_micros() as f64);
                             }
                             sequence = sequence.wrapping_add(1);
-                            rtp_timestamp = rtp_timestamp.wrapping_add(samples);
+                            rtp_clock.advance_samples(samples, Instant::now());
                             media.media_sent_ms = media.media_sent_ms.saturating_add(duration_ms);
                             let duration = Duration::from_millis(duration_ms.max(1));
                             let anchored = scheduled_deadline + duration;
@@ -523,7 +601,7 @@ async fn run_sender(
                                 latency_recoveries,
                                 max_lateness_ms,
                                 sequence,
-                                rtp_timestamp,
+                                rtp_timestamp: rtp_clock.timestamp(),
                                 latest_receiver_report,
                             });
                         }
@@ -569,11 +647,54 @@ async fn run_sender(
                     permit.send(event);
                 }
             }
+            _ = async {
+                match keepalive.as_mut() {
+                    Some(interval) => interval.tick().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let media_scheduled = active
+                    .as_ref()
+                    .is_some_and(|media| media.started && !paused && media.deadline.is_some());
+                if media_scheduled {
+                    continue;
+                }
+                rtp_clock.sync_to(Instant::now());
+                let frame = OpusFrame {
+                    generation: active.as_ref().map_or(0, |media| media.generation),
+                    payload: Bytes::from_static(OPUS_SILENCE_PAYLOAD),
+                    samples_per_channel: OPUS_FRAME_SAMPLES,
+                    duration_ms: OPUS_FRAME_DURATION_MS,
+                    marker: false,
+                    track_position_samples: 0,
+                };
+                let payload_len = frame.payload.len();
+                if packetizer
+                    .packetize(frame, rtp_clock.timestamp(), sequence, &mut scratch)
+                    .is_ok()
+                    && matches!(
+                        tokio::time::timeout(DATAGRAM_SEND_TIMEOUT, socket.send(&scratch)).await,
+                        Ok(Ok(sent)) if sent == scratch.len()
+                    )
+                {
+                    let sent = scratch.len() as u64;
+                    packets_sent = packets_sent.saturating_add(1);
+                    bytes_sent = bytes_sent.saturating_add(sent);
+                    octets_sent = octets_sent.saturating_add(payload_len as u64);
+                    sequence = sequence.wrapping_add(1);
+                    rtp_clock.advance_samples(OPUS_FRAME_SAMPLES, Instant::now());
+                    metrics::counter!("music_stream.runtime.rtp_keepalive_packets").increment(1);
+                    metrics::counter!("music_stream.runtime.rtp_packets").increment(1);
+                    metrics::counter!("music_stream.runtime.rtp_bytes").increment(sent);
+                } else {
+                    metrics::counter!("music_stream.runtime.rtp_keepalive_failures").increment(1);
+                }
+            }
             _ = rtcp.tick() => {
                 if packets_sent > 0
                     && let Ok(report) = build_rtcp_sender_report(
                         config.ssrc,
-                        rtp_timestamp,
+                        rtp_clock.projected_timestamp(Instant::now()),
                         packets_sent.min(u64::from(u32::MAX)) as u32,
                         octets_sent.min(u64::from(u32::MAX)) as u32,
                         SystemTime::now(),
@@ -622,7 +743,7 @@ async fn run_sender(
                             latency_recoveries,
                             max_lateness_ms,
                             sequence,
-                            rtp_timestamp,
+                            rtp_timestamp: rtp_clock.timestamp(),
                             latest_receiver_report,
                         });
                     }
@@ -740,6 +861,18 @@ mod tests {
         assert!(supervisor.await.expect("supervisor").is_err());
     }
 
+    #[test]
+    fn keepalive_payload_is_a_valid_stereo_opus_silence_frame() {
+        let mut decoder = opus::Decoder::new(48_000, opus::Channels::Stereo).expect("decoder");
+        let mut pcm = [1_i16; OPUS_FRAME_SAMPLES as usize * 2];
+        let samples = decoder
+            .decode(OPUS_SILENCE_PAYLOAD, &mut pcm, false)
+            .expect("decode silence");
+
+        assert_eq!(samples, OPUS_FRAME_SAMPLES as usize);
+        assert!(pcm.into_iter().all(|sample| sample == 0));
+    }
+
     #[tokio::test]
     async fn activating_paused_media_never_sends_before_resume() {
         let remote = UdpSocket::bind("127.0.0.1:0").await.expect("remote");
@@ -784,6 +917,111 @@ mod tests {
             .await
             .expect("RTP timeout")
             .expect("RTP receive");
+        sender.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn idle_keepalive_preserves_the_rtp_session_and_resynchronizes_media() {
+        let remote = UdpSocket::bind("127.0.0.1:0").await.expect("remote");
+        let mut config = RtpTransportConfig::new(
+            "127.0.0.1",
+            remote.local_addr().expect("remote address").port(),
+            79,
+        );
+        config.local_ip = "127.0.0.1".to_owned();
+        config.rtp_keepalive_interval = Some(Duration::from_millis(40));
+        let (events, mut event_rx) = mpsc::channel(8);
+        let sender = SenderHandle::spawn(config, 20, 100, Duration::from_secs(60), events)
+            .await
+            .expect("sender");
+
+        let (output, receiver) = opus_queue::bounded(40);
+        output
+            .send_blocking(
+                OpusFrame {
+                    generation: 1,
+                    payload: Bytes::from_static(b"opus"),
+                    samples_per_channel: OPUS_FRAME_SAMPLES,
+                    duration_ms: OPUS_FRAME_DURATION_MS,
+                    marker: false,
+                    track_position_samples: 0,
+                },
+                &CancellationToken::new(),
+            )
+            .expect("queue first frame");
+        drop(output);
+        sender
+            .activate(1, 0, false, receiver)
+            .await
+            .expect("activate first source");
+
+        let mut first = [0_u8; 1_500];
+        let first_len = tokio::time::timeout(Duration::from_secs(1), remote.recv(&mut first))
+            .await
+            .expect("first RTP timeout")
+            .expect("first RTP receive");
+        assert_eq!(&first[12..first_len], b"opus");
+        loop {
+            if matches!(
+                event_rx.recv().await,
+                Some(WorkerEvent::CurrentEnded { generation: 1 })
+            ) {
+                break;
+            }
+        }
+
+        let mut keepalive = [0_u8; 1_500];
+        let keepalive_len =
+            tokio::time::timeout(Duration::from_secs(1), remote.recv(&mut keepalive))
+                .await
+                .expect("keepalive RTP timeout")
+                .expect("keepalive RTP receive");
+        assert_eq!(&keepalive[12..keepalive_len], OPUS_SILENCE_PAYLOAD);
+        assert_eq!(keepalive[1] & 0x80, 0);
+
+        let (output, receiver) = opus_queue::bounded(40);
+        output
+            .send_blocking(
+                OpusFrame {
+                    generation: 2,
+                    payload: Bytes::from_static(b"opus"),
+                    samples_per_channel: OPUS_FRAME_SAMPLES,
+                    duration_ms: OPUS_FRAME_DURATION_MS,
+                    marker: false,
+                    track_position_samples: 0,
+                },
+                &CancellationToken::new(),
+            )
+            .expect("queue resumed frame");
+        drop(output);
+        sender
+            .activate(2, 0, false, receiver)
+            .await
+            .expect("activate resumed source");
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let resumed = loop {
+            let mut packet = vec![0_u8; 1_500];
+            let len = tokio::time::timeout_at(deadline, remote.recv(&mut packet))
+                .await
+                .expect("resumed RTP timeout")
+                .expect("resumed RTP receive");
+            packet.truncate(len);
+            if packet.get(12..) == Some(b"opus") {
+                break packet;
+            }
+        };
+
+        let keepalive_sequence = u16::from_be_bytes([keepalive[2], keepalive[3]]);
+        let resumed_sequence = u16::from_be_bytes([resumed[2], resumed[3]]);
+        let keepalive_timestamp =
+            u32::from_be_bytes([keepalive[4], keepalive[5], keepalive[6], keepalive[7]]);
+        let resumed_timestamp =
+            u32::from_be_bytes([resumed[4], resumed[5], resumed[6], resumed[7]]);
+        assert!(resumed_sequence.wrapping_sub(keepalive_sequence) >= 1);
+        assert!(resumed_timestamp.wrapping_sub(keepalive_timestamp) >= OPUS_FRAME_SAMPLES);
+        assert_ne!(resumed[1] & 0x80, 0, "resumed media starts a new talkspurt");
+
         sender.shutdown().await.expect("shutdown");
     }
 

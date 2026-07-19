@@ -1,4 +1,5 @@
 import fs from 'node:fs'
+import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -109,6 +110,130 @@ test('all lifecycle methods are asynchronous and RTP remains monotonic across sw
   }
 })
 
+test('seek near the end preserves repeated automatic preload promotion', async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'music-seek-promotion-'))
+  const paths = await Promise.all(
+    [2.2, 1, 1].map(async (seconds, index) => {
+      const audioPath = path.join(directory, `${index}.wav`)
+      await fs.promises.writeFile(audioPath, makeSineWave(seconds))
+      return audioPath
+    }),
+  )
+  const socket = await createBoundUdpSocket()
+  const streamer = new Streamer()
+  const streamId = `seek-promotion-${Date.now()}`
+
+  try {
+    await streamer.startStream({
+      streamId,
+      current: { id: 'a', kind: 'file', path: paths[0] },
+      next: { id: 'b', kind: 'file', path: paths[1] },
+      transport: rtpTransport(socket, 0x11223345),
+    })
+    await waitForStatus(
+      () => streamer.getStatus(streamId),
+      (status) => status.playState === 'playing' && status.current?.id === 'a',
+    )
+    await streamer.seekStream(streamId, 2)
+
+    await waitForStatus(
+      () => streamer.getStatus(streamId),
+      (status) => status.current?.id === 'b' && status.playState === 'playing',
+    ).catch(async (error: unknown) => {
+      throw new Error(`b did not promote after seek: ${JSON.stringify(await streamer.getStatus(streamId))}`, {
+        cause: error,
+      })
+    })
+    await streamer.setNext(
+      streamId,
+      { id: 'c', kind: 'file', path: paths[2] },
+    )
+    const final = await waitForStatus(
+      () => streamer.getStatus(streamId),
+      (status) => status.current?.id === 'c' && status.playState === 'playing',
+    ).catch(async (error: unknown) => {
+      throw new Error(`c did not promote after b: ${JSON.stringify(await streamer.getStatus(streamId))}`, {
+        cause: error,
+      })
+    })
+    expect(final.current?.id).toBe('c')
+  } finally {
+    await stopStreamIfPresent(streamer, streamId)
+    await closeSocket(socket)
+    await fs.promises.rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('immediate seek to the end releases promoted HTTP preload quota for the following track', async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'music-immediate-seek-'))
+  const currentPath = path.join(directory, 'current.wav')
+  await fs.promises.writeFile(currentPath, makeSineWave(2.2))
+  const delayedNext = makeSineWave(0.8)
+  const server = http.createServer((_request, response) => {
+    setTimeout(() => {
+      response.writeHead(200, {
+        'content-length': delayedNext.length,
+        'content-type': 'audio/wav',
+      })
+      response.end(delayedNext)
+    }, 350)
+  })
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('HTTP test server did not bind')
+  const socket = await createBoundUdpSocket()
+  const streamer = new Streamer()
+  const streamId = `immediate-seek-${Date.now()}`
+
+  try {
+    await streamer.startStream({
+      streamId,
+      current: { id: 'a', kind: 'file', path: currentPath },
+      next: {
+        id: 'b',
+        kind: 'url',
+        url: `http://127.0.0.1:${address.port}/b.wav`,
+        formatHint: 'wav',
+      },
+      transport: rtpTransport(socket, 0x11223346),
+      source: { http: { maxRetries: 0 } },
+    })
+    await streamer.seekStream(streamId, 2)
+
+    await waitForStatus(
+      () => streamer.getStatus(streamId),
+      (status) => status.current?.id === 'b' && status.playState === 'playing',
+    ).catch(async (error: unknown) => {
+      throw new Error(`delayed b did not promote: ${JSON.stringify(await streamer.getStatus(streamId))}`, {
+        cause: error,
+      })
+    })
+    await streamer.setNext(
+      streamId,
+      {
+        id: 'c',
+        kind: 'url',
+        url: `http://127.0.0.1:${address.port}/c.wav`,
+        formatHint: 'wav',
+      },
+    )
+    const following = await waitForStatus(
+      () => streamer.getStatus(streamId),
+      (status) => status.current?.id === 'c' && status.playState === 'playing',
+    )
+    expect(following.current?.id).toBe('c')
+  } finally {
+    await stopStreamIfPresent(streamer, streamId)
+    await closeSocket(socket)
+    server.closeAllConnections()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+    await fs.promises.rm(directory, { recursive: true, force: true })
+  }
+})
+
 test('bounded URL startup does not block the JavaScript event loop', async () => {
   const server = await createHttpServerWorker(makeSineWave(0.5))
   const socket = await createBoundUdpSocket()
@@ -141,6 +266,81 @@ test('bounded URL startup does not block the JavaScript event loop', async () =>
     await stopStreamIfPresent(streamer, streamId)
     await server.close()
     await closeSocket(socket)
+  }
+})
+
+test('failed next preload after current end exits buffering and requests a replacement', async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'music-next-failure-'))
+  const currentPath = path.join(directory, 'current.wav')
+  const recoveredPath = path.join(directory, 'recovered.wav')
+  const followingPath = path.join(directory, 'following.wav')
+  await fs.promises.writeFile(currentPath, makeSineWave(0.04))
+  await fs.promises.writeFile(recoveredPath, makeSineWave(0.5))
+  await fs.promises.writeFile(followingPath, makeSineWave(0.5))
+  const server = http.createServer((_request, response) => {
+    setTimeout(() => {
+      response.writeHead(503)
+      response.end()
+    }, 150)
+  })
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('HTTP test server did not bind')
+  const socket = await createBoundUdpSocket()
+  const streamer = new Streamer()
+  const streamId = `next-failure-${Date.now()}`
+
+  try {
+    await streamer.startStream({
+      streamId,
+      current: { id: 'current', kind: 'file', path: currentPath },
+      next: {
+        id: 'failed-next',
+        kind: 'url',
+        url: `http://127.0.0.1:${address.port}/next.wav`,
+        formatHint: 'wav',
+      },
+      transport: rtpTransport(socket, 0x33445567),
+      source: { http: { maxRetries: 0 } },
+    })
+
+    const idle = await waitForStatus(
+      () => streamer.getStatus(streamId),
+      (status) => status.playState === 'idle' && !status.current && !status.next,
+    )
+    expect(idle.playState).toBe('idle')
+    const events = streamer.drainEvents(streamId)
+    const state = events.find(
+      (event) => event.type === 'stateChanged' && event.status?.playState === 'idle',
+    )
+    const request = events.find((event) => event.type === 'nextNeeded')
+    expect(state).toBeDefined()
+    expect(request).toBeDefined()
+    expect(state!.sequence).toBeLessThan(request!.sequence)
+
+    await streamer.switchTrack(
+      streamId,
+      { id: 'recovered', kind: 'file', path: recoveredPath },
+      { id: 'following', kind: 'file', path: followingPath },
+    )
+    await waitForStatus(
+      () => streamer.getStatus(streamId),
+      (status) => status.current?.id === 'recovered' && status.playState === 'playing',
+    )
+    const following = await waitForStatus(
+      () => streamer.getStatus(streamId),
+      (status) => status.current?.id === 'following' && status.playState === 'playing',
+    )
+    expect(following.current?.id).toBe('following')
+  } finally {
+    await stopStreamIfPresent(streamer, streamId)
+    await closeSocket(socket)
+    server.closeAllConnections()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+    await fs.promises.rm(directory, { recursive: true, force: true })
   }
 })
 

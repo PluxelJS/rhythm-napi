@@ -386,6 +386,9 @@ impl TryFrom<RtpTransportConfigInput> for RtpTransportConfig {
             mtu: value.mtu.unwrap_or(1_200) as usize,
             rtcp_mux: value.rtcp_mux.unwrap_or(true),
             opus_bitrate_bps: Some(value.bitrate.unwrap_or(DEFAULT_MUSIC_OPUS_BITRATE_BPS)),
+            rtp_keepalive_interval: value
+                .rtp_keepalive_interval_ms
+                .map(|milliseconds| Duration::from_millis(u64::from(milliseconds))),
             encryption: value
                 .encryption
                 .map(Into::into)
@@ -425,6 +428,9 @@ impl From<RtpTransportConfig> for RtpTransportConfigOutput {
             mtu: value.mtu as u32,
             rtcp_mux: value.rtcp_mux,
             opus_bitrate_bps: value.opus_bitrate_bps,
+            rtp_keepalive_interval_ms: value
+                .rtp_keepalive_interval
+                .map(|interval| interval.as_millis().try_into().unwrap_or(u32::MAX)),
             encryption_mode,
         }
     }
@@ -557,5 +563,31 @@ mod tests {
         })
         .expect_err("MIME types are not format hints");
         assert_eq!(error.code(), music_stream::ErrorCode::InvalidSource);
+    }
+
+    #[test]
+    fn rtp_keepalive_interval_round_trips_through_the_napi_contract() {
+        let transport = RtpTransportConfig::try_from(RtpTransportConfigInput {
+            ip: "127.0.0.1".to_owned(),
+            port: 5_000,
+            rtcp_port: None,
+            audio_ssrc: 42,
+            audio_pt: Some(96),
+            bitrate: Some(128_000),
+            rtcp_mux: Some(true),
+            rtp_keepalive_interval_ms: Some(5_000),
+            mtu: None,
+            local_ip: None,
+            local_port: None,
+            encryption: None,
+        })
+        .expect("transport conversion");
+        assert_eq!(
+            transport.rtp_keepalive_interval,
+            Some(Duration::from_secs(5))
+        );
+
+        let output = RtpTransportConfigOutput::from(transport);
+        assert_eq!(output.rtp_keepalive_interval_ms, Some(5_000));
     }
 }

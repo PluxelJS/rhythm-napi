@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
 
@@ -11,6 +11,8 @@ const MIN_RTP_MTU: usize = 64;
 const MAX_RTP_DATAGRAM_BYTES: usize = 65_507;
 const MIN_OPUS_BITRATE_BPS: u32 = 500;
 const MAX_OPUS_BITRATE_BPS: u32 = 512_000;
+const MIN_RTP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_RTP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 const NTP_UNIX_EPOCH_OFFSET_SECS: u64 = 2_208_988_800;
 pub const RTP_OPUS_CLOCK_RATE_HZ: u32 = 48_000;
 
@@ -62,6 +64,7 @@ pub struct RtpTransportConfig {
     pub mtu: usize,
     pub rtcp_mux: bool,
     pub opus_bitrate_bps: Option<u32>,
+    pub rtp_keepalive_interval: Option<Duration>,
     pub encryption: RtpEncryptionConfig,
 }
 
@@ -79,6 +82,7 @@ impl RtpTransportConfig {
             mtu: DEFAULT_MTU,
             rtcp_mux: true,
             opus_bitrate_bps: None,
+            rtp_keepalive_interval: None,
             encryption: RtpEncryptionConfig::None,
         }
     }
@@ -94,6 +98,9 @@ impl RtpTransportConfig {
             || self.mtu > MAX_RTP_DATAGRAM_BYTES
             || self.opus_bitrate_bps.is_some_and(|bitrate| {
                 !(MIN_OPUS_BITRATE_BPS..=MAX_OPUS_BITRATE_BPS).contains(&bitrate)
+            })
+            || self.rtp_keepalive_interval.is_some_and(|interval| {
+                !(MIN_RTP_KEEPALIVE_INTERVAL..=MAX_RTP_KEEPALIVE_INTERVAL).contains(&interval)
             })
         {
             return Err(MusicStreamError::InvalidConfig(
@@ -350,6 +357,28 @@ mod tests {
         config.mtu = MAX_RTP_DATAGRAM_BYTES + 1;
         assert_eq!(
             config.validate().expect_err("oversized MTU").code(),
+            crate::ErrorCode::InvalidConfig
+        );
+    }
+
+    #[test]
+    fn transport_rejects_an_out_of_range_rtp_keepalive_interval() {
+        let mut config = RtpTransportConfig::new("127.0.0.1", 5_000, 1);
+        config.rtp_keepalive_interval = Some(Duration::ZERO);
+        assert_eq!(
+            config
+                .validate()
+                .expect_err("zero keepalive interval")
+                .code(),
+            crate::ErrorCode::InvalidConfig
+        );
+
+        config.rtp_keepalive_interval = Some(Duration::from_secs(61));
+        assert_eq!(
+            config
+                .validate()
+                .expect_err("excessive keepalive interval")
+                .code(),
             crate::ErrorCode::InvalidConfig
         );
     }

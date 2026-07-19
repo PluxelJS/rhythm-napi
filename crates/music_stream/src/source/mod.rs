@@ -915,7 +915,79 @@ async fn acquire_download_slot(
 #[derive(Debug)]
 struct DownloadSlotPermit {
     _global: OwnedSemaphorePermit,
-    _preload: Option<OwnedSemaphorePermit>,
+    _preload: Option<PromotablePreloadPermit>,
+}
+
+/// A preload-only admission permit must stop counting against preload capacity
+/// as soon as its shared transfer is promoted to current playback. Keeping the
+/// permit for the lifetime of the downloaded artifact creates a circular wait:
+/// the following preload waits for quota held by the current artifact, while
+/// that artifact is retained until the following preload can be promoted.
+#[derive(Debug)]
+struct PromotablePreloadPermit {
+    permit: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+    cancellation: CancellationToken,
+}
+
+impl PromotablePreloadPermit {
+    fn new(permit: OwnedSemaphorePermit, mut priority: watch::Receiver<bool>) -> Option<Self> {
+        if *priority.borrow_and_update() {
+            return None;
+        }
+        let permit = Arc::new(Mutex::new(Some(permit)));
+        let cancellation = CancellationToken::new();
+        let watcher_permit = Arc::clone(&permit);
+        let watcher_cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            loop {
+                if *priority.borrow_and_update() {
+                    watcher_permit
+                        .lock()
+                        .expect("preload permit lock poisoned")
+                        .take();
+                    return;
+                }
+                tokio::select! {
+                    _ = watcher_cancellation.cancelled() => return,
+                    changed = priority.changed() => {
+                        if changed.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        Some(Self {
+            permit,
+            cancellation,
+        })
+    }
+
+    fn split(&self, permits: usize) -> Option<OwnedSemaphorePermit> {
+        self.permit
+            .lock()
+            .expect("preload permit lock poisoned")
+            .as_mut()
+            .and_then(|permit| permit.split(permits))
+    }
+
+    fn num_permits(&self) -> usize {
+        self.permit
+            .lock()
+            .expect("preload permit lock poisoned")
+            .as_ref()
+            .map_or(0, OwnedSemaphorePermit::num_permits)
+    }
+}
+
+impl Drop for PromotablePreloadPermit {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.permit
+            .lock()
+            .expect("preload permit lock poisoned")
+            .take();
+    }
 }
 
 async fn acquire_download_slot_with_priority(
@@ -969,7 +1041,7 @@ async fn acquire_preload_permit(
     gate: &PauseGate,
     cancellation: &CancellationToken,
     priority: &mut watch::Receiver<bool>,
-) -> Result<Option<OwnedSemaphorePermit>> {
+) -> Result<Option<PromotablePreloadPermit>> {
     loop {
         if *priority.borrow_and_update() {
             return Ok(None);
@@ -988,9 +1060,10 @@ async fn acquire_preload_permit(
                 ))?;
             }
             result = &mut permit => {
-                return result.map(Some).map_err(|_| MusicStreamError::StreamClosed(
+                let permit = result.map_err(|_| MusicStreamError::StreamClosed(
                     "preload source admission was closed".to_owned(),
-                ));
+                ))?;
+                return Ok(PromotablePreloadPermit::new(permit, priority.clone()));
             }
         }
     }
@@ -1077,7 +1150,7 @@ struct TempfileAdmission {
 #[derive(Debug)]
 struct TempfileQuota {
     global: OwnedSemaphorePermit,
-    preload: Option<OwnedSemaphorePermit>,
+    preload: Option<PromotablePreloadPermit>,
 }
 
 enum ArtifactFileWriter {
@@ -2014,6 +2087,40 @@ mod tests {
 
         cancel_waiter.cancel();
         assert!(blocked_preload.await.expect("preload task").is_err());
+    }
+
+    #[tokio::test]
+    async fn promoted_download_releases_preload_admission_before_artifact_drop() {
+        let global = Arc::new(Semaphore::new(2));
+        let preloads = Arc::new(Semaphore::new(1));
+        let gate = PauseGate::default();
+        let cancellation = CancellationToken::new();
+        let (priority_tx, mut priority) = watch::channel(false);
+        let admission = acquire_download_slot_with_priority(
+            Arc::clone(&global),
+            Arc::clone(&preloads),
+            &gate,
+            &cancellation,
+            &mut priority,
+        )
+        .await
+        .expect("preload admission");
+        assert_eq!(global.available_permits(), 1);
+        assert_eq!(preloads.available_permits(), 0);
+
+        priority_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_millis(100), async {
+            while preloads.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("promotion did not release preload admission");
+
+        assert_eq!(preloads.available_permits(), 1);
+        assert_eq!(global.available_permits(), 1);
+        drop(admission);
+        assert_eq!(global.available_permits(), 2);
     }
 
     #[tokio::test]

@@ -157,6 +157,7 @@ pub struct RtpTransportConfigInput {
     pub audio_pt: Option<u32>,
     pub bitrate: Option<u32>,
     pub rtcp_mux: Option<bool>,
+    pub rtp_keepalive_interval_ms: Option<u32>,
     pub mtu: Option<u32>,
     pub local_ip: Option<String>,
     pub local_port: Option<u32>,
@@ -187,6 +188,7 @@ impl std::fmt::Debug for RtpTransportConfigInput {
             .field("audio_pt", &self.audio_pt)
             .field("bitrate", &self.bitrate)
             .field("rtcp_mux", &self.rtcp_mux)
+            .field("rtp_keepalive_interval_ms", &self.rtp_keepalive_interval_ms)
             .field("mtu", &self.mtu)
             .field("local_ip", &self.local_ip)
             .field("local_port", &self.local_port)
@@ -285,5 +287,6 @@ pub struct RtpTransportConfigOutput {
     pub mtu: u32,
     pub rtcp_mux: bool,
     pub opus_bitrate_bps: Option<u32>,
+    pub rtp_keepalive_interval_ms: Option<u32>,
     pub encryption_mode: String,
 }

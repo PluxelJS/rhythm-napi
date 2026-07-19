@@ -32,6 +32,12 @@ test('source and transport policies reject invalid limits synchronously', () => 
     port: 0,
     audioSsrc: 1,
   })).toThrow(/port/)
+  expect(() => streamer.validateRtpTransportConfig({
+    ip: '127.0.0.1',
+    port: 5_000,
+    audioSsrc: 1,
+    rtpKeepaliveIntervalMs: 0,
+  })).toThrow(/transport|invalid/i)
 })
 
 test('HTTP authorization failure is reported asynchronously', async () => {

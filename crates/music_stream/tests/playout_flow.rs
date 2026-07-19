@@ -231,6 +231,70 @@ async fn preloaded_next_promotes_without_resetting_rtp_clock() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preloaded_progressive_url_promotes_and_reaches_playing() {
+    let first_wav = tempfile::Builder::new()
+        .suffix(".wav")
+        .tempfile()
+        .expect("first");
+    let second_wav = tempfile::Builder::new()
+        .suffix(".wav")
+        .tempfile()
+        .expect("second");
+    write_wav(first_wav.path(), 0.14);
+    write_wav(second_wav.path(), 0.5);
+    let body = std::fs::read(second_wav.path()).expect("next body");
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("HTTP bind");
+    let address = listener.local_addr().expect("HTTP address");
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut request = [0_u8; 2_048];
+        let _ = stream.read(&mut request).await;
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: audio/wav\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(header.as_bytes()).await.expect("header");
+        stream.write_all(&body).await.expect("body");
+    });
+
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("RTP bind");
+    let runtime = runtime_for(
+        "url-promotion",
+        file_track("a", first_wav.path()),
+        Some(TrackSource {
+            id: "b".to_owned(),
+            kind: TrackKind::Url,
+            url: Some(format!("http://{address}/next.wav")),
+            path: None,
+            format_hint: Some("wav".to_owned()),
+            seekable: Some(true),
+            headers: Default::default(),
+        }),
+        &receiver,
+        11,
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let status = runtime.snapshot().await.status;
+        if status.current.as_ref().is_some_and(|track| track.id == "b")
+            && status.play_state == music_stream::PlayState::Playing
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "stuck status: {status:?}"
+        );
+        let _ = try_recv_rtp(&receiver, Duration::from_millis(20)).await;
+    }
+
+    runtime.shutdown().await.expect("shutdown");
+    server.await.expect("server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stalled_live_decode_never_blocks_rtp_deadlines() {
     let wav = tempfile::Builder::new()
         .suffix(".wav")

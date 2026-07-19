@@ -122,9 +122,25 @@ struct ActorEffects {
 
 impl ActorEffects {
     fn into_output(self, status: StreamStatus) -> ActorOutput {
+        let mut facts = Vec::with_capacity(self.events.len() + 1);
+        let mut requests = Vec::new();
+        for event in self.events {
+            if matches!(
+                event,
+                StreamEvent::NextNeeded { .. } | StreamEvent::SourceRefreshNeeded { .. }
+            ) {
+                requests.push(event);
+            } else {
+                facts.push(event);
+            }
+        }
+        facts.push(StreamEvent::StateChanged {
+            status: status.clone(),
+        });
+        facts.extend(requests);
         ActorOutput {
             actions: self.actions,
-            events: self.events,
+            events: facts,
             status,
         }
     }
@@ -228,11 +244,7 @@ impl StreamActor {
             StreamCommand::SetGain { gain } => self.set_gain(gain, &mut output),
         }
 
-        let status = self.status();
-        output.events.push(StreamEvent::StateChanged {
-            status: status.clone(),
-        });
-        Ok(output.into_output(status))
+        Ok(output.into_output(self.status()))
     }
 
     pub fn handle_worker_event(&mut self, event: WorkerEvent) -> ActorOutput {
@@ -251,7 +263,7 @@ impl StreamActor {
             }
             WorkerEvent::CurrentEnded { generation } => {
                 if self.is_current_generation(generation) {
-                    self.promote_next_or_wait(&mut output);
+                    self.promote_next_or_wait(&mut output, true);
                 }
             }
             WorkerEvent::CurrentFailed {
@@ -298,6 +310,7 @@ impl StreamActor {
                     .is_some_and(|slot| slot.generation == generation && slot.task_active)
                 {
                     if code == ErrorCode::SourceAuthExpired
+                        && self.current.is_some()
                         && let Some(next) = self.next.as_ref()
                     {
                         output.events.push(StreamEvent::SourceRefreshNeeded {
@@ -307,6 +320,14 @@ impl StreamActor {
                         });
                     }
                     self.next = None;
+                    if self.current.is_none() {
+                        if self.play_state != PlayState::Paused {
+                            self.play_state = PlayState::Idle;
+                        }
+                        output.events.push(StreamEvent::NextNeeded {
+                            stream_id: self.stream_id.clone(),
+                        });
+                    }
                     output.events.push(StreamEvent::Error {
                         stream_id: self.stream_id.clone(),
                         code,
@@ -316,11 +337,7 @@ impl StreamActor {
             }
         }
 
-        let status = self.status();
-        output.events.push(StreamEvent::StateChanged {
-            status: status.clone(),
-        });
-        output.into_output(status)
+        output.into_output(self.status())
     }
 
     /// Moves the state machine to its only safe state after orchestration has
@@ -666,7 +683,7 @@ impl StreamActor {
         }
     }
 
-    fn promote_next_or_wait(&mut self, output: &mut ActorEffects) {
+    fn promote_next_or_wait(&mut self, output: &mut ActorEffects, request_next_when_empty: bool) {
         let preserve_pause = self.play_state == PlayState::Paused;
         if self.promote_ready_next(output) {
             return;
@@ -682,9 +699,11 @@ impl StreamActor {
             };
         } else {
             self.play_state = PlayState::Idle;
-            output.events.push(StreamEvent::NextNeeded {
-                stream_id: self.stream_id.clone(),
-            });
+            if request_next_when_empty {
+                output.events.push(StreamEvent::NextNeeded {
+                    stream_id: self.stream_id.clone(),
+                });
+            }
         }
     }
 
@@ -727,9 +746,8 @@ impl StreamActor {
                 generation: current.generation,
             });
         }
-        if code == ErrorCode::SourceAuthExpired
-            && let Some(current) = self.current.as_ref()
-        {
+        let refresh_current = code == ErrorCode::SourceAuthExpired && self.next.is_none();
+        if refresh_current && let Some(current) = self.current.as_ref() {
             output.events.push(StreamEvent::SourceRefreshNeeded {
                 stream_id: self.stream_id.clone(),
                 track_id: current.source.id.clone(),
@@ -742,7 +760,7 @@ impl StreamActor {
             message,
         });
 
-        self.promote_next_or_wait(output);
+        self.promote_next_or_wait(output, !refresh_current);
     }
 
     fn is_current_generation(&self, generation: u64) -> bool {
@@ -1002,6 +1020,64 @@ mod tests {
             generation: next_generation,
             track: track("b")
         }));
+    }
+
+    #[test]
+    fn next_failure_after_current_end_exits_buffering_and_requests_replacement() {
+        let mut actor = StreamActor::new("s1".to_owned(), Some(track("a")), Some(track("b")));
+        actor.handle_command(StreamCommand::Play).expect("play");
+        let current_generation = actor.current_generation();
+        let next_generation = actor.next.as_ref().expect("next").generation;
+        actor.handle_worker_event(WorkerEvent::CurrentEnded {
+            generation: current_generation,
+        });
+
+        let output = actor.handle_worker_event(WorkerEvent::NextFailed {
+            generation: next_generation,
+            code: ErrorCode::SourceTimeout,
+            message: "preload timed out".to_owned(),
+        });
+
+        assert_eq!(output.status.play_state, PlayState::Idle);
+        assert!(output.status.current.is_none());
+        assert!(output.status.next.is_none());
+        assert!(output.events.iter().any(
+            |event| matches!(event, StreamEvent::NextNeeded { stream_id } if stream_id == "s1")
+        ));
+        let state_index = output
+            .events
+            .iter()
+            .position(|event| matches!(event, StreamEvent::StateChanged { .. }))
+            .expect("state event");
+        let request_index = output
+            .events
+            .iter()
+            .position(|event| matches!(event, StreamEvent::NextNeeded { .. }))
+            .expect("next request");
+        assert!(state_index < request_index);
+    }
+
+    #[test]
+    fn paused_next_failure_preserves_pause_while_requesting_replacement() {
+        let mut actor = StreamActor::new("s1".to_owned(), Some(track("a")), Some(track("b")));
+        actor.handle_command(StreamCommand::Play).expect("play");
+        let current_generation = actor.current_generation();
+        let next_generation = actor.next.as_ref().expect("next").generation;
+        actor.handle_worker_event(WorkerEvent::CurrentEnded {
+            generation: current_generation,
+        });
+        actor.handle_command(StreamCommand::Pause).expect("pause");
+
+        let output = actor.handle_worker_event(WorkerEvent::NextFailed {
+            generation: next_generation,
+            code: ErrorCode::SourceTimeout,
+            message: "preload timed out".to_owned(),
+        });
+
+        assert_eq!(output.status.play_state, PlayState::Paused);
+        assert!(output.events.iter().any(
+            |event| matches!(event, StreamEvent::NextNeeded { stream_id } if stream_id == "s1")
+        ));
     }
 
     #[test]
@@ -1293,6 +1369,23 @@ mod tests {
                     if *code == ErrorCode::SourceAuthExpired && message == "expired"
             )
         }));
+        assert!(
+            !output
+                .events
+                .iter()
+                .any(|event| matches!(event, StreamEvent::NextNeeded { .. }))
+        );
+        let state_index = output
+            .events
+            .iter()
+            .position(|event| matches!(event, StreamEvent::StateChanged { .. }))
+            .expect("state event");
+        let refresh_index = output
+            .events
+            .iter()
+            .position(|event| matches!(event, StreamEvent::SourceRefreshNeeded { .. }))
+            .expect("refresh request");
+        assert!(state_index < refresh_index);
     }
 
     #[test]
