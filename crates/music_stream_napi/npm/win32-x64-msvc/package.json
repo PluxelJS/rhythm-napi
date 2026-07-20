@@ -1,34 +1,34 @@
 {
-  "name": "@rhythm-app/streamer-win32-x64-msvc",
-  "version": "0.1.0",
-  "cpu": [
-    "x64"
-  ],
-  "main": "rhythm_streamer.win32-x64-msvc.node",
-  "files": [
-    "rhythm_streamer.win32-x64-msvc.node"
-  ],
-  "description": "Low-latency audio decode, Opus encode, and RTP/RTCP streaming runtime for Node.js",
-  "keywords": [
-    "napi-rs",
-    "audio",
-    "opus",
-    "rtp",
-    "streaming"
-  ],
-  "license": "AGPL-3.0-or-later",
-  "engines": {
-    "node": ">=20"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Kokoro-js/rhythm-napi.git"
-  },
-  "publishConfig": {
-    "registry": "https://registry.npmjs.org/",
-    "access": "public"
-  },
-  "os": [
-    "win32"
-  ]
+	"name": "@rhythm-app/streamer-win32-x64-msvc",
+	"version": "0.1.0",
+	"description": "Low-latency audio decode, Opus encode, and RTP/RTCP streaming runtime for Node.js",
+	"keywords": [
+		"audio",
+		"napi-rs",
+		"opus",
+		"rtp",
+		"streaming"
+	],
+	"license": "AGPL-3.0-or-later",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/PluxelJS/rhythm-napi.git"
+	},
+	"files": [
+		"rhythm_streamer.win32-x64-msvc.node"
+	],
+	"os": [
+		"win32"
+	],
+	"cpu": [
+		"x64"
+	],
+	"main": "rhythm_streamer.win32-x64-msvc.node",
+	"publishConfig": {
+		"access": "public",
+		"registry": "https://registry.npmjs.org/"
+	},
+	"engines": {
+		"node": ">=20"
+	}
 }
