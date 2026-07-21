@@ -182,6 +182,17 @@ impl VolumeConfig {
             return;
         }
 
+        // Decoded PCM is normally already in libopus' [-1, 1] float range. Preserve the previous
+        // clamping behavior for malformed or over-range sources, but avoid dirtying every cache
+        // line for the overwhelmingly common 100%-volume, 0 dB path.
+        if gain == 1.0
+            && samples
+                .iter()
+                .all(|sample| sample.is_finite() && (-1.0..=1.0).contains(sample))
+        {
+            return;
+        }
+
         if self.soft_limit && gain > 1.0 {
             apply_gain_with_soft_limit_in_place(samples, gain);
         } else {
@@ -360,6 +371,19 @@ mod tests {
         let mut samples = vec![0.5, -0.75];
         apply_gain_in_place(&mut samples, 2.0);
         assert_eq!(samples, vec![1.0, -1.0]);
+    }
+
+    #[test]
+    fn unity_gain_preserves_normalized_pcm_and_still_clamps_over_range_input() {
+        let config = VolumeConfig::default();
+        let mut normalized = vec![-1.0, -0.25, 0.0, 0.5, 1.0];
+        let expected = normalized.clone();
+        config.apply_in_place(&mut normalized);
+        assert_eq!(normalized, expected);
+
+        let mut over_range = vec![1.25, -1.5];
+        config.apply_in_place(&mut over_range);
+        assert_eq!(over_range, vec![1.0, -1.0]);
     }
 
     #[test]
