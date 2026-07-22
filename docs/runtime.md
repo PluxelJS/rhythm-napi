@@ -147,7 +147,7 @@ tempfile worst-case quota
 | bounded HTTP | `maxConcurrentHttpDownloads` | 至少留一个 current 槽 |
 | live connection | `maxConcurrentLiveStreams` | 至少留一个 current 槽 |
 | tempfile | `maxTempfileBytes` | preload 最多使用四分之一预算 |
-| live bytes | `maxLiveBufferedBytes` | 所有 live bridge 按实际字节共享 |
+| live bytes | `maxLiveBufferedBytes` | 所有 live bridge 与 HLS playlist/segment allocation 共享 |
 
 每个 source 的 `maxBytes` 不得超过 `Streamer` tempfile 预算的四分之一，单个 live bridge 也必须
 小于共享 live byte 预算。这些关系在启动前校验，避免运行中等待永远无法满足的 semaphore。

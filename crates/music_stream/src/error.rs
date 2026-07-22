@@ -64,6 +64,12 @@ pub enum MusicStreamError {
     #[error("detected live HTTP source: {0}")]
     DetectedLiveSource(String),
 
+    /// Internal routing signal emitted before any response body is consumed.
+    /// Producers must convert it into the HLS path rather than expose it.
+    #[doc(hidden)]
+    #[error("detected HLS source: {0}")]
+    DetectedHlsSource(String),
+
     #[error("source timed out: {0}")]
     SourceTimeout(String),
 
@@ -106,7 +112,7 @@ impl MusicStreamError {
             Self::StreamAlreadyExists(_) => ErrorCode::StreamAlreadyExists,
             Self::InvalidConfig(_) => ErrorCode::InvalidConfig,
             Self::InvalidSource(_) => ErrorCode::InvalidSource,
-            Self::DetectedLiveSource(_) => ErrorCode::Unsupported,
+            Self::DetectedLiveSource(_) | Self::DetectedHlsSource(_) => ErrorCode::Unsupported,
             Self::SourceTimeout(_) => ErrorCode::SourceTimeout,
             Self::SourceAuthExpired(_) => ErrorCode::SourceAuthExpired,
             Self::Unsupported(_) => ErrorCode::Unsupported,

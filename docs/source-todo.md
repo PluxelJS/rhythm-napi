@@ -6,19 +6,20 @@ Opus queue、sender 和资源预算，不为每种协议复制播放状态机。
 ## P0：能力准确性
 
 - [ ] 若真实语料需要，扩展 Ogg Opus multistream/channel mapping；当前输入支持常见 mono/stereo。
-- [ ] 对 m3u8 返回明确的 HLS 未支持错误，避免落成泛化的容器 decode 错误。
 - [ ] 继续扩大小型格式语料测试；当前已有 ADTS AAC、Ogg Opus、WAV，仍需覆盖 MP3、FLAC、
   Ogg Vorbis、M4A/MP4 及损坏输入。
 - [ ] 评估仍返回非标准 `ICY 200 OK` 状态行的老式 Shoutcast 服务；当前标准 HTTP Icecast/ICY
   响应已支持。
 
-## P1：HLS
+## P1：HLS 后续
 
-- [ ] 增加独立 HLS source，不把 m3u8 清单当媒体字节交给 Symphonia。
-- [ ] 第一阶段只做音频常用能力：master/media playlist、相对 URL、VOD/live reload、segment 预取、
-  超时、取消、鉴权 header 和有界重试。
-- [ ] 明确支持的 segment 容器后再实现对应 demux；MPEG-TS 和 fMP4 必须分别验证，不能直接拼接文件。
-- [ ] 后续按真实 provider 需求增加 AES-128、byte range、`EXT-X-MAP` 和 discontinuity。
+基础音频 HLS 已实现 master/media playlist、相对 URL、VOD/live reload、有界获取，以及 packed 或
+MPEG-TS 内的 ADTS AAC/MP3；以下能力继续按真实 provider 需求增加：
+
+- [ ] fMP4/CMAF 与 `EXT-X-MAP`；不能把 fragment 直接拼接成普通文件。
+- [ ] AES-128 等加密、byte range、midstream discontinuity 和 codec generation 切换。
+- [ ] LL-HLS partial segment、blocking reload 和 preload hint。
+- [ ] 若语料需要，基于 PAT/PMT 扩展多 program/多 audio PID 选择，并评估 LATM AAC、AC-3/E-AC-3。
 
 ## P2：MP4/M4A 渐进
 

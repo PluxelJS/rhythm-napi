@@ -110,6 +110,22 @@ source transfer 返回内部路由信号，current producer 释放 tempfile/HTTP
 live 只允许在首个媒体字节交付前重试。partial body 失败必须终止 decoder，禁止把新响应拼接到
 旧容器。reader 只有在实际 `blocking_recv` 前调用 wait observer，拿到字节后重新申请 CPU lease。
 
+### HLS
+
+`.m3u8` path 或显式 `formatHint: m3u8` 在进入 actor 前规范化为 live/current-only 语义。HLS source
+使用共享 HTTP client 解析 master/media playlist、相对 URL、默认音频 rendition 和最低带宽候选；
+VOD 遇到 `ENDLIST` 正常结束，live 从靠近末尾的三个 segment 开始并按 target duration 重载。
+opaque bounded URL 若在正文前返回标准 playlist Content-Type，或最终 redirect URL 以 `.m3u8`
+结尾，也会释放 artifact admission 并重路由到 HLS。
+
+playlist 限 1 MiB、单 segment 限 16 MiB，open/idle timeout、取消、受限 header 和重试沿用 live
+配置。响应在读取 body 前一次性申请共享 live-byte permit；已知长度按 `Content-Length`，未知长度按
+受限上限预留，避免并发下载各占部分 permit 后互相等待。MPEG-TS 在原 allocation 内移除 TS/PES
+header，再把 permit 连同 ADTS AAC 或 MPEG audio 字节移交给 live bridge，不复制整段媒体。
+
+当前不支持 encrypted segment、byte range、`EXT-X-MAP`/fMP4、midstream discontinuity、codec
+切换和 LL-HLS partial segment；这些输入返回明确的 `UNSUPPORTED`，不会退化成模糊 decoder 错误。
+
 ## 音频管线
 
 ### Decode

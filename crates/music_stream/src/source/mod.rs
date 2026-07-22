@@ -17,12 +17,16 @@ use crate::control::PauseGate;
 use crate::error::{MusicStreamError, Result};
 use crate::model::{TrackKind, TrackSource};
 
+mod hls;
 mod live;
 mod spool;
+pub(crate) use hls::spawn_http_hls_stream;
 pub use live::HttpLiveStreamConfig;
 #[cfg(test)]
 pub(crate) use live::StreamingByteReader;
-pub(crate) use live::{BlockingReadObserver, spawn_http_live_stream};
+pub(crate) use live::{
+    BlockingReadObserver, HttpLiveStream, LiveByteBudget, spawn_http_live_stream,
+};
 pub(crate) use spool::GrowingSpoolReader;
 use spool::{GrowingSpool, GrowingSpoolWriter, growing_spool};
 
@@ -1371,6 +1375,13 @@ async fn download_http_artifact_once(
             ),
         ));
     }
+    if is_hls_playlist_response(response.headers(), response.url()) {
+        return Err(HttpAttemptError::terminal(
+            MusicStreamError::DetectedHlsSource(
+                "response is an HLS playlist by content type or final URL".to_owned(),
+            ),
+        ));
+    }
     let declared_length = response.content_length();
     if declared_length.is_some_and(|length| length > config.max_bytes) {
         return Err(HttpAttemptError::terminal(MusicStreamError::InvalidSource(
@@ -1605,6 +1616,33 @@ fn is_strong_live_http_response(headers: &reqwest::header::HeaderMap) -> bool {
             })
 }
 
+fn is_hls_playlist_response(
+    headers: &reqwest::header::HeaderMap,
+    final_url: &reqwest::Url,
+) -> bool {
+    let path_is_m3u8 = final_url
+        .path_segments()
+        .and_then(Iterator::last)
+        .and_then(|name| name.rsplit_once('.'))
+        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("m3u8"));
+    let hls_content_type = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .is_some_and(|mime| {
+            matches!(
+                mime.to_ascii_lowercase().as_str(),
+                "application/vnd.apple.mpegurl"
+                    | "application/x-mpegurl"
+                    | "application/mpegurl"
+                    | "audio/mpegurl"
+                    | "audio/x-mpegurl"
+            )
+        });
+    path_is_m3u8 || hls_content_type
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Read as _;
@@ -1648,6 +1686,34 @@ mod tests {
             "no-cache".parse().expect("cache control"),
         );
         assert!(!is_strong_live_http_response(&ambiguous));
+    }
+
+    #[test]
+    fn hls_detection_requires_a_playlist_mime_or_final_extension() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            "application/vnd.apple.mpegurl; charset=utf-8"
+                .parse()
+                .expect("content type"),
+        );
+        assert!(is_hls_playlist_response(
+            &headers,
+            &reqwest::Url::parse("https://media.test/signed").expect("URL")
+        ));
+        assert!(is_hls_playlist_response(
+            &reqwest::header::HeaderMap::new(),
+            &reqwest::Url::parse("https://cdn.test/audio/INDEX.M3U8?token=1").expect("URL")
+        ));
+
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            "audio/mpeg".parse().expect("content type"),
+        );
+        assert!(!is_hls_playlist_response(
+            &headers,
+            &reqwest::Url::parse("https://media.test/signed").expect("URL")
+        ));
     }
 
     #[test]

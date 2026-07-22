@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 bytes.workspace = true
 lru.workspace = true
+m3u8-rs.workspace = true
 metrics.workspace = true
 opus.workspace = true
 rand.workspace = true

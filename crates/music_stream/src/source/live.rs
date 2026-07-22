@@ -27,6 +27,42 @@ pub struct HttpLiveStreamConfig {
     pub retry_backoff: Duration,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct LiveByteBudget {
+    semaphore: Arc<Semaphore>,
+    capacity: usize,
+}
+
+impl LiveByteBudget {
+    pub(crate) fn new(capacity: usize) -> Result<Self> {
+        if capacity == 0 || capacity > u32::MAX as usize || capacity > Semaphore::MAX_PERMITS {
+            return Err(MusicStreamError::InvalidConfig(
+                "global live byte budget must fit in a positive u32".to_owned(),
+            ));
+        }
+        Ok(Self {
+            semaphore: Arc::new(Semaphore::new(capacity)),
+            capacity,
+        })
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub(super) async fn acquire(&self, bytes: usize) -> Result<OwnedSemaphorePermit> {
+        let permits = u32::try_from(bytes).map_err(|_| {
+            MusicStreamError::InvalidSource("live HTTP chunk is too large".to_owned())
+        })?;
+        Arc::clone(&self.semaphore)
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| {
+                MusicStreamError::StreamClosed("global live byte budget closed".to_owned())
+            })
+    }
+}
+
 impl Default for HttpLiveStreamConfig {
     fn default() -> Self {
         Self {
@@ -71,7 +107,7 @@ pub struct HttpLiveStreamReport {
 struct ByteChunk {
     bytes: Bytes,
     _stream_budget: OwnedSemaphorePermit,
-    _global_budget: OwnedSemaphorePermit,
+    _global_budget: Arc<OwnedSemaphorePermit>,
 }
 
 pub(crate) trait BlockingReadObserver: std::fmt::Debug + Send + Sync {
@@ -97,22 +133,19 @@ pub struct StreamingByteReader {
 pub struct StreamingByteWriter {
     sender: mpsc::Sender<ByteMessage>,
     stream_budget: Arc<Semaphore>,
-    global_budget: Arc<Semaphore>,
+    global_budget: LiveByteBudget,
     max_chunk_bytes: usize,
 }
 
 impl StreamingByteReader {
     #[cfg(test)]
     pub fn new(max_buffered_bytes: usize) -> Result<(StreamingByteWriter, Self)> {
-        Self::with_global_budget(
-            max_buffered_bytes,
-            Arc::new(Semaphore::new(max_buffered_bytes)),
-        )
+        Self::with_global_budget(max_buffered_bytes, LiveByteBudget::new(max_buffered_bytes)?)
     }
 
     pub(crate) fn with_global_budget(
         max_buffered_bytes: usize,
-        global_budget: Arc<Semaphore>,
+        global_budget: LiveByteBudget,
     ) -> Result<(StreamingByteWriter, Self)> {
         if max_buffered_bytes == 0 || max_buffered_bytes > u32::MAX as usize {
             return Err(MusicStreamError::InvalidConfig(
@@ -144,6 +177,10 @@ impl StreamingByteReader {
 }
 
 impl StreamingByteWriter {
+    pub(super) fn global_byte_budget(&self) -> LiveByteBudget {
+        self.global_budget.clone()
+    }
+
     pub async fn push(&self, bytes: Bytes) -> Result<()> {
         let mut offset = 0;
         while offset < bytes.len() {
@@ -155,6 +192,26 @@ impl StreamingByteWriter {
     }
 
     async fn push_one(&self, bytes: Bytes) -> Result<()> {
+        let global_wait_started = std::time::Instant::now();
+        let global_permit = self.global_budget.acquire(bytes.len()).await?;
+        metrics::histogram!("music_stream.source.live_global_budget_wait_us")
+            .record(global_wait_started.elapsed().as_micros() as f64);
+        self.push_one_with_global_permit(bytes, Arc::new(global_permit))
+            .await
+    }
+
+    async fn push_one_with_global_permit(
+        &self,
+        bytes: Bytes,
+        global_permit: Arc<OwnedSemaphorePermit>,
+    ) -> Result<()> {
+        if global_permit.num_permits() < bytes.len()
+            || !Arc::ptr_eq(global_permit.semaphore(), &self.global_budget.semaphore)
+        {
+            return Err(MusicStreamError::Internal(
+                "live byte permit does not match its payload".to_owned(),
+            ));
+        }
         let permits = u32::try_from(bytes.len()).map_err(|_| {
             MusicStreamError::InvalidSource("live HTTP chunk is too large".to_owned())
         })?;
@@ -162,15 +219,6 @@ impl StreamingByteWriter {
             .acquire_many_owned(permits)
             .await
             .map_err(|_| MusicStreamError::StreamClosed("live byte bridge closed".to_owned()))?;
-        let global_wait_started = std::time::Instant::now();
-        let global_permit = Arc::clone(&self.global_budget)
-            .acquire_many_owned(permits)
-            .await
-            .map_err(|_| {
-                MusicStreamError::StreamClosed("global live byte budget closed".to_owned())
-            })?;
-        metrics::histogram!("music_stream.source.live_global_budget_wait_us")
-            .record(global_wait_started.elapsed().as_micros() as f64);
         self.sender
             .send(ByteMessage::Data(ByteChunk {
                 bytes,
@@ -179,6 +227,29 @@ impl StreamingByteWriter {
             }))
             .await
             .map_err(|_| MusicStreamError::StreamClosed("live byte bridge closed".to_owned()))
+    }
+
+    pub(super) async fn push_with_global_permit(
+        &self,
+        bytes: Bytes,
+        global_permit: OwnedSemaphorePermit,
+    ) -> Result<()> {
+        if global_permit.num_permits() < bytes.len()
+            || !Arc::ptr_eq(global_permit.semaphore(), &self.global_budget.semaphore)
+        {
+            return Err(MusicStreamError::Internal(
+                "live byte permit does not match its payload".to_owned(),
+            ));
+        }
+        let global_permit = Arc::new(global_permit);
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let end = offset.saturating_add(self.max_chunk_bytes).min(bytes.len());
+            self.push_one_with_global_permit(bytes.slice(offset..end), Arc::clone(&global_permit))
+                .await?;
+            offset = end;
+        }
+        Ok(())
     }
 
     pub async fn fail(&self, message: impl Into<String>, cancellation: &CancellationToken) {
@@ -234,7 +305,7 @@ pub struct HttpLiveStream {
 pub fn spawn_http_live_stream(
     source: &TrackSource,
     config: HttpLiveStreamConfig,
-    global_byte_budget: Arc<Semaphore>,
+    global_byte_budget: LiveByteBudget,
 ) -> Result<HttpLiveStream> {
     config.validate()?;
     if !source.is_live() {
@@ -474,11 +545,11 @@ mod tests {
 
     #[tokio::test]
     async fn live_bridges_share_the_runtime_wide_byte_budget() {
-        let global = Arc::new(Semaphore::new(4));
+        let global = LiveByteBudget::new(4).expect("global budget");
         let (first_writer, mut first_reader) =
-            StreamingByteReader::with_global_budget(4, Arc::clone(&global)).expect("first bridge");
+            StreamingByteReader::with_global_budget(4, global.clone()).expect("first bridge");
         let (second_writer, _second_reader) =
-            StreamingByteReader::with_global_budget(4, Arc::clone(&global)).expect("second bridge");
+            StreamingByteReader::with_global_budget(4, global).expect("second bridge");
         first_writer
             .push(Bytes::from_static(b"abcd"))
             .await

@@ -175,6 +175,44 @@ export function createHttpStatusServerWorker(statusCode: number): Promise<HttpSe
   return createHttpWorker(code, { statusCode }, 'auth.wav')
 }
 
+export function createHlsServerWorker(
+  body: Buffer,
+  playlistPath = 'playlist.m3u8',
+): Promise<HttpServerWorker> {
+  const code = `
+    const http = require('node:http')
+    const { parentPort, workerData } = require('node:worker_threads')
+    const body = Buffer.from(workerData.body)
+    const playlist = Buffer.from('#EXTM3U\\n#EXT-X-TARGETDURATION:1\\n#EXT-X-MEDIA-SEQUENCE:0\\n#EXTINF:0.6,\\nsegment.wav\\n#EXT-X-ENDLIST\\n')
+    const server = http.createServer((request, response) => {
+      if (request.url === '/segment.wav') {
+        response.writeHead(200, {
+          'content-length': body.length,
+          'content-type': 'audio/wav',
+        })
+        response.end(body)
+        return
+      }
+      response.writeHead(200, {
+        'content-length': playlist.length,
+        'content-type': 'application/vnd.apple.mpegurl',
+      })
+      response.end(playlist)
+    })
+    server.listen(0, '127.0.0.1', () => {
+      parentPort.postMessage({ type: 'listening', port: server.address().port })
+    })
+    parentPort.on('message', (message) => {
+      if (message === 'close') {
+        server.close((error) => {
+          parentPort.postMessage({ type: 'closed', error: error ? error.message : null })
+        })
+      }
+    })
+  `
+  return createHttpWorker(code, { body }, playlistPath)
+}
+
 function createHttpWorker(
   code: string,
   workerData: Record<string, unknown>,

@@ -9,6 +9,7 @@ import { Streamer } from '..'
 import {
   closeSocket,
   createBoundUdpSocket,
+  createHlsServerWorker,
   createHttpServerWorker,
   delay,
   isRtpForSsrc,
@@ -403,6 +404,72 @@ test('misclassified Icecast URL automatically uses live semantics', async () => 
     expect(playing.current?.seekable).toBe(false)
     await expect(streamer.pauseStream(streamId)).rejects.toThrow(/live sources cannot be paused/)
     await expect(streamer.seekStream(streamId, 1)).rejects.toThrow(/not seekable/)
+  } finally {
+    await stopStreamIfPresent(streamer, streamId)
+    await server.close()
+    await closeSocket(socket)
+  }
+})
+
+test('m3u8 URL automatically uses the bounded HLS source path', async () => {
+  const server = await createHlsServerWorker(makeSineWave(0.6))
+  const socket = await createBoundUdpSocket()
+  const streamer = new Streamer()
+  const streamId = `hls-${Date.now()}`
+  const ssrc = 0x33445568
+
+  try {
+    const packet = waitForDatagram(socket, (message) => isRtpForSsrc(message, ssrc))
+    const started = await streamer.startStream({
+      streamId,
+      current: {
+        id: 'hls-radio',
+        kind: 'url',
+        url: server.url,
+        seekable: true,
+      },
+      transport: rtpTransport(socket, ssrc),
+    })
+    expect(started.current?.kind).toBe('live')
+    expect(started.current?.seekable).toBe(false)
+    await packet
+    const playing = await waitForStatus(
+      () => streamer.getStatus(streamId),
+      (status) => status.playState === 'playing',
+    )
+    expect(playing.current?.id).toBe('hls-radio')
+  } finally {
+    await stopStreamIfPresent(streamer, streamId)
+    await server.close()
+    await closeSocket(socket)
+  }
+})
+
+test('opaque playlist URL is corrected to HLS from its response type', async () => {
+  const server = await createHlsServerWorker(makeSineWave(0.6), 'signed-manifest')
+  const socket = await createBoundUdpSocket()
+  const streamer = new Streamer()
+  const streamId = `detected-hls-${Date.now()}`
+  const ssrc = 0x33445569
+
+  try {
+    const packet = waitForDatagram(socket, (message) => isRtpForSsrc(message, ssrc))
+    await streamer.startStream({
+      streamId,
+      current: {
+        id: 'opaque-hls-radio',
+        kind: 'url',
+        url: server.url,
+        seekable: true,
+      },
+      transport: rtpTransport(socket, ssrc),
+    })
+    await packet
+    const playing = await waitForStatus(
+      () => streamer.getStatus(streamId),
+      (status) => status.playState === 'playing' && status.current?.kind === 'live',
+    )
+    expect(playing.current?.seekable).toBe(false)
   } finally {
     await stopStreamIfPresent(streamer, streamId)
     await server.close()

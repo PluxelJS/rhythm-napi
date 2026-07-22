@@ -87,6 +87,37 @@ impl TrackSource {
     }
 
     #[must_use]
+    pub fn is_hls(&self) -> bool {
+        if self.kind == TrackKind::File {
+            return false;
+        }
+        if self
+            .format_hint
+            .as_deref()
+            .is_some_and(|hint| hint.eq_ignore_ascii_case("m3u8"))
+        {
+            return true;
+        }
+        let Some(url) = self.url.as_deref() else {
+            return false;
+        };
+        let path = url.split(['?', '#']).next().unwrap_or(url);
+        path.rsplit('/').next().is_some_and(|name| {
+            name.rsplit_once('.')
+                .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("m3u8"))
+        })
+    }
+
+    #[must_use]
+    pub fn with_detected_kind(mut self) -> Self {
+        if self.is_hls() {
+            self.kind = TrackKind::Live;
+            self.seekable = Some(false);
+        }
+        self
+    }
+
+    #[must_use]
     pub fn is_seekable(&self) -> bool {
         match self.kind {
             TrackKind::Live => false,
@@ -391,5 +422,20 @@ mod tests {
         .validate()
         .expect_err("oversized encoded window");
         assert_eq!(error.code(), crate::ErrorCode::InvalidConfig);
+    }
+
+    #[test]
+    fn hls_detection_normalizes_url_sources_to_live_semantics() {
+        let mut by_extension = source(TrackKind::Url, Some(true));
+        by_extension.url = Some("https://media.test/audio/index.m3u8?token=1".to_owned());
+        assert!(by_extension.is_hls());
+        let normalized = by_extension.with_detected_kind();
+        assert_eq!(normalized.kind, TrackKind::Live);
+        assert_eq!(normalized.seekable, Some(false));
+
+        let mut by_hint = source(TrackKind::Url, None);
+        by_hint.url = Some("https://media.test/opaque".to_owned());
+        by_hint.format_hint = Some("M3U8".to_owned());
+        assert!(by_hint.is_hls());
     }
 }

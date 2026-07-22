@@ -605,7 +605,7 @@ mod tests {
         drop(writer);
 
         tokio::task::spawn_blocking(move || {
-            let mut decoder = SymphoniaStreamDecoder::open(reader, Some("aac")).expect("decoder");
+            let mut decoder = SymphoniaStreamDecoder::open(reader, None).expect("probe decoder");
             let chunk = match decoder.poll_decode().expect("decode") {
                 DecodePoll::Chunk(chunk) => chunk,
                 other => panic!("expected AAC chunk, got {other:?}"),

@@ -21,6 +21,7 @@ bytes = "1.11.0"
 criterion = "0.8.2"
 lru = "0.18.0"
 metrics = "0.24.6"
+m3u8-rs = "6.0.0"
 napi = { version = "3.9.3", default-features = false, features = ["napi8", "tokio_rt"] }
 napi-derive = "3.5.6"
 opus = "0.3.1"

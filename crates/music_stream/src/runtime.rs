@@ -23,7 +23,7 @@ use crate::model::{
 };
 use crate::session::{ActorOutput, StreamActor, StreamCommand, TaskAction, WorkerEvent};
 use crate::source::{
-    FileSourceResolver, SharedSourceArtifactCache, SharedSourceDownloadRegistry,
+    FileSourceResolver, LiveByteBudget, SharedSourceArtifactCache, SharedSourceDownloadRegistry,
     SourceArtifactCache, SourceDownloadRegistry, SourceResolverConfig, SourceRuntimeResources,
     flush_temp_cleanup,
 };
@@ -86,7 +86,7 @@ pub struct RuntimeResources {
     http_downloads: Arc<Semaphore>,
     http_preloads: Arc<Semaphore>,
     live_streams: Arc<Semaphore>,
-    live_byte_budget: Arc<Semaphore>,
+    live_byte_budget: LiveByteBudget,
     tempfile_budget: Arc<Semaphore>,
     tempfile_preloads: Arc<Semaphore>,
     cpu_scheduler: Arc<producer::CpuScheduler>,
@@ -135,7 +135,7 @@ impl RuntimeResources {
             http_downloads: Arc::new(Semaphore::new(limits.max_concurrent_http_downloads)),
             http_preloads: Arc::new(Semaphore::new(limits.max_concurrent_http_downloads - 1)),
             live_streams: Arc::new(Semaphore::new(limits.max_concurrent_live_streams)),
-            live_byte_budget: Arc::new(Semaphore::new(limits.max_live_buffered_bytes)),
+            live_byte_budget: LiveByteBudget::new(limits.max_live_buffered_bytes)?,
             tempfile_budget: Arc::new(Semaphore::new(tempfile_permits)),
             tempfile_preloads: Arc::new(Semaphore::new((tempfile_permits / 4).max(1))),
             cpu_scheduler: Arc::new(producer::CpuScheduler::with_maximum(limits.max_cpu_workers)),
@@ -314,6 +314,8 @@ impl StreamRuntime {
         volume: VolumeLevel,
         gain: GainLevel,
     ) -> Result<Self> {
+        let current = current.with_detected_kind();
+        let next = next.map(TrackSource::with_detected_kind);
         Self::validate_stream_id(&stream_id)?;
         config.validate()?;
         current.validate()?;
@@ -359,7 +361,8 @@ impl StreamRuntime {
         Ok(runtime)
     }
 
-    pub async fn command(&self, command: StreamCommand) -> Result<StreamRuntimeSnapshot> {
+    pub async fn command(&self, mut command: StreamCommand) -> Result<StreamRuntimeSnapshot> {
+        normalize_command_sources(&mut command);
         validate_command_sources(&command)?;
         let _guard = self.inner.orchestration.lock().await;
         let (planned, output) = {
@@ -387,6 +390,27 @@ impl StreamRuntime {
 
     pub async fn shutdown(&self) -> Result<StreamRuntimeSnapshot> {
         self.command(StreamCommand::Stop).await
+    }
+}
+
+fn normalize_command_sources(command: &mut StreamCommand) {
+    match command {
+        StreamCommand::SetNext(next) => {
+            *next = next.take().map(TrackSource::with_detected_kind);
+        }
+        StreamCommand::SwitchTrack { current, next } => {
+            *current = current.clone().with_detected_kind();
+            *next = next.take().map(TrackSource::with_detected_kind);
+        }
+        StreamCommand::RefreshCurrentSource { current } => {
+            *current = current.clone().with_detected_kind();
+        }
+        StreamCommand::Play
+        | StreamCommand::Pause
+        | StreamCommand::Stop
+        | StreamCommand::Seek { .. }
+        | StreamCommand::SetVolume { .. }
+        | StreamCommand::SetGain { .. } => {}
     }
 }
 
@@ -639,7 +663,7 @@ impl StreamRuntimeInner {
             initial_paused: request.initial_paused,
             resolver,
             source: self.config.source.clone(),
-            live_byte_budget: Arc::clone(&self.config.resources.live_byte_budget),
+            live_byte_budget: self.config.resources.live_byte_budget.clone(),
             live_streams: Arc::clone(&self.config.resources.live_streams),
             cpu_scheduler: Arc::clone(&self.config.resources.cpu_scheduler),
             blocking_producers: Arc::clone(&self.config.resources.blocking_producers),

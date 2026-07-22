@@ -4,7 +4,7 @@
 npm install @rhythm-app/streamer
 ```
 
-Rust N-API media runtime for decoding file, bounded HTTP, and live HTTP audio, encoding fixed
+Rust N-API media runtime for decoding file, bounded HTTP, live HTTP, and audio HLS, encoding fixed
 48 kHz stereo Opus frames, and sending paced RTP/RTCP.
 
 Create one long-lived `Streamer` per media process. A `streamId` owns one persistent RTP session;
@@ -16,6 +16,8 @@ Bounded HTTP sources can start playback before the response completes. Give sign
 extension an accurate `formatHint`. Per-source `headers` support authenticated HTTP media without
 projecting credentials in status or events. Live sources are current-only and do not support pause,
 seek, or next preload because the runtime deliberately has no implicit timeshift store.
+`.m3u8` URLs, or opaque playlist URLs with `formatHint: 'm3u8'`, automatically use the bounded HLS
+path and the same current-only live semantics.
 
 All lifecycle methods return Promises. Await `shutdown()` before process exit; shutdown is idempotent
 and permanently closes the instance. Promise errors begin with a stable media error code followed by

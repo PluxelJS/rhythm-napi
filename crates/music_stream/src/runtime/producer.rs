@@ -20,8 +20,9 @@ use crate::error::{MusicStreamError, Result};
 use crate::model::{GainLevel, MediaBufferConfig, TrackKind, TrackSource, VolumeLevel};
 use crate::session::WorkerEvent;
 use crate::source::{
-    BlockingReadObserver, FileSourceResolver, ProgressiveUrlSource, SharedUrlControl,
-    SourceArtifact, SourceResolverConfig, UrlPlaybackSource, spawn_http_live_stream,
+    BlockingReadObserver, FileSourceResolver, LiveByteBudget, ProgressiveUrlSource,
+    SharedUrlControl, SourceArtifact, SourceResolverConfig, UrlPlaybackSource,
+    spawn_http_hls_stream, spawn_http_live_stream,
 };
 
 #[derive(Debug)]
@@ -175,7 +176,7 @@ pub(super) struct ProducerSpec {
     pub initial_paused: bool,
     pub resolver: FileSourceResolver,
     pub source: SourceResolverConfig,
-    pub live_byte_budget: Arc<tokio::sync::Semaphore>,
+    pub live_byte_budget: LiveByteBudget,
     pub live_streams: Arc<Semaphore>,
     pub cpu_scheduler: Arc<CpuScheduler>,
     pub blocking_producers: Arc<Semaphore>,
@@ -425,7 +426,9 @@ pub(super) fn spawn(spec: ProducerSpec) -> ProducerHandle {
             blocking_producers: spec.blocking_producers,
             blocking_preloads: spec.blocking_preloads,
         };
-        if job.track.is_live() {
+        if job.track.is_hls() {
+            run_hls(job, spec.source, spec.live_byte_budget, spec.live_streams).await
+        } else if job.track.is_live() {
             run_live(job, spec.source, spec.live_byte_budget, spec.live_streams).await
         } else {
             run_artifact(
@@ -530,7 +533,7 @@ async fn run_artifact(
     job: ProducerJob,
     resolver: FileSourceResolver,
     source_config: SourceResolverConfig,
-    live_byte_budget: Arc<tokio::sync::Semaphore>,
+    live_byte_budget: LiveByteBudget,
     live_streams: Arc<Semaphore>,
 ) -> Result<()> {
     if job.track.kind == TrackKind::Url
@@ -544,6 +547,9 @@ async fn run_artifact(
             Ok(source) => source,
             Err(MusicStreamError::DetectedLiveSource(_)) => {
                 return run_detected_live(job, source_config, live_byte_budget, live_streams).await;
+            }
+            Err(MusicStreamError::DetectedHlsSource(_)) => {
+                return run_detected_hls(job, source_config, live_byte_budget, live_streams).await;
             }
             Err(error) => return Err(error),
         };
@@ -567,6 +573,9 @@ async fn run_artifact(
         Err(MusicStreamError::DetectedLiveSource(_)) => {
             return run_detected_live(job, source_config, live_byte_budget, live_streams).await;
         }
+        Err(MusicStreamError::DetectedHlsSource(_)) => {
+            return run_detected_hls(job, source_config, live_byte_budget, live_streams).await;
+        }
         Err(error) => return Err(error),
     };
     record_source_ready(&job);
@@ -578,7 +587,7 @@ async fn run_artifact(
 async fn run_detected_live(
     mut job: ProducerJob,
     source: SourceResolverConfig,
-    live_byte_budget: Arc<tokio::sync::Semaphore>,
+    live_byte_budget: LiveByteBudget,
     live_streams: Arc<Semaphore>,
 ) -> Result<()> {
     if matches!(job.control.role(), ProducerRole::Next) {
@@ -599,6 +608,32 @@ async fn run_detected_live(
         .await
         .map_err(|_| MusicStreamError::StreamClosed("worker event loop closed".to_owned()))?;
     run_live(job, source, live_byte_budget, live_streams).await
+}
+
+async fn run_detected_hls(
+    mut job: ProducerJob,
+    source: SourceResolverConfig,
+    live_byte_budget: LiveByteBudget,
+    live_streams: Arc<Semaphore>,
+) -> Result<()> {
+    if matches!(job.control.role(), ProducerRole::Next) {
+        return Err(MusicStreamError::Unsupported(
+            "detected HLS source cannot be preloaded as next yet".to_owned(),
+        ));
+    }
+    metrics::counter!("music_stream.source.detected_hls_fallbacks").increment(1);
+    job.track.kind = TrackKind::Live;
+    job.track.seekable = Some(false);
+    job.track.format_hint = Some("m3u8".to_owned());
+    job.role = ProducerRole::Current;
+    job.next_prime_ms = None;
+    job.events
+        .send(WorkerEvent::CurrentSourceDetectedLive {
+            generation: job.generation,
+        })
+        .await
+        .map_err(|_| MusicStreamError::StreamClosed("worker event loop closed".to_owned()))?;
+    run_hls(job, source, live_byte_budget, live_streams).await
 }
 
 async fn run_file_artifact(
@@ -715,7 +750,7 @@ async fn wait_for_shared_terminal(
 async fn run_live(
     job: ProducerJob,
     source: SourceResolverConfig,
-    live_byte_budget: Arc<tokio::sync::Semaphore>,
+    live_byte_budget: LiveByteBudget,
     live_streams: Arc<Semaphore>,
 ) -> Result<()> {
     if matches!(job.role, ProducerRole::Next) {
@@ -729,6 +764,34 @@ async fn run_live(
     record_codec_start(&job);
     let stream = spawn_http_live_stream(&job.track, source.live_http, live_byte_budget)?;
     let hint = decoder_hint(&job.track);
+    run_http_stream(job, stream, hint, admission).await
+}
+
+async fn run_hls(
+    job: ProducerJob,
+    source: SourceResolverConfig,
+    live_byte_budget: LiveByteBudget,
+    live_streams: Arc<Semaphore>,
+) -> Result<()> {
+    if matches!(job.role, ProducerRole::Next) {
+        return Err(MusicStreamError::Unsupported(
+            "HLS sources cannot run as preload producers yet".to_owned(),
+        ));
+    }
+    let _live_admission =
+        acquire_job_slot(live_streams, &job.control.gate, &job.cancellation).await?;
+    let admission = acquire_blocking_job(&job).await?;
+    record_codec_start(&job);
+    let stream = spawn_http_hls_stream(&job.track, source.live_http, live_byte_budget)?;
+    run_http_stream(job, stream, None, admission).await
+}
+
+async fn run_http_stream(
+    job: ProducerJob,
+    stream: crate::source::HttpLiveStream,
+    hint: Option<String>,
+    admission: AdmissionPermit,
+) -> Result<()> {
     let source_cancellation = stream.cancellation.clone();
     let mut source_task = stream.task;
     let mut reader = stream.reader;
@@ -1034,6 +1097,9 @@ fn role_name(role: ProducerRole) -> &'static str {
 }
 
 fn source_kind_name(source: &TrackSource) -> &'static str {
+    if source.is_hls() {
+        return "hls";
+    }
     match source.kind {
         TrackKind::File => "file",
         TrackKind::Url => "url",
@@ -1359,7 +1425,7 @@ mod tests {
             job,
             resolver,
             SourceResolverConfig::default(),
-            Arc::new(Semaphore::new(1)),
+            LiveByteBudget::new(1).expect("live byte budget"),
             Arc::new(Semaphore::new(1)),
         ));
         tokio::time::sleep(Duration::from_millis(20)).await;

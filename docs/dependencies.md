@@ -6,6 +6,7 @@
 | --- | --- | --- |
 | `tokio`, `tokio-util` | async task、UDP、timer、channel、cancellation | 不运行 codec/DSP，不用 runtime worker 承担同步清理 |
 | `reqwest` | async HTTP、连接池、TLS | 禁止 blocking client；业务鉴权和 URL 解析留给宿主 |
+| `m3u8-rs` | HLS master/media playlist 语法解析 | 只解析清单；variant 策略、segment 上限与获取生命周期仍由 source 控制 |
 | `symphonia` | 容器 probe、demux、decode、seek | 只在受控 blocking worker 中调用 |
 | `rubato` | 高质量 sample-rate conversion | 只处理 PCM，不负责调度或 buffering |
 | `opus` | libopus 安全封装 | 解码 Ogg Opus mono/stereo packet，并编码固定输出格式；codec 不进入 sender task |
