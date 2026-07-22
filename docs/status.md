@@ -42,11 +42,18 @@
 仍需用生产 corpus 和环境验证 AAC/M4A、ALAC、FLAC、OGG/Vorbis、VBR、超大 metadata、损坏文件、
 慢 DNS/TLS、磁盘满、UDP stall 以及 10/50 路多小时运行。现有测试证明语义，不替代容量规划。
 
-### Profile 驱动的热路径优化
+### 媒体性能待办
 
-Opus payload pool、更多 PCM/Rubato buffer 复用、SIMD 和 codec 参数自适应只有在 allocation/CPU
-profile 证明收益后才值得增加。优化不得重新引入第二层 queue、跨 sender payload 复制或更差的
-取消语义。
+后续优化按生产 corpus 和分阶段 profile 排序，而不是默认从手写 SIMD 开始：
+
+- 为 MP3、AAC、FLAC、M4A/MP4 分别建立 decode、resample、DSP、Opus 和 allocation 基线；
+- 验证 fast-start M4A/MP4 的安全渐进 probe，并在容器索引、Range 语义和响应身份可证明时再扩展；
+- 比较 Opus complexity 10/8/6/5 的 CPU、音质、sender lateness 和并发尾延迟，再决定是否暴露配置；
+- 对真实 44.1 kHz 曲库比较 Rubato sinc 参数的 CPU/音质，不以合成吞吐单独改变默认质量；
+- profile 证明必要后再增加 Opus payload pool、更多 PCM buffer 复用和 gain/downmix/limiter SIMD；
+- 用 10/50 路长时间运行验证 allocator 压力、RSS、underrun、取消时间和 Node event-loop delay。
+
+这些优化不得重新引入第二层 queue、跨 sender payload 复制或更差的取消语义。
 
 ### Loudness 分析
 

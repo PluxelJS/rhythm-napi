@@ -9,6 +9,7 @@ use crate::Result;
 use crate::error::MusicStreamError;
 
 const MAX_CONSECUTIVE_DECODE_ERRORS: usize = 32;
+const MAX_RECYCLED_PCM_SAMPLES: usize = 48_000 * 2;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DecodedChunk {
@@ -46,6 +47,12 @@ pub enum DecodePoll {
 
 pub trait DecoderBackend {
     fn poll_decode(&mut self) -> Result<DecodePoll>;
+
+    /// Returns an owned PCM chunk after the caller has finished processing it.
+    ///
+    /// Stateful decoders may retain the allocation for the next decoded packet. Backends that do
+    /// not own reusable storage can keep the default drop behavior.
+    fn recycle(&mut self, _chunk: DecodedChunk) {}
 }
 
 #[cfg(test)]
@@ -79,6 +86,7 @@ pub struct SymphoniaFileDecoder {
     decoder: PacketAudioDecoder,
     track_id: u32,
     decode_errors: DecodeErrorBudget,
+    recycled_samples: Vec<f32>,
 }
 impl std::fmt::Debug for SymphoniaFileDecoder {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -93,6 +101,7 @@ pub struct SymphoniaStreamDecoder {
     decoder: PacketAudioDecoder,
     track_id: u32,
     decode_errors: DecodeErrorBudget,
+    recycled_samples: Vec<f32>,
 }
 impl std::fmt::Debug for SymphoniaStreamDecoder {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -125,6 +134,7 @@ impl SymphoniaFileDecoder {
             decoder,
             track_id,
             decode_errors: DecodeErrorBudget::default(),
+            recycled_samples: Vec::new(),
         })
     }
 
@@ -163,7 +173,12 @@ impl DecoderBackend for SymphoniaFileDecoder {
             &mut self.decoder,
             self.track_id,
             &mut self.decode_errors,
+            &mut self.recycled_samples,
         )
+    }
+
+    fn recycle(&mut self, chunk: DecodedChunk) {
+        recycle_symphonia_chunk(&mut self.recycled_samples, chunk);
     }
 }
 impl SymphoniaStreamDecoder {
@@ -185,6 +200,7 @@ impl SymphoniaStreamDecoder {
             decoder,
             track_id,
             decode_errors: DecodeErrorBudget::default(),
+            recycled_samples: Vec::new(),
         })
     }
 }
@@ -195,7 +211,12 @@ impl DecoderBackend for SymphoniaStreamDecoder {
             &mut self.decoder,
             self.track_id,
             &mut self.decode_errors,
+            &mut self.recycled_samples,
         )
+    }
+
+    fn recycle(&mut self, chunk: DecodedChunk) {
+        recycle_symphonia_chunk(&mut self.recycled_samples, chunk);
     }
 }
 fn open_symphonia_decoder(
@@ -246,6 +267,7 @@ fn poll_symphonia_decode(
     decoder: &mut PacketAudioDecoder,
     track_id: u32,
     decode_errors: &mut DecodeErrorBudget,
+    recycled_samples: &mut Vec<f32>,
 ) -> Result<DecodePoll> {
     use symphonia::core::errors::Error as SymphoniaError;
 
@@ -288,13 +310,13 @@ fn poll_symphonia_decode(
         match decoder.decode(&packet) {
             Ok(audio_buf) => {
                 decode_errors.reset();
-                let mut samples_interleaved = vec![0.0; audio_buf.samples_interleaved()];
-                audio_buf.copy_to_slice_interleaved(&mut samples_interleaved);
+                recycled_samples.resize(audio_buf.samples_interleaved(), 0.0);
+                audio_buf.copy_to_slice_interleaved(&mut *recycled_samples);
                 let spec = audio_buf.spec();
                 return Ok(DecodePoll::Chunk(DecodedChunk {
                     sample_rate: spec.rate(),
                     channels: spec.channels().count() as u16,
-                    samples_interleaved,
+                    samples_interleaved: std::mem::take(recycled_samples),
                 }));
             }
             Err(error)
@@ -420,6 +442,15 @@ impl LibOpusPacketDecoder {
     }
 }
 
+fn recycle_symphonia_chunk(recycled_samples: &mut Vec<f32>, mut chunk: DecodedChunk) {
+    chunk.samples_interleaved.clear();
+    if chunk.samples_interleaved.capacity() <= MAX_RECYCLED_PCM_SAMPLES
+        && chunk.samples_interleaved.capacity() > recycled_samples.capacity()
+    {
+        *recycled_samples = chunk.samples_interleaved;
+    }
+}
+
 #[derive(Debug, Default)]
 struct DecodeErrorBudget {
     consecutive: usize,
@@ -499,6 +530,29 @@ mod tests {
         assert_eq!(chunk.channels, 2);
         assert_eq!(chunk.samples_per_channel(), 960);
         assert_eq!(decoder.poll_decode().expect("end"), DecodePoll::End);
+    }
+
+    #[test]
+    fn symphonia_file_decoder_reuses_recycled_pcm_allocation() {
+        let temp = tempfile::Builder::new()
+            .suffix(".wav")
+            .tempfile()
+            .expect("temp wav");
+        write_test_wav(temp.path(), 9_600).expect("write wav");
+
+        let mut decoder = SymphoniaFileDecoder::open(temp.path()).expect("decoder");
+        let first = match decoder.poll_decode().expect("first decode") {
+            DecodePoll::Chunk(chunk) => chunk,
+            other => panic!("expected first chunk, got {other:?}"),
+        };
+        let first_allocation = first.samples_interleaved.as_ptr();
+        decoder.recycle(first);
+
+        let second = match decoder.poll_decode().expect("second decode") {
+            DecodePoll::Chunk(chunk) => chunk,
+            other => panic!("expected second chunk, got {other:?}"),
+        };
+        assert_eq!(second.samples_interleaved.as_ptr(), first_allocation);
     }
     #[test]
     fn symphonia_file_decoder_can_open_at_time_offset() {

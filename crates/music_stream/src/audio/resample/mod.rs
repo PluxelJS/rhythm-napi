@@ -15,6 +15,8 @@ mod rubato_backend {
     use crate::error::{MusicStreamError, Result};
 
     const DEFAULT_CHUNK_FRAMES: usize = 1024;
+    const MAX_RECYCLED_BUFFERS: usize = 4;
+    const MAX_RECYCLED_BUFFER_SAMPLES: usize = 48_000 * 2;
 
     #[derive(Clone, Debug)]
     pub struct RubatoResamplerConfig {
@@ -85,7 +87,8 @@ mod rubato_backend {
         pending_input: Vec<f32>,
         pending_input_start: usize,
         pending_output: VecDeque<DecodedChunk>,
-        output_scratch: Vec<f32>,
+        recycled_buffers: Vec<Vec<f32>>,
+        transformed: bool,
         trim_output_frames_remaining: usize,
         input_frames_seen: usize,
         output_frames_emitted: usize,
@@ -126,7 +129,8 @@ mod rubato_backend {
                 pending_input: Vec::new(),
                 pending_input_start: 0,
                 pending_output: VecDeque::new(),
-                output_scratch: Vec::new(),
+                recycled_buffers: Vec::new(),
+                transformed: false,
                 trim_output_frames_remaining: 0,
                 input_frames_seen: 0,
                 output_frames_emitted: 0,
@@ -167,14 +171,45 @@ mod rubato_backend {
                 }
             }
         }
+
+        fn recycle(&mut self, chunk: DecodedChunk) {
+            if self.transformed {
+                self.recycle_buffer(chunk.samples_interleaved);
+            } else {
+                self.inner.recycle(chunk);
+            }
+        }
     }
 
-    impl<D> RubatoResamplingDecoder<D> {
-        fn accept_chunk(&mut self, chunk: DecodedChunk) -> Result<()> {
+    impl<D> RubatoResamplingDecoder<D>
+    where
+        D: DecoderBackend,
+    {
+        fn accept_chunk(&mut self, mut chunk: DecodedChunk) -> Result<()> {
             let input_sample_rate = chunk.sample_rate;
-            let mut normalized = self.normalize_channels(chunk)?;
+            let channels_match = chunk.channels == self.config.target.channels;
+            if channels_match && input_sample_rate == self.config.target.sample_rate {
+                self.pending_output.push_back(chunk);
+                return Ok(());
+            }
+
+            self.transformed = true;
+            let mut normalized = if channels_match {
+                std::mem::take(&mut chunk.samples_interleaved)
+            } else {
+                if self.config.target.channels != 2 {
+                    return Err(MusicStreamError::Unsupported(format!(
+                        "channel normalization to {} channels is not supported",
+                        self.config.target.channels
+                    )));
+                }
+                let mut normalized = self.take_recycled_buffer();
+                to_stereo_interleaved(&chunk.samples_interleaved, chunk.channels, &mut normalized)?;
+                normalized
+            };
             let frames = normalized.len() / usize::from(self.config.target.channels);
             if input_sample_rate == self.config.target.sample_rate {
+                self.inner.recycle(chunk);
                 self.pending_output.push_back(DecodedChunk {
                     sample_rate: self.config.target.sample_rate,
                     channels: self.config.target.channels,
@@ -187,24 +222,26 @@ mod rubato_backend {
             self.input_frames_seen = self.input_frames_seen.saturating_add(frames);
             self.compact_pending_input();
             self.pending_input.append(&mut normalized);
+            if channels_match {
+                chunk.samples_interleaved = normalized;
+            } else {
+                self.recycle_buffer(normalized);
+            }
+            self.inner.recycle(chunk);
             self.process_full_chunks()
         }
 
-        fn normalize_channels(&mut self, chunk: DecodedChunk) -> Result<Vec<f32>> {
-            if chunk.channels == self.config.target.channels {
-                return Ok(chunk.samples_interleaved);
-            }
+        fn take_recycled_buffer(&mut self) -> Vec<f32> {
+            self.recycled_buffers.pop().unwrap_or_default()
+        }
 
-            if self.config.target.channels != 2 {
-                return Err(MusicStreamError::Unsupported(format!(
-                    "channel normalization to {} channels is not supported",
-                    self.config.target.channels
-                )));
+        fn recycle_buffer(&mut self, mut samples: Vec<f32>) {
+            samples.clear();
+            if samples.capacity() <= MAX_RECYCLED_BUFFER_SAMPLES
+                && self.recycled_buffers.len() < MAX_RECYCLED_BUFFERS
+            {
+                self.recycled_buffers.push(samples);
             }
-
-            let mut normalized = Vec::new();
-            to_stereo_interleaved(&chunk.samples_interleaved, chunk.channels, &mut normalized)?;
-            Ok(normalized)
         }
 
         fn ensure_resampler(&mut self, input_sample_rate: u32) -> Result<()> {
@@ -281,13 +318,12 @@ mod rubato_backend {
         fn process_one(&mut self, partial_len: Option<usize>) -> Result<()> {
             let channels = usize::from(self.config.target.channels);
             let input_frames = self.pending_input_frames();
+            let mut output = self.take_recycled_buffer();
             let resampler = self.resampler.as_mut().ok_or_else(|| {
                 MusicStreamError::Internal("rubato resampler was not initialized".to_owned())
             })?;
             let output_frames_next = resampler.output_frames_next();
-            self.output_scratch.clear();
-            self.output_scratch
-                .resize(output_frames_next * channels, 0.0);
+            output.resize(output_frames_next * channels, 0.0);
 
             let input_adapter = InterleavedSlice::new(
                 &self.pending_input[self.pending_input_start..],
@@ -296,7 +332,7 @@ mod rubato_backend {
             )
             .map_err(map_size_error)?;
             let mut output_adapter =
-                InterleavedSlice::new_mut(&mut self.output_scratch, channels, output_frames_next)
+                InterleavedSlice::new_mut(&mut output, channels, output_frames_next)
                     .map_err(map_size_error)?;
             let indexing = partial_len.map(|partial_len| Indexing {
                 input_offset: 0,
@@ -315,11 +351,13 @@ mod rubato_backend {
             }
 
             if output_written == 0 {
+                self.recycle_buffer(output);
                 return Ok(());
             }
 
             if self.trim_output_frames_remaining >= output_written {
                 self.trim_output_frames_remaining -= output_written;
+                self.recycle_buffer(output);
                 return Ok(());
             }
 
@@ -335,15 +373,20 @@ mod rubato_backend {
             }
 
             if emit_frames == 0 {
+                self.recycle_buffer(output);
                 return Ok(());
             }
 
             let start = skip_frames * channels;
             let end = start + emit_frames * channels;
+            if start > 0 {
+                output.copy_within(start..end, 0);
+            }
+            output.truncate(emit_frames * channels);
             self.pending_output.push_back(DecodedChunk {
                 sample_rate: self.config.target.sample_rate,
                 channels: self.config.target.channels,
-                samples_interleaved: self.output_scratch[start..end].to_vec(),
+                samples_interleaved: output,
             });
             self.output_frames_emitted = self.output_frames_emitted.saturating_add(emit_frames);
             Ok(())
@@ -459,6 +502,52 @@ mod rubato_backend {
 
             assert_eq!(chunk.samples_interleaved, vec![0.25, 0.25, -0.25, -0.25]);
             assert_eq!(decoder.poll_decode().expect("end"), DecodePoll::End);
+        }
+
+        #[test]
+        fn resampling_decoder_reuses_recycled_output_allocation() {
+            let source = || DecodedChunk {
+                sample_rate: 44_100,
+                channels: 2,
+                samples_interleaved: vec![0.25; DEFAULT_CHUNK_FRAMES * 2],
+            };
+            let mut decoder = RubatoResamplingDecoder::new(
+                MemoryDecoder::new([source(), source()]),
+                RubatoResamplerConfig::new(AudioFormat {
+                    sample_rate: 48_000,
+                    channels: 2,
+                }),
+            )
+            .expect("resampling decoder");
+
+            let first = match decoder.poll_decode().expect("first output") {
+                DecodePoll::Chunk(chunk) => chunk,
+                other => panic!("expected first output, got {other:?}"),
+            };
+            let first_allocation = first.samples_interleaved.as_ptr();
+            decoder.recycle(first);
+
+            let second = match decoder.poll_decode().expect("second output") {
+                DecodePoll::Chunk(chunk) => chunk,
+                other => panic!("expected second output, got {other:?}"),
+            };
+            assert_eq!(second.samples_interleaved.as_ptr(), first_allocation);
+        }
+
+        #[test]
+        fn resampling_decoder_does_not_retain_oversized_recycled_buffers() {
+            let mut decoder = RubatoResamplingDecoder::new(
+                MemoryDecoder::new(std::iter::empty::<DecodedChunk>()),
+                RubatoResamplerConfig::new(AudioFormat {
+                    sample_rate: 48_000,
+                    channels: 2,
+                }),
+            )
+            .expect("resampling decoder");
+
+            decoder.recycle_buffer(Vec::with_capacity(MAX_RECYCLED_BUFFER_SAMPLES + 1));
+
+            assert!(decoder.recycled_buffers.is_empty());
         }
     }
 }

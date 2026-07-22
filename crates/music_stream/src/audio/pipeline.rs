@@ -132,6 +132,7 @@ where
                             Ok(())
                         },
                     )?;
+                    self.decoder.recycle(chunk);
                 }
                 DecodePoll::NeedMore => {
                     report.source_need_more = true;
