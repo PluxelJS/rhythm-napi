@@ -96,11 +96,11 @@ impl HttpLiveStreamConfig {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct HttpLiveStreamReport {
-    pub bytes_read: u64,
-    pub retries: u8,
-    pub completed: bool,
-    pub stopped: bool,
+pub(crate) struct HttpLiveStreamReport {
+    pub(crate) bytes_read: u64,
+    pub(crate) retries: u8,
+    pub(crate) completed: bool,
+    pub(crate) stopped: bool,
 }
 
 #[derive(Debug)]
@@ -122,7 +122,7 @@ enum ByteMessage {
 }
 
 #[derive(Debug)]
-pub struct StreamingByteReader {
+pub(crate) struct StreamingByteReader {
     receiver: mpsc::Receiver<ByteMessage>,
     current: Option<ByteChunk>,
     offset: usize,
@@ -130,7 +130,7 @@ pub struct StreamingByteReader {
 }
 
 #[derive(Clone, Debug)]
-pub struct StreamingByteWriter {
+pub(crate) struct StreamingByteWriter {
     sender: mpsc::Sender<ByteMessage>,
     stream_budget: Arc<Semaphore>,
     global_budget: LiveByteBudget,
@@ -139,7 +139,7 @@ pub struct StreamingByteWriter {
 
 impl StreamingByteReader {
     #[cfg(test)]
-    pub fn new(max_buffered_bytes: usize) -> Result<(StreamingByteWriter, Self)> {
+    pub(crate) fn new(max_buffered_bytes: usize) -> Result<(StreamingByteWriter, Self)> {
         Self::with_global_budget(max_buffered_bytes, LiveByteBudget::new(max_buffered_bytes)?)
     }
 
@@ -181,7 +181,7 @@ impl StreamingByteWriter {
         self.global_budget.clone()
     }
 
-    pub async fn push(&self, bytes: Bytes) -> Result<()> {
+    pub(crate) async fn push(&self, bytes: Bytes) -> Result<()> {
         let mut offset = 0;
         while offset < bytes.len() {
             let end = offset.saturating_add(self.max_chunk_bytes).min(bytes.len());
@@ -252,7 +252,7 @@ impl StreamingByteWriter {
         Ok(())
     }
 
-    pub async fn fail(&self, message: impl Into<String>, cancellation: &CancellationToken) {
+    pub(super) async fn fail(&self, message: impl Into<String>, cancellation: &CancellationToken) {
         tokio::select! {
             _ = cancellation.cancelled() => {}
             _ = self.sender.send(ByteMessage::Failed(message.into())) => {}
@@ -296,13 +296,13 @@ impl Read for StreamingByteReader {
 }
 
 #[derive(Debug)]
-pub struct HttpLiveStream {
-    pub reader: StreamingByteReader,
-    pub cancellation: CancellationToken,
-    pub task: JoinHandle<Result<HttpLiveStreamReport>>,
+pub(crate) struct HttpLiveStream {
+    pub(crate) reader: StreamingByteReader,
+    pub(crate) cancellation: CancellationToken,
+    pub(crate) task: JoinHandle<Result<HttpLiveStreamReport>>,
 }
 
-pub fn spawn_http_live_stream(
+pub(crate) fn spawn_http_live_stream(
     source: &TrackSource,
     config: HttpLiveStreamConfig,
     global_byte_budget: LiveByteBudget,

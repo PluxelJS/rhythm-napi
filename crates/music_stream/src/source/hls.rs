@@ -1,6 +1,6 @@
 //! Bounded audio HLS playlist and segment delivery.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use aes::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
@@ -90,7 +90,7 @@ async fn run_http_hls_stream(
     let mut segment_kind = None;
     let mut initialization = None;
     let mut key_cache = None;
-    let mut delivered_segments = 0_u64;
+    let mut delivered_media = false;
 
     loop {
         if cancellation.is_cancelled() {
@@ -118,8 +118,7 @@ async fn run_http_hls_stream(
                 next_sequence = next_sequence.saturating_add(1);
                 continue;
             }
-            validate_segment(segment)?;
-            if segment.discontinuity && delivered_segments > 0 {
+            if segment.discontinuity && delivered_media {
                 metrics::counter!("music_stream.source.hls_discontinuities").increment(1);
             }
             let mapped_fmp4 = segment.map.is_some();
@@ -145,7 +144,7 @@ async fn run_http_hls_stream(
                                 .to_owned(),
                         ));
                     }
-                    None if delivered_segments > 0 => {
+                    None if delivered_media => {
                         return Err(MusicStreamError::Unsupported(
                             "HLS cannot introduce an initialization map midstream".to_owned(),
                         ));
@@ -231,7 +230,7 @@ async fn run_http_hls_stream(
                 report.stopped = true;
                 return Ok(report);
             }
-            delivered_segments = delivered_segments.saturating_add(1);
+            delivered_media = true;
             next_sequence = next_sequence.saturating_add(1);
             metrics::counter!("music_stream.source.hls_segments").increment(1);
         }
@@ -389,7 +388,7 @@ struct AudioGroupProfile {
 fn select_variant(master: &m3u8_rs::MasterPlaylist) -> Option<&str> {
     // EXT-X-MEDIA has no CODECS or BANDWIDTH, so derive a compact profile for each
     // referenced audio group in one pass over the variants.
-    let mut audio_groups = std::collections::HashMap::<&str, AudioGroupProfile>::new();
+    let mut audio_groups = HashMap::<&str, AudioGroupProfile>::new();
     for variant in &master.variants {
         let Some(group_id) = variant.audio.as_deref() else {
             continue;
@@ -454,14 +453,14 @@ fn select_variant(master: &m3u8_rs::MasterPlaylist) -> Option<&str> {
         })
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum AudioCodecRank {
     Verified,
     Unknown,
     Unsupported,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CodecProfile {
     audio_rank: AudioCodecRank,
     has_video: bool,
@@ -478,13 +477,9 @@ fn codec_profile(codecs: Option<&str>) -> CodecProfile {
     let mut audio_rank = AudioCodecRank::Unknown;
     let mut has_video = false;
     for codec in codecs.split(',').map(str::trim) {
-        if codec == "mp3" || codec_family(codec, "mp4a") {
+        if is_verified_audio_codec(codec) {
             audio_rank = AudioCodecRank::Verified;
-        } else if ["ac-3", "ec-3", "ac-4", "dtsc", "dtse", "dtsh", "dtsl"]
-            .iter()
-            .any(|family| codec_family(codec, family))
-            && audio_rank != AudioCodecRank::Verified
-        {
+        } else if is_unsupported_audio_codec(codec) && audio_rank != AudioCodecRank::Verified {
             audio_rank = AudioCodecRank::Unsupported;
         }
         has_video |= [
@@ -497,6 +492,32 @@ fn codec_profile(codecs: Option<&str>) -> CodecProfile {
         audio_rank,
         has_video,
     }
+}
+
+fn is_verified_audio_codec(codec: &str) -> bool {
+    matches!(
+        codec,
+        "mp3"
+            | "mp4a.40.2"
+            | "mp4a.40.5"
+            | "mp4a.40.29"
+            | "mp4a.40.34"
+            | "mp4a.66"
+            | "mp4a.67"
+            | "mp4a.68"
+            | "mp4a.69"
+            | "mp4a.6b"
+    )
+}
+
+fn is_unsupported_audio_codec(codec: &str) -> bool {
+    ["ac-3", "ec-3", "ac-4", "dtsc", "dtse", "dtsh", "dtsl"]
+        .iter()
+        .any(|family| codec_family(codec, family))
+        || matches!(
+            codec,
+            "mp4a.a5" | "mp4a.a6" | "mp4a.a9" | "mp4a.aa" | "mp4a.ab" | "mp4a.ac"
+        )
 }
 
 fn codec_family(codec: &str, family: &str) -> bool {
@@ -520,19 +541,6 @@ fn initial_sequence(playlist: &MediaPlaylist) -> u64 {
     playlist
         .media_sequence
         .saturating_add(playlist.segments.len().saturating_sub(LIVE_EDGE_SEGMENTS) as u64)
-}
-
-fn validate_segment(segment: &m3u8_rs::MediaSegment) -> Result<()> {
-    if segment
-        .key
-        .as_ref()
-        .is_some_and(|key| !matches!(key.method, KeyMethod::None | KeyMethod::AES128))
-    {
-        return Err(MusicStreamError::Unsupported(
-            "HLS encryption method is not supported".to_owned(),
-        ));
-    }
-    Ok(())
 }
 
 fn segment_is_gap(segment: &m3u8_rs::MediaSegment) -> bool {
@@ -1295,7 +1303,31 @@ mod tests {
             playlist.segments[1].key.as_ref().map(|key| &key.method),
             Some(&KeyMethod::AES128)
         );
-        validate_segment(&playlist.segments[1]).expect("AES-128 segment");
+    }
+
+    #[test]
+    fn codec_profiles_distinguish_supported_and_unsupported_mp4a_types() {
+        assert_eq!(
+            codec_profile(Some("avc1.4D401E,mp4a.40.2")),
+            CodecProfile {
+                audio_rank: AudioCodecRank::Verified,
+                has_video: true,
+            }
+        );
+        assert_eq!(
+            codec_profile(Some("mp4a.A6")),
+            CodecProfile {
+                audio_rank: AudioCodecRank::Unsupported,
+                has_video: false,
+            }
+        );
+        assert_eq!(
+            codec_profile(Some("opus")),
+            CodecProfile {
+                audio_rank: AudioCodecRank::Unknown,
+                has_video: false,
+            }
+        );
     }
 
     #[test]
