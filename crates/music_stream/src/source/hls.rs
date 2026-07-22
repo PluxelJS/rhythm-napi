@@ -3,8 +3,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use aes::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
 use bytes::Bytes;
-use m3u8_rs::{AlternativeMediaType, ByteRange, KeyMethod, MediaPlaylist, Playlist};
+use m3u8_rs::{AlternativeMediaType, ByteRange, Key, KeyMethod, MediaPlaylist, Playlist};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
 
@@ -20,6 +21,7 @@ use super::{is_retryable_http, map_http_error, shared_http_client};
 const MAX_PLAYLIST_BYTES: usize = 1024 * 1024;
 const MAX_INIT_SEGMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
+const AES128_KEY_BYTES: usize = 16;
 const MAX_MASTER_DEPTH: usize = 3;
 const LIVE_EDGE_SEGMENTS: usize = 3;
 
@@ -87,6 +89,7 @@ async fn run_http_hls_stream(
     let mut next_sequence = initial_sequence(&playlist);
     let mut segment_kind = None;
     let mut initialization = None;
+    let mut key_cache = None;
     let mut delivered_segments = 0_u64;
 
     loop {
@@ -140,6 +143,15 @@ async fn run_http_hls_stream(
                         ));
                     }
                     None => {
+                        let encryption = resolve_aes128_encryption(
+                            &http,
+                            &media_url,
+                            segment.key.as_ref(),
+                            next_sequence,
+                            true,
+                            &mut key_cache,
+                        )
+                        .await?;
                         let response = http
                             .fetch_range(
                                 map_identity.url.clone(),
@@ -151,8 +163,9 @@ async fn run_http_hls_stream(
                         report.bytes_read = report
                             .bytes_read
                             .saturating_add(response.bytes.len() as u64);
-                        validate_fmp4_initialization(&response.bytes)?;
-                        let (bytes, permit) = response.into_parts();
+                        let (mut bytes, permit) = response.into_parts();
+                        decrypt_hls_bytes(&mut bytes, encryption)?;
+                        validate_fmp4_initialization(&bytes)?;
                         if !push_budgeted_bytes(&writer, &cancellation, bytes, permit).await? {
                             report.stopped = true;
                             return Ok(report);
@@ -171,6 +184,15 @@ async fn run_http_hls_stream(
             let segment_url = media_url.join(&segment.uri).map_err(|error| {
                 MusicStreamError::InvalidSource(format!("invalid HLS segment URL: {error}"))
             })?;
+            let encryption = resolve_aes128_encryption(
+                &http,
+                &media_url,
+                segment.key.as_ref(),
+                next_sequence,
+                false,
+                &mut key_cache,
+            )
+            .await?;
             let response = http
                 .fetch_range(
                     segment_url.clone(),
@@ -186,7 +208,8 @@ async fn run_http_hls_stream(
             report.bytes_read = report
                 .bytes_read
                 .saturating_add(response.bytes.len() as u64);
-            let (bytes, global_permit) = response.into_parts();
+            let (mut bytes, global_permit) = response.into_parts();
+            decrypt_hls_bytes(&mut bytes, encryption)?;
             let (bytes, kind) = normalize_segment(bytes, &segment_url, mapped_fmp4)?;
             if let Some(kind) = kind {
                 if segment_kind.is_some_and(|current| current != kind) {
@@ -390,10 +413,10 @@ fn validate_segment(segment: &m3u8_rs::MediaSegment, after_first: bool) -> Resul
     if segment
         .key
         .as_ref()
-        .is_some_and(|key| key.method != KeyMethod::None)
+        .is_some_and(|key| !matches!(key.method, KeyMethod::None | KeyMethod::AES128))
     {
         return Err(MusicStreamError::Unsupported(
-            "encrypted HLS segments are not supported yet".to_owned(),
+            "HLS encryption method is not supported".to_owned(),
         ));
     }
     if after_first && segment.discontinuity {
@@ -437,6 +460,146 @@ impl HlsByteRange {
 struct InitializationMap {
     url: reqwest::Url,
     range: Option<HlsByteRange>,
+}
+
+struct Aes128KeyCache {
+    url: reqwest::Url,
+    key: [u8; AES128_KEY_BYTES],
+}
+
+#[derive(Clone, Copy)]
+struct Aes128Encryption {
+    key: [u8; AES128_KEY_BYTES],
+    iv: [u8; AES128_KEY_BYTES],
+}
+
+async fn resolve_aes128_encryption(
+    http: &HlsHttp<'_>,
+    media_url: &reqwest::Url,
+    key: Option<&Key>,
+    media_sequence: u64,
+    initialization: bool,
+    cache: &mut Option<Aes128KeyCache>,
+) -> Result<Option<Aes128Encryption>> {
+    let Some(key) = key else {
+        *cache = None;
+        return Ok(None);
+    };
+    match key.method {
+        KeyMethod::None => {
+            *cache = None;
+            return Ok(None);
+        }
+        KeyMethod::AES128 => {}
+        KeyMethod::SampleAES | KeyMethod::Other(_) => {
+            return Err(MusicStreamError::Unsupported(
+                "HLS encryption method is not supported".to_owned(),
+            ));
+        }
+    }
+    if key
+        .keyformat
+        .as_deref()
+        .is_some_and(|format| !format.eq_ignore_ascii_case("identity"))
+        || key
+            .keyformatversions
+            .as_deref()
+            .is_some_and(|versions| versions.split('/').any(|version| version.trim() != "1"))
+    {
+        return Err(MusicStreamError::Unsupported(
+            "HLS AES-128 requires the identity key format version 1".to_owned(),
+        ));
+    }
+    let iv = match key.iv.as_deref() {
+        Some(iv) => parse_aes128_iv(iv)?,
+        None if initialization => {
+            return Err(MusicStreamError::InvalidSource(
+                "encrypted HLS initialization map requires an explicit IV".to_owned(),
+            ));
+        }
+        None => sequence_iv(media_sequence),
+    };
+    let key_uri = key.uri.as_deref().ok_or_else(|| {
+        MusicStreamError::InvalidSource("HLS AES-128 key requires a URI".to_owned())
+    })?;
+    let key_url = media_url.join(key_uri).map_err(|error| {
+        MusicStreamError::InvalidSource(format!("invalid HLS key URL: {error}"))
+    })?;
+    if cache.as_ref().is_none_or(|cached| cached.url != key_url) {
+        let response = http
+            .fetch(key_url.clone(), http.config.idle_timeout, AES128_KEY_BYTES)
+            .await?;
+        if response.bytes.len() != AES128_KEY_BYTES {
+            return Err(MusicStreamError::InvalidSource(
+                "HLS AES-128 key must contain exactly 16 bytes".to_owned(),
+            ));
+        }
+        let mut bytes = [0_u8; AES128_KEY_BYTES];
+        bytes.copy_from_slice(&response.bytes);
+        *cache = Some(Aes128KeyCache {
+            url: key_url,
+            key: bytes,
+        });
+        metrics::counter!("music_stream.source.hls_keys").increment(1);
+    }
+    let cached = cache
+        .as_ref()
+        .ok_or_else(|| MusicStreamError::Internal("HLS AES-128 key cache is empty".to_owned()))?;
+    Ok(Some(Aes128Encryption {
+        key: cached.key,
+        iv,
+    }))
+}
+
+fn parse_aes128_iv(value: &str) -> Result<[u8; AES128_KEY_BYTES]> {
+    let digits = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .ok_or_else(|| {
+            MusicStreamError::InvalidSource("HLS AES-128 IV must start with 0x".to_owned())
+        })?;
+    if digits.is_empty()
+        || digits.len() > 32
+        || !digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(MusicStreamError::InvalidSource(
+            "HLS AES-128 IV must contain 1 to 32 hexadecimal digits".to_owned(),
+        ));
+    }
+    u128::from_str_radix(digits, 16)
+        .map(u128::to_be_bytes)
+        .map_err(|_| MusicStreamError::InvalidSource("invalid HLS AES-128 IV".to_owned()))
+}
+
+fn sequence_iv(media_sequence: u64) -> [u8; AES128_KEY_BYTES] {
+    let mut iv = [0_u8; AES128_KEY_BYTES];
+    iv[8..].copy_from_slice(&media_sequence.to_be_bytes());
+    iv
+}
+
+fn decrypt_hls_bytes(bytes: &mut Vec<u8>, encryption: Option<Aes128Encryption>) -> Result<()> {
+    let Some(encryption) = encryption else {
+        return Ok(());
+    };
+    if bytes.is_empty() || !bytes.len().is_multiple_of(AES128_KEY_BYTES) {
+        return Err(MusicStreamError::DecodeError(
+            "HLS AES-128 ciphertext is not block-aligned".to_owned(),
+        ));
+    }
+    let plaintext_len =
+        cbc::Decryptor::<aes::Aes128>::new(&encryption.key.into(), &encryption.iv.into())
+            .decrypt_padded::<Pkcs7>(bytes)
+            .map_err(|_| {
+                MusicStreamError::DecodeError("HLS AES-128 padding is invalid".to_owned())
+            })?
+            .len();
+    if plaintext_len == 0 {
+        return Err(MusicStreamError::DecodeError(
+            "HLS AES-128 segment decrypted to an empty body".to_owned(),
+        ));
+    }
+    bytes.truncate(plaintext_len);
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -966,6 +1129,7 @@ fn content_range_matches(value: &str, expected: HlsByteRange) -> bool {
 mod tests {
     use std::io::Read as _;
 
+    use aes::cipher::BlockModeEncrypt as _;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpListener;
 
@@ -1016,7 +1180,7 @@ mod tests {
             playlist.segments[1].key.as_ref().map(|key| &key.method),
             Some(&KeyMethod::AES128)
         );
-        assert!(validate_segment(&playlist.segments[1], true).is_err());
+        validate_segment(&playlist.segments[1], true).expect("AES-128 segment");
     }
 
     #[test]
@@ -1069,6 +1233,23 @@ mod tests {
         let mut reversed = make_iso_box(*b"mdat", b"media");
         reversed.extend(make_iso_box(*b"moof", b"samples"));
         assert!(validate_fmp4_fragment(&reversed).is_err());
+    }
+
+    #[test]
+    fn aes128_iv_and_in_place_decryption_follow_hls_rules() {
+        let key = [0x42; AES128_KEY_BYTES];
+        let explicit = parse_aes128_iv("0x1234").expect("explicit IV");
+        assert_eq!(explicit[14..], [0x12, 0x34]);
+        assert_eq!(sequence_iv(7)[8..], 7_u64.to_be_bytes());
+
+        let plaintext = b"bounded encrypted HLS segment";
+        let mut ciphertext = encrypt_test_aes128(plaintext, key, explicit);
+        decrypt_hls_bytes(
+            &mut ciphertext,
+            Some(Aes128Encryption { key, iv: explicit }),
+        )
+        .expect("decrypt");
+        assert_eq!(ciphertext, plaintext);
     }
 
     #[tokio::test]
@@ -1149,22 +1330,29 @@ mod tests {
         let mut fragment = make_iso_box(*b"styp", b"msdh");
         fragment.extend(make_iso_box(*b"moof", b"samples"));
         fragment.extend(make_iso_box(*b"mdat", b"media"));
-        let mut resource = initialization.clone();
-        resource.extend_from_slice(&fragment);
-        resource.extend_from_slice(&fragment);
+        let key = [0x11; AES128_KEY_BYTES];
+        let iv = [0x12; AES128_KEY_BYTES];
+        let encrypted_initialization = encrypt_test_aes128(&initialization, key, iv);
+        let encrypted_fragment = encrypt_test_aes128(&fragment, key, iv);
+        let mut resource = encrypted_initialization.clone();
+        resource.extend_from_slice(&encrypted_fragment);
+        resource.extend_from_slice(&encrypted_fragment);
         let playlist = format!(
-            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:1\n#EXT-X-MAP:URI=\"media.mp4\",BYTERANGE=\"{}@0\"\n#EXTINF:1,\n#EXT-X-BYTERANGE:{}@{}\nmedia.mp4\n#EXTINF:1,\n#EXT-X-BYTERANGE:{}\nmedia.mp4\n#EXT-X-ENDLIST\n",
-            initialization.len(),
-            fragment.len(),
-            initialization.len(),
-            fragment.len(),
+            "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:1\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\",IV=0x12121212121212121212121212121212\n#EXT-X-MAP:URI=\"media.mp4\",BYTERANGE=\"{}@0\"\n#EXTINF:1,\n#EXT-X-BYTERANGE:{}@{}\nmedia.mp4\n#EXTINF:1,\n#EXT-X-BYTERANGE:{}\nmedia.mp4\n#EXT-X-ENDLIST\n",
+            encrypted_initialization.len(),
+            encrypted_fragment.len(),
+            encrypted_initialization.len(),
+            encrypted_fragment.len(),
         )
         .into_bytes();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address");
-        let expected = resource.clone();
+        let encrypted_bytes = resource.len();
+        let mut expected = initialization;
+        expected.extend_from_slice(&fragment);
+        expected.extend_from_slice(&fragment);
         let server = tokio::spawn(async move {
-            for _ in 0..4 {
+            for _ in 0..5 {
                 let (mut socket, _) = listener.accept().await.expect("accept");
                 let mut request = [0_u8; 1024];
                 let read = socket.read(&mut request).await.expect("request");
@@ -1176,6 +1364,13 @@ mod tests {
                     );
                     socket.write_all(headers.as_bytes()).await.expect("headers");
                     socket.write_all(&playlist).await.expect("playlist");
+                } else if request.starts_with("GET /key.bin ") {
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        key.len()
+                    );
+                    socket.write_all(headers.as_bytes()).await.expect("headers");
+                    socket.write_all(&key).await.expect("key");
                 } else {
                     assert!(request.starts_with("GET /media.mp4 "));
                     let request = request.to_ascii_lowercase();
@@ -1226,9 +1421,97 @@ mod tests {
 
         let report = task.await.expect("HLS task").expect("HLS result");
         assert!(report.completed);
-        assert_eq!(report.bytes_read, expected.len() as u64);
+        assert_eq!(report.bytes_read, encrypted_bytes as u64);
         assert_eq!(reader_task.await.expect("reader task"), expected);
         server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn hls_stream_decrypts_inherited_aes128_key_with_sequence_ivs() {
+        let elementary = b"\xff\xf1\x50\x80\x00\x1f\xfcAAC";
+        let segment = make_test_ts(elementary);
+        let key = [0x24; AES128_KEY_BYTES];
+        let first = encrypt_test_aes128(&segment, key, sequence_iv(7));
+        let second = encrypt_test_aes128(&segment, key, sequence_iv(8));
+        let encrypted_bytes = first.len() + second.len();
+        let playlist = b"#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:7\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:1,\nfirst.ts\n#EXTINF:1,\nsecond.ts\n#EXT-X-ENDLIST\n";
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut request = [0_u8; 1024];
+                let read = socket.read(&mut request).await.expect("request");
+                let request = String::from_utf8_lossy(&request[..read]);
+                let body: &[u8] = if request.starts_with("GET /key.bin ") {
+                    &key
+                } else if request.starts_with("GET /first.ts ") {
+                    &first
+                } else if request.starts_with("GET /second.ts ") {
+                    &second
+                } else {
+                    assert!(request.starts_with("GET /playlist.m3u8 "));
+                    playlist
+                };
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket.write_all(headers.as_bytes()).await.expect("headers");
+                socket.write_all(body).await.expect("body");
+            }
+        });
+        let source = TrackSource {
+            id: "aes128-hls-test".to_owned(),
+            kind: crate::model::TrackKind::Url,
+            url: Some(format!("http://{address}/playlist.m3u8")),
+            path: None,
+            format_hint: None,
+            seekable: Some(true),
+            headers: BTreeMap::new(),
+        };
+        let stream = spawn_http_hls_stream(
+            &source,
+            HttpLiveStreamConfig {
+                max_buffered_bytes: 32,
+                ..HttpLiveStreamConfig::default()
+            },
+            LiveByteBudget::new(1024).expect("budget"),
+        )
+        .expect("HLS stream");
+        let HttpLiveStream {
+            mut reader, task, ..
+        } = stream;
+        let reader_task = tokio::task::spawn_blocking(move || {
+            let mut output = Vec::new();
+            reader.read_to_end(&mut output).expect("read HLS bytes");
+            output
+        });
+
+        let report = task.await.expect("HLS task").expect("HLS result");
+        let mut expected = elementary.to_vec();
+        expected.extend_from_slice(elementary);
+        assert!(report.completed);
+        assert_eq!(report.bytes_read, encrypted_bytes as u64);
+        assert_eq!(reader_task.await.expect("reader task"), expected);
+        server.await.expect("server");
+    }
+
+    fn encrypt_test_aes128(
+        plaintext: &[u8],
+        key: [u8; AES128_KEY_BYTES],
+        iv: [u8; AES128_KEY_BYTES],
+    ) -> Vec<u8> {
+        let padded_len = plaintext.len().div_ceil(AES128_KEY_BYTES) * AES128_KEY_BYTES
+            + usize::from(plaintext.len().is_multiple_of(AES128_KEY_BYTES)) * AES128_KEY_BYTES;
+        let mut output = vec![0_u8; padded_len];
+        output[..plaintext.len()].copy_from_slice(plaintext);
+        let encrypted_len = cbc::Encryptor::<aes::Aes128>::new(&key.into(), &iv.into())
+            .encrypt_padded::<Pkcs7>(&mut output, plaintext.len())
+            .expect("encrypt test segment")
+            .len();
+        output.truncate(encrypted_len);
+        output
     }
 
     fn make_iso_box(box_type: [u8; 4], payload: &[u8]) -> Vec<u8> {

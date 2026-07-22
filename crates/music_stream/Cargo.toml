@@ -10,7 +10,9 @@ publish = false
 workspace = true
 
 [dependencies]
+aes.workspace = true
 bytes.workspace = true
+cbc.workspace = true
 lru.workspace = true
 m3u8-rs.workspace = true
 metrics.workspace = true

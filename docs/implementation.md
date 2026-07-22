@@ -128,8 +128,11 @@ Symphonia 的 non-seekable fragmented-MP4 demux。playlist 解析后线性继承
 byte-range offset；range 请求必须返回匹配的 206、`Content-Range` 和精确长度，服务端忽略或错返
 range 时 fail closed。init map 改变仍要求新的 media generation。
 
-当前不支持 encrypted segment、midstream discontinuity、codec 切换和 LL-HLS partial segment；
-这些输入返回明确的 `UNSUPPORTED`，不会退化成模糊 decoder 错误。
+标准 `METHOD=AES-128` 使用 identity key format：16-byte key 经同一有界 HTTP 路径获取并按 key URL
+缓存，显式 IV 最多 128 bit且左侧补零，缺省 segment IV 由 media sequence生成；加密 init map按规范
+必须给显式 IV。CBC/PKCS#7 在原 segment allocation 内解密，padding、block alignment、key长度或
+key format不符都 fail closed。当前不支持 SAMPLE-AES/DRM、midstream discontinuity、codec切换和
+LL-HLS partial segment。
 
 ## 音频管线
 
