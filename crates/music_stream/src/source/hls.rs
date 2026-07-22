@@ -10,7 +10,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{MusicStreamError, Result};
-use crate::model::TrackSource;
+use crate::model::{NetworkPolicy, TrackSource, validate_network_url};
 
 use super::live::{
     HttpLiveStream, HttpLiveStreamConfig, HttpLiveStreamReport, LiveByteBudget,
@@ -43,6 +43,7 @@ pub(crate) fn spawn_http_hls_stream(
     let url = reqwest::Url::parse(url)
         .map_err(|error| MusicStreamError::InvalidSource(format!("invalid HLS URL: {error}")))?;
     let headers = source.headers.clone();
+    let network_policy = source.network_policy.clone();
     let client = http_client_for(source);
     let (writer, reader) =
         StreamingByteReader::with_global_budget(config.max_buffered_bytes, global_byte_budget)?;
@@ -52,6 +53,7 @@ pub(crate) fn spawn_http_hls_stream(
         let result = run_http_hls_stream(
             url,
             headers,
+            network_policy,
             client,
             config,
             writer.clone(),
@@ -73,6 +75,7 @@ pub(crate) fn spawn_http_hls_stream(
 async fn run_http_hls_stream(
     url: reqwest::Url,
     headers: BTreeMap<String, String>,
+    network_policy: NetworkPolicy,
     client: reqwest::Client,
     config: HttpLiveStreamConfig,
     writer: StreamingByteWriter,
@@ -82,6 +85,7 @@ async fn run_http_hls_stream(
     let http = HlsHttp {
         client: &client,
         headers: &headers,
+        network_policy: &network_policy,
         config: &config,
         cancellation: &cancellation,
         byte_budget: &byte_budget,
@@ -988,6 +992,7 @@ fn detect_elementary_kind(bytes: &[u8]) -> Option<HlsAudioKind> {
 struct HlsHttp<'a> {
     client: &'a reqwest::Client,
     headers: &'a BTreeMap<String, String>,
+    network_policy: &'a NetworkPolicy,
     config: &'a HttpLiveStreamConfig,
     cancellation: &'a CancellationToken,
     byte_budget: &'a LiveByteBudget,
@@ -1010,6 +1015,7 @@ impl HlsHttp<'_> {
         max_bytes: usize,
         range: Option<HlsByteRange>,
     ) -> Result<BudgetedResponse> {
+        validate_network_url(self.network_policy, &url)?;
         let mut attempt = 0;
         loop {
             match self
@@ -1416,6 +1422,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn public_only_policy_is_applied_to_every_hls_request() {
+        let client = reqwest::Client::new();
+        let headers = BTreeMap::new();
+        let network_policy = NetworkPolicy::PublicOnly;
+        let config = HttpLiveStreamConfig::default();
+        let cancellation = CancellationToken::new();
+        let byte_budget = LiveByteBudget::new(1024).expect("budget");
+        let http = HlsHttp {
+            client: &client,
+            headers: &headers,
+            network_policy: &network_policy,
+            config: &config,
+            cancellation: &cancellation,
+            byte_budget: &byte_budget,
+        };
+
+        for url in [
+            "http://example.com/segment.ts",
+            "https://127.0.0.1/segment.ts",
+            "https://example.com:8443/key.bin",
+            "file:///etc/passwd",
+        ] {
+            let error = http
+                .fetch(
+                    reqwest::Url::parse(url).expect("URL fixture"),
+                    Duration::from_millis(10),
+                    1024,
+                )
+                .await
+                .expect_err("unsafe HLS child URL must be rejected");
+            assert_eq!(error.code(), crate::ErrorCode::InvalidSource, "{url}");
+        }
+    }
+
+    #[tokio::test]
     async fn hls_stream_fetches_playlist_and_delivers_ts_audio() {
         let elementary = b"\xff\xf1\x50\x80\x00\x1f\xfcAAC";
         let segment = make_test_ts(elementary);
@@ -1429,6 +1470,11 @@ mod tests {
                 let mut request = [0_u8; 1024];
                 let read = socket.read(&mut request).await.expect("request");
                 let request = String::from_utf8_lossy(&request[..read]);
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("x-provider-token: trusted")
+                );
                 if request.starts_with("GET /playlist.m3u8 ") {
                     socket
                         .write_all(
@@ -1459,7 +1505,7 @@ mod tests {
             path: None,
             format_hint: None,
             seekable: Some(true),
-            headers: BTreeMap::new(),
+            headers: BTreeMap::from([("x-provider-token".to_owned(), "trusted".to_owned())]),
             network_policy: crate::model::NetworkPolicy::Provider,
         };
         let stream = spawn_http_hls_stream(

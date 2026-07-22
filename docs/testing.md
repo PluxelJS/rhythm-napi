@@ -87,6 +87,83 @@ callback/补偿队列、鉴权刷新信号、批量 status、ReplayGain 和 shut
 PCM）为：fake encoder 约 176 µs，libopus pipeline 约 39.1 ms，约 128 倍实时速度。该数字说明当前
 样本中主要 CPU 成本位于 libopus，但不能直接推导生产并发容量。
 
+`criterion_media`把确定性真实fixture拆成decode和完整pipeline，并独立测量44.1→48 kHz Rubato与
+非静音Opus。2026-07-22同一开发机的初始中位数为：
+
+| 阶段/fixture | 媒体时长 | 运行时间 | 约实时倍数 |
+| --- | ---: | ---: | ---: |
+| Rubato mono 44.1→stereo 48 kHz | 5 s | 22.2 ms | 225x |
+| Opus stereo 48 kHz complexity 10 | 5 s | 35.1 ms | 142x |
+| MP3完整pipeline | 0.25 s | 5.07 ms | 49x |
+| FLAC完整pipeline | 0.20 s | 3.98 ms | 50x |
+| Vorbis完整pipeline | 0.25 s | 5.58 ms | 45x |
+| ALAC/M4A完整pipeline | 0.20 s | 4.09 ms | 49x |
+| AAC/M4A完整pipeline | 0.50 s | 8.20 ms | 61x |
+
+fixture很短且命中OS page cache，只适合检测代码级回归。保存优化前基线并让Criterion统计比较：
+
+```sh
+cargo bench --bench criterion_media -- --save-baseline before
+# 修改后
+cargo bench --bench criterion_media -- --baseline before
+```
+
+结果显示生产常见44.1 kHz输入不能只看Opus：Rubato也是主要CPU阶段；下一步优化应按真实曲库的
+格式占比和并发尾延迟排序。
+
+音乐播放采用质量优先基线：Opus complexity固定为10，Rubato默认质量参数不因吞吐测试下调。
+benchmark用于寻找等质量实现中的CPU、复制和allocation浪费，不用于论证降低编码或重采样质量。
+
+`allocation_profile`用release构建直接统计每次workload的allocation次数和申请字节，不测耗时：
+
+```sh
+cargo bench --bench allocation_profile
+```
+
+2026-07-22的5秒基线中，Rubato是527次/574462 bytes，Opus是250次/80570 bytes；Opus恰好每个
+20 ms frame产生一次payload allocation，但总量只有约16 KiB/s。短fixture的完整pipeline为
+568至2280次allocation，其中Vorbis的高值主要来自open/init（open并drain为1737次，预先open后的
+steady drain只有4次），不能把每首歌冷启动成本误判成持续decode热点。基于这组证据，暂不增加
+Opus payload pool；先用长时间多路运行确认allocator或RSS确实构成压力。若要定位Rubato内部
+callsite，应使用保留debug symbol的profiling构建，strip后的Massif `UnknownFn`不能支持代码改动。
+
+### 多路质量 soak
+
+N-API runner固定使用Opus complexity 10、128 kbps和现有高质量Rubato配置，循环播放确定性的
+44.1 kHz stereo非静音fixture，并持续补充next来覆盖promotion：
+
+```sh
+cd crates/music_stream_napi
+npm run soak -- --streams 10 --duration-seconds 1800 --sample-seconds 2 --fixture-seconds 5
+npm run soak -- --streams 50 --duration-seconds 7200 --sample-seconds 2 --fixture-seconds 5
+```
+
+runner输出JSONL：
+
+- `sample`中的packet/byte、underrun、drop和recovery是相邻diagnostics样本的差值；首个样本没有
+  previous，因而这些差值为0；
+- `bufferedMs`给出所有当前可观测stream的min/p50/p95/max；promotion或sender尚未发布首份progress
+  时，个别stream可短暂计入`missingDiagnostics`，持续缺失才表示异常；
+- `playStates`、`currentTracks`和`nextTracks`揭示actor层跨曲空档；`rtpPacketCoverageRatio`把实收RTP
+  与每路每秒50个20 ms packet的基线比较，用来发现underrun计数覆盖不到的无current/next时段；
+- `sinkRtp*`只统计音频RTP，`sinkRtcp*`统计mux到同一socket的RTCP，前者可与sender的
+  `packetsSent`交叉检查；
+- `summary`给出sender生命周期累计计数、RSS/heap基线与峰值、全程最大event-loop delay及
+  diagnostics缺失样本数，适合直接比较不同commit；
+- runtime error会使进程非零退出；underrun、drop或RSS增长不会被runner用任意阈值自动隐藏或判定，
+  应结合运行时长、机器和基线判断。
+
+runner在每次sample时补充next，因此`sample-seconds`不得大于`fixture-seconds`的一半，否则测试工具
+自身会制造跨曲空档；无效组合会直接拒绝。覆盖率仍可能包含低频RTP keepalive，应结合play state和
+current/next计数判断，不能把它单独当作音质分数。
+
+短基线（同一开发机release构建）中，10路/15秒为0 underrun、0 drop、0 recovery，最大lateness
+4 ms。修正runner对无效采样周期的接受后，50路/60秒有效基线的RTP packet覆盖率为1.000，持续
+50路playing，0 underrun/drop/recovery/error，最大lateness 8 ms；RSS从启动前62.5 MiB、首样本
+103.5 MiB增长到峰值137.6 MiB，增长速度已放缓但一分钟不足以证明平台期。5秒fixture刻意放大
+decoder冷启动和promotion频率；allocator稳定性至少需要30至120分钟运行，格式/容器质量与长曲
+切换仍必须使用生产corpus验证，不能由循环WAV fixture替代。
+
 任何性能改动至少同时记录：
 
 - activation-to-prebuffer；

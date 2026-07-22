@@ -19,6 +19,22 @@ type _PlayStateContract = Assert<Equal<
   StreamStatusOutput['playState'],
   'idle' | 'buffering' | 'playing' | 'paused' | 'stopped'
 >>
+type _PlayoutDiagnosticsContract = Assert<Equal<
+  StreamStatusOutput['playoutDiagnostics'],
+  | {
+    bufferedMs: number
+    packetsSent: number
+    bytesSent: number
+    droppedFrames: number
+    droppedMediaMs: number
+    latencyRecoveries: number
+    underruns: number
+    maxLatenessMs: number
+    sequence: number
+    rtpTimestamp: number
+  }
+  | undefined
+>>
 type _ReplayGainModeContract = Assert<Equal<
   ReplayGainInput['mode'],
   'track' | 'album' | undefined

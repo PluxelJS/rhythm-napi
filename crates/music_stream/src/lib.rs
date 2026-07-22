@@ -22,6 +22,15 @@ pub use audio::dsp::{
 pub use audio::frame::{OpusFrame, PcmFrame};
 pub use audio::opus::{LibOpusEncoder, LibOpusEncoderConfig, OpusEncoderBackend};
 pub use audio::pipeline::{PipelineConfig, PlayoutPipeline, WorkerTurnReport};
+// Internal benchmark support. These types remain hidden from generated documentation and are not
+// part of the N-API contract, but exporting the production implementations prevents benchmarks
+// from drifting into duplicate codec/resampler code.
+#[doc(hidden)]
+pub use audio::AudioFormat;
+#[doc(hidden)]
+pub use audio::decode::SymphoniaFileDecoder;
+#[doc(hidden)]
+pub use audio::resample::{RubatoResamplerConfig, RubatoResamplingDecoder};
 pub use error::{ErrorCode, MusicStreamError, Result};
 pub use event::{SourceRole, StreamEvent};
 pub use model::{

@@ -383,6 +383,7 @@ async fn run_sender(
     let mut dropped_frames = 0_u64;
     let mut dropped_media_ms = 0_u64;
     let mut latency_recoveries = 0_u64;
+    let mut underruns = 0_u64;
     let mut max_lateness_ms = 0_u64;
     let mut receiver_reports = 0_usize;
     let mut latest_receiver_report = None;
@@ -547,7 +548,15 @@ async fn run_sender(
                     metrics::counter!("music_stream.runtime.latency_recoveries").increment(1);
                 }
                 let Some(mut frame) = media.receiver.try_recv() else {
+                    underruns = underruns.saturating_add(1);
                     metrics::counter!("music_stream.runtime.underruns").increment(1);
+                    progress_tx.send_modify(|progress| {
+                        if progress.generation == media.generation {
+                            progress.underruns = underruns;
+                            progress.buffered_ms = media.receiver.buffered_ms();
+                            progress.max_lateness_ms = max_lateness_ms;
+                        }
+                    });
                     media.started = false;
                     media.first_packet = true;
                     media.deadline = None;
@@ -599,6 +608,8 @@ async fn run_sender(
                                 dropped_frames,
                                 dropped_media_ms,
                                 latency_recoveries,
+                                underruns,
+                                buffered_ms: media.receiver.buffered_ms(),
                                 max_lateness_ms,
                                 sequence,
                                 rtp_timestamp: rtp_clock.timestamp(),
@@ -741,6 +752,8 @@ async fn run_sender(
                             dropped_frames,
                             dropped_media_ms,
                             latency_recoveries,
+                            underruns,
+                            buffered_ms: media.receiver.buffered_ms(),
                             max_lateness_ms,
                             sequence,
                             rtp_timestamp: rtp_clock.timestamp(),
@@ -1094,6 +1107,62 @@ mod tests {
         assert_eq!(progress.dropped_media_ms, progress.dropped_frames * 20);
         assert_eq!(progress.latency_recoveries, 1);
 
+        sender.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn underrun_is_published_without_waiting_for_a_recovery_packet() {
+        let remote = UdpSocket::bind("127.0.0.1:0").await.expect("remote");
+        let mut config = RtpTransportConfig::new(
+            "127.0.0.1",
+            remote.local_addr().expect("remote address").port(),
+            79,
+        );
+        config.local_ip = "127.0.0.1".to_owned();
+        let (events, _event_rx) = mpsc::channel(4);
+        let sender = SenderHandle::spawn(config, 20, 100, Duration::from_secs(60), events)
+            .await
+            .expect("sender");
+        let (output, receiver) = opus_queue::bounded(400);
+        let cancellation = CancellationToken::new();
+        output
+            .send_blocking(
+                OpusFrame {
+                    generation: 1,
+                    payload: Bytes::from_static(b"opus"),
+                    samples_per_channel: 960,
+                    duration_ms: 20,
+                    marker: false,
+                    track_position_samples: 0,
+                },
+                &cancellation,
+            )
+            .expect("queue frame");
+        sender
+            .activate(1, 0, false, receiver)
+            .await
+            .expect("activate");
+
+        let mut packet = [0_u8; 1_500];
+        tokio::time::timeout(Duration::from_secs(1), remote.recv(&mut packet))
+            .await
+            .expect("RTP timeout")
+            .expect("RTP receive");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if sender.progress().underruns > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("underrun progress timeout");
+
+        let progress = sender.progress();
+        assert_eq!(progress.underruns, 1);
+        assert_eq!(progress.buffered_ms, 0);
+        drop(output);
         sender.shutdown().await.expect("shutdown");
     }
 }

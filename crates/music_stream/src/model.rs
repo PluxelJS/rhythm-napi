@@ -55,17 +55,16 @@ impl TrackSource {
                         "URL and live sources require url".to_owned(),
                     ));
                 };
-                if url.len() > MAX_SOURCE_LOCATION_BYTES
-                    || !(url.starts_with("http://") || url.starts_with("https://"))
-                {
+                if url.len() > MAX_SOURCE_LOCATION_BYTES {
                     return Err(crate::MusicStreamError::InvalidSource(
                         "URL and live sources require an HTTP(S) URL no longer than 16 KiB"
                             .to_owned(),
                     ));
                 }
-                if self.network_policy == NetworkPolicy::PublicOnly {
-                    validate_public_url(url)?;
-                }
+                let url = reqwest::Url::parse(url).map_err(|error| {
+                    crate::MusicStreamError::InvalidSource(format!("invalid source URL: {error}"))
+                })?;
+                validate_network_url(&self.network_policy, &url)?;
             }
             TrackKind::File => {}
         }
@@ -148,15 +147,22 @@ impl TrackSource {
     }
 }
 
-fn validate_public_url(value: &str) -> crate::Result<()> {
-    let url = reqwest::Url::parse(value).map_err(|error| {
-        crate::MusicStreamError::InvalidSource(format!("invalid public URL: {error}"))
-    })?;
+pub(crate) fn validate_network_url(
+    policy: &NetworkPolicy,
+    url: &reqwest::Url,
+) -> crate::Result<()> {
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(crate::MusicStreamError::InvalidSource(
+            "media requests require an absolute HTTP(S) URL".to_owned(),
+        ));
+    }
+    if *policy == NetworkPolicy::Provider {
+        return Ok(());
+    }
     if url.scheme() != "https"
         || url.username() != ""
         || url.password().is_some()
         || url.port().is_some()
-        || url.host_str().is_none()
     {
         return Err(crate::MusicStreamError::InvalidSource(
             "public-only sources require an HTTPS URL on the default port without credentials"
@@ -217,6 +223,11 @@ fn validate_source_headers(source: &TrackSource) -> crate::Result<()> {
     if source.kind == TrackKind::File && !source.headers.is_empty() {
         return Err(crate::MusicStreamError::InvalidSource(
             "file sources cannot contain HTTP headers".to_owned(),
+        ));
+    }
+    if source.network_policy == NetworkPolicy::PublicOnly && !source.headers.is_empty() {
+        return Err(crate::MusicStreamError::InvalidSource(
+            "public-only sources cannot contain custom HTTP headers".to_owned(),
         ));
     }
     if source.headers.len() > MAX_HEADERS
@@ -480,6 +491,15 @@ mod tests {
                 "unexpected public target: {url}"
             );
         }
+
+        public.url = Some("https://1.1.1.1/live".to_owned());
+        public
+            .headers
+            .insert("authorization".to_owned(), "Bearer secret".to_owned());
+        let error = public
+            .validate()
+            .expect_err("public-only headers must be rejected");
+        assert!(error.to_string().contains("custom HTTP headers"));
     }
 
     #[test]

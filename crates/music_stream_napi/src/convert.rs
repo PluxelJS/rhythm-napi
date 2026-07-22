@@ -96,8 +96,24 @@ pub(crate) fn runtime_resource_limits_from_input(
 impl StreamStatusOutput {
     pub(crate) fn apply_progress(&mut self, progress: StreamRuntimeProgress) {
         self.time_played_ms = i64::try_from(progress.stream_position_ms()).unwrap_or(i64::MAX);
+        self.playout_diagnostics = Some(PlayoutDiagnosticsOutput {
+            buffered_ms: saturating_i64(progress.buffered_ms),
+            packets_sent: saturating_i64(progress.packets_sent),
+            bytes_sent: saturating_i64(progress.bytes_sent),
+            dropped_frames: saturating_i64(progress.dropped_frames),
+            dropped_media_ms: saturating_i64(progress.dropped_media_ms),
+            latency_recoveries: saturating_i64(progress.latency_recoveries),
+            underruns: saturating_i64(progress.underruns),
+            max_lateness_ms: saturating_i64(progress.max_lateness_ms),
+            sequence: u32::from(progress.sequence),
+            rtp_timestamp: progress.rtp_timestamp,
+        });
         self.receiver_report = progress.latest_receiver_report.map(Into::into);
     }
+}
+
+fn saturating_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 pub(crate) fn default_napi_source_config() -> SourceResolverConfig {
@@ -305,6 +321,7 @@ impl From<music_stream::StreamStatus> for StreamStatusOutput {
             generation: value.generation as i64,
             volume: f64::from(value.volume.as_unit()),
             gain_db: f64::from(value.gain.as_db()),
+            playout_diagnostics: None,
             receiver_report: None,
         }
     }

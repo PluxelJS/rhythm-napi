@@ -38,3 +38,11 @@ ogg = "0.9.2"
 [[bench]]
 name = "criterion_pipeline"
 harness = false
+
+[[bench]]
+name = "criterion_media"
+harness = false
+
+[[bench]]
+name = "allocation_profile"
+harness = false

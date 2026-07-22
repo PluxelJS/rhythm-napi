@@ -40,6 +40,28 @@ test('source and transport policies reject invalid limits synchronously', () => 
   })).toThrow(/transport|invalid/i)
 })
 
+test('public-only sources reject custom headers at the N-API boundary', async () => {
+  const socket = await createBoundUdpSocket()
+  const streamer = new Streamer()
+
+  try {
+    await expect(streamer.startStream({
+      streamId: `public-headers-${Date.now()}`,
+      current: {
+        id: 'untrusted-authenticated-url',
+        kind: 'live',
+        url: 'https://1.1.1.1/live.mp3',
+        headers: { authorization: 'Bearer secret' },
+        networkPolicy: 'public-only',
+      },
+      transport: rtpTransport(socket, 0x33445566),
+    })).rejects.toThrow(/INVALID_SOURCE.*custom HTTP headers/i)
+  } finally {
+    await streamer.shutdown()
+    await closeSocket(socket)
+  }
+})
+
 test('HTTP authorization failure is reported asynchronously', async () => {
   const server = await createHttpStatusServerWorker(403)
   const socket = await createBoundUdpSocket()

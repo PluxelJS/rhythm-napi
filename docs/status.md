@@ -46,12 +46,15 @@
 
 后续优化按生产 corpus 和分阶段 profile 排序，而不是默认从手写 SIMD 开始：
 
-- 为 MP3、AAC、FLAC、M4A/MP4 分别建立 decode、resample、DSP、Opus 和 allocation 基线；
+- 已用确定性短fixture建立MP3、AAC、FLAC、Vorbis、ALAC的decode/完整pipeline及独立Rubato/Opus
+  Criterion基线，并建立分离open/drain的allocation基线；继续补生产长音频和DSP profile；
 - 验证 fast-start M4A/MP4 的安全渐进 probe，并在容器索引、Range 语义和响应身份可证明时再扩展；
-- 比较 Opus complexity 10/8/6/5 的 CPU、音质、sender lateness 和并发尾延迟，再决定是否暴露配置；
-- 对真实 44.1 kHz 曲库比较 Rubato sinc 参数的 CPU/音质，不以合成吞吐单独改变默认质量；
+- Opus complexity固定为最高质量档10，不为提高并发降低编码复杂度或暴露降质配置；
+- 用真实44.1 kHz曲库验证Rubato频响、失真和稳定性；性能结果只能推动等质量实现优化，不能单独
+  下调sinc质量参数；
 - profile 证明必要后再增加 Opus payload pool、更多 PCM buffer 复用和 gain/downmix/limiter SIMD；
-- 用 10/50 路长时间运行验证 allocator 压力、RSS、underrun、取消时间和 Node event-loop delay。
+- 已有固定最高质量配置的10/50路N-API soak runner及短基线；继续运行30至120分钟，验证allocator
+  压力、RSS趋势、underrun、取消时间和Node event-loop delay。
 
 这些优化不得重新引入第二层 queue、跨 sender payload 复制或更差的取消语义。
 

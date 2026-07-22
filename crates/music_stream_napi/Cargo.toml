@@ -23,5 +23,6 @@ tokio.workspace = true
 napi-build = "2.2.3"
 
 [dev-dependencies]
-# Rust unit tests run without a Node host, so N-API symbols must use napi-rs' no-op shim.
-napi = { workspace = true, features = ["noop"] }
+# Rust unit tests run without a Node host. Dynamic symbols keep the test binary linkable while the
+# no-op mode prevents registration from requiring a live Node environment.
+napi = { workspace = true, features = ["dyn-symbols", "noop"] }

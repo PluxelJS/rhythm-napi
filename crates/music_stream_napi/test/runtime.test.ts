@@ -54,6 +54,11 @@ test('all lifecycle methods are asynchronous and RTP remains monotonic across sw
     expect(started.current?.id).toBe('first')
     expect(started.current && 'path' in started.current).toBe(false)
     const before = (await firstPacket).message
+    const activeStatus = await streamer.getStatus(streamId)
+    expect(activeStatus.playoutDiagnostics?.packetsSent).toBeGreaterThan(0)
+    expect(activeStatus.playoutDiagnostics?.bytesSent).toBeGreaterThan(0)
+    expect(activeStatus.playoutDiagnostics?.bufferedMs).toBeGreaterThanOrEqual(0)
+    expect(activeStatus.playoutDiagnostics?.underruns).toBeGreaterThanOrEqual(0)
     await expect(streamer.startStream({
       streamId: `${streamId}-overflow`,
       current: { id: 'overflow', kind: 'file', path: firstPath },

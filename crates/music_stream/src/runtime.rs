@@ -243,6 +243,8 @@ pub struct StreamRuntimeProgress {
     pub dropped_frames: u64,
     pub dropped_media_ms: u64,
     pub latency_recoveries: u64,
+    pub underruns: u64,
+    pub buffered_ms: u64,
     pub max_lateness_ms: u64,
     pub sequence: u16,
     pub rtp_timestamp: u32,

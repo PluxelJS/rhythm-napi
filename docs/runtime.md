@@ -191,6 +191,11 @@ loop:
 packet。唯一可播放帧不会因暂时 starve 被丢掉。underrun 后 sender 重新等待 prebuffer，并从新的
 wall-clock base 恢复，不倒退 RTP clock。
 
+sender通过watch保留最新progress。Node查询status时可读取`playoutDiagnostics`：`bufferedMs`是当前
+encoded queue深度，其余packet/byte、underrun、drop和recovery计数在同一persistent sender生命周期
+内累计，switch/seek/promotion不会清零。这样宿主可以对10/50路批量采样，而不在实时循环增加另一条
+事件流。
+
 ## 错误与监督
 
 错误分为三层：

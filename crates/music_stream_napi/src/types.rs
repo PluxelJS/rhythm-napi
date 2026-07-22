@@ -42,7 +42,25 @@ pub struct StreamStatusOutput {
     pub generation: i64,
     pub volume: f64,
     pub gain_db: f64,
+    pub playout_diagnostics: Option<PlayoutDiagnosticsOutput>,
     pub receiver_report: Option<RtcpReceiverReportOutput>,
+}
+
+/// Bounded sender diagnostics. Counters are cumulative for the stream's persistent RTP sender,
+/// including track switches; `bufferedMs` is the latest encoded queue depth.
+#[derive(Clone, Debug)]
+#[napi(object)]
+pub struct PlayoutDiagnosticsOutput {
+    pub buffered_ms: i64,
+    pub packets_sent: i64,
+    pub bytes_sent: i64,
+    pub dropped_frames: i64,
+    pub dropped_media_ms: i64,
+    pub latency_recoveries: i64,
+    pub underruns: i64,
+    pub max_lateness_ms: i64,
+    pub sequence: u32,
+    pub rtp_timestamp: u32,
 }
 
 #[derive(Debug)]

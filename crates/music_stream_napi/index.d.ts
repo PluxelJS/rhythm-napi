@@ -62,6 +62,23 @@ export interface MediaBufferConfigInput {
   maxPlayoutLatenessMs?: number
 }
 
+/**
+ * Bounded sender diagnostics. Counters are cumulative for the stream's persistent RTP sender,
+ * including track switches; `bufferedMs` is the latest encoded queue depth.
+ */
+export interface PlayoutDiagnosticsOutput {
+  bufferedMs: number
+  packetsSent: number
+  bytesSent: number
+  droppedFrames: number
+  droppedMediaMs: number
+  latencyRecoveries: number
+  underruns: number
+  maxLatenessMs: number
+  sequence: number
+  rtpTimestamp: number
+}
+
 export interface ReplayGainInput {
   mode?: 'track' | 'album'
   trackGainDb?: number
@@ -204,6 +221,7 @@ export interface StreamStatusOutput {
   generation: number
   volume: number
   gainDb: number
+  playoutDiagnostics?: PlayoutDiagnosticsOutput
   receiverReport?: RtcpReceiverReportOutput
 }
 
