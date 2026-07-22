@@ -215,6 +215,7 @@ export interface TrackSourceInput {
   formatHint?: string
   seekable?: boolean
   headers?: Record<string, string>
+  networkPolicy?: 'public-only'
 }
 
 export interface TrackSourceOutput {

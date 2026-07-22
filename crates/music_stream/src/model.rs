@@ -7,6 +7,13 @@ pub enum TrackKind {
     Live,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum NetworkPolicy {
+    #[default]
+    Provider,
+    PublicOnly,
+}
+
 const MAX_TRACK_ID_BYTES: usize = 512;
 const MAX_SOURCE_LOCATION_BYTES: usize = 16 * 1024;
 
@@ -22,6 +29,7 @@ pub struct TrackSource {
     pub seekable: Option<bool>,
     /// Per-source HTTP request headers. They stay server-side and are never projected in status.
     pub headers: BTreeMap<String, String>,
+    pub network_policy: NetworkPolicy,
 }
 
 impl TrackSource {
@@ -54,6 +62,9 @@ impl TrackSource {
                         "URL and live sources require an HTTP(S) URL no longer than 16 KiB"
                             .to_owned(),
                     ));
+                }
+                if self.network_policy == NetworkPolicy::PublicOnly {
+                    validate_public_url(url)?;
                 }
             }
             TrackKind::File => {}
@@ -135,6 +146,69 @@ impl TrackSource {
             TrackKind::File | TrackKind::Url => self.seekable.unwrap_or(true),
         }
     }
+}
+
+fn validate_public_url(value: &str) -> crate::Result<()> {
+    let url = reqwest::Url::parse(value).map_err(|error| {
+        crate::MusicStreamError::InvalidSource(format!("invalid public URL: {error}"))
+    })?;
+    if url.scheme() != "https"
+        || url.username() != ""
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.host_str().is_none()
+    {
+        return Err(crate::MusicStreamError::InvalidSource(
+            "public-only sources require an HTTPS URL on the default port without credentials"
+                .to_owned(),
+        ));
+    }
+    if let Some(host) = url.host_str()
+        && let Ok(address) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>()
+        && !is_public_ip(address)
+    {
+        return Err(crate::MusicStreamError::InvalidSource(
+            "public-only sources cannot target a non-global IP address".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn is_public_ip(address: std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(address) => is_public_ipv4(address),
+        std::net::IpAddr::V6(address) => {
+            if let Some(mapped) = address.to_ipv4_mapped() {
+                return is_public_ipv4(mapped);
+            }
+            let segments = address.segments();
+            // Only globally routed unicast space is admitted. Explicitly exclude special-purpose
+            // ranges inside 2000::/3 that can tunnel or synthesize non-public IPv4 destinations.
+            segments[0] & 0xe000 == 0x2000
+                && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
+                && !(segments[0] == 0x2001 && segments[1] == 0x0002)
+                && !(segments[0] == 0x2001 && (segments[1] & 0xfff0) == 0x0020)
+                && segments[0] != 0x2002
+        }
+    }
+}
+
+fn is_public_ipv4(address: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = address.octets();
+    !(a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 88 && c == 99)
+        || (a == 192 && b == 168)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224)
 }
 
 fn validate_source_headers(source: &TrackSource) -> crate::Result<()> {
@@ -381,6 +455,30 @@ mod tests {
             format_hint: None,
             seekable,
             headers: Default::default(),
+            network_policy: NetworkPolicy::Provider,
+        }
+    }
+
+    #[test]
+    fn public_only_sources_reject_non_https_and_non_global_literal_addresses() {
+        let mut public = source(TrackKind::Live, Some(false));
+        public.network_policy = NetworkPolicy::PublicOnly;
+        public.url = Some("https://1.1.1.1/live".to_owned());
+        assert!(public.validate().is_ok());
+
+        for url in [
+            "http://example.com/live",
+            "https://127.0.0.1/live",
+            "https://10.0.0.1/live",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[::1]/live",
+            "https://example.com:8443/live",
+        ] {
+            public.url = Some(url.to_owned());
+            assert!(
+                public.validate().is_err(),
+                "unexpected public target: {url}"
+            );
         }
     }
 

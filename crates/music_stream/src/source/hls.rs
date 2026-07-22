@@ -16,7 +16,7 @@ use super::live::{
     HttpLiveStream, HttpLiveStreamConfig, HttpLiveStreamReport, LiveByteBudget,
     StreamingByteReader, StreamingByteWriter,
 };
-use super::{is_retryable_http, map_http_error, shared_http_client};
+use super::{http_client_for, is_retryable_http, map_http_error};
 
 const MAX_PLAYLIST_BYTES: usize = 1024 * 1024;
 const MAX_INIT_SEGMENT_BYTES: usize = 4 * 1024 * 1024;
@@ -43,6 +43,7 @@ pub(crate) fn spawn_http_hls_stream(
     let url = reqwest::Url::parse(url)
         .map_err(|error| MusicStreamError::InvalidSource(format!("invalid HLS URL: {error}")))?;
     let headers = source.headers.clone();
+    let client = http_client_for(source);
     let (writer, reader) =
         StreamingByteReader::with_global_budget(config.max_buffered_bytes, global_byte_budget)?;
     let cancellation = CancellationToken::new();
@@ -51,6 +52,7 @@ pub(crate) fn spawn_http_hls_stream(
         let result = run_http_hls_stream(
             url,
             headers,
+            client,
             config,
             writer.clone(),
             worker_cancellation.clone(),
@@ -71,11 +73,11 @@ pub(crate) fn spawn_http_hls_stream(
 async fn run_http_hls_stream(
     url: reqwest::Url,
     headers: BTreeMap<String, String>,
+    client: reqwest::Client,
     config: HttpLiveStreamConfig,
     writer: StreamingByteWriter,
     cancellation: CancellationToken,
 ) -> Result<HttpLiveStreamReport> {
-    let client = shared_http_client();
     let byte_budget = writer.global_byte_budget();
     let http = HlsHttp {
         client: &client,
@@ -1458,6 +1460,7 @@ mod tests {
             format_hint: None,
             seekable: Some(true),
             headers: BTreeMap::new(),
+            network_policy: crate::model::NetworkPolicy::Provider,
         };
         let stream = spawn_http_hls_stream(
             &source,
@@ -1561,6 +1564,7 @@ mod tests {
             format_hint: None,
             seekable: Some(true),
             headers: BTreeMap::new(),
+            network_policy: crate::model::NetworkPolicy::Provider,
         };
         let stream = spawn_http_hls_stream(
             &source,
@@ -1630,6 +1634,7 @@ mod tests {
             format_hint: None,
             seekable: Some(true),
             headers: BTreeMap::new(),
+            network_policy: crate::model::NetworkPolicy::Provider,
         };
         let stream = spawn_http_hls_stream(
             &source,

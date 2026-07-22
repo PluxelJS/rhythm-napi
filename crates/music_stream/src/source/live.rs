@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::error::{MusicStreamError, Result};
 use crate::model::TrackSource;
 
-use super::{is_retryable_http, map_http_error, shared_http_client};
+use super::{http_client_for, is_retryable_http, map_http_error};
 
 const LIVE_HTTP_OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 const LIVE_HTTP_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -318,12 +318,13 @@ pub(crate) fn spawn_http_live_stream(
         .clone()
         .ok_or_else(|| MusicStreamError::InvalidSource("live source requires a URL".to_owned()))?;
     let headers = source.headers.clone();
+    let client = http_client_for(source);
     let (writer, reader) =
         StreamingByteReader::with_global_budget(config.max_buffered_bytes, global_byte_budget)?;
     let cancellation = CancellationToken::new();
     let worker_cancellation = cancellation.clone();
     let task = tokio::spawn(async move {
-        run_http_live_stream(url, headers, config, writer, worker_cancellation).await
+        run_http_live_stream(url, headers, config, client, writer, worker_cancellation).await
     });
     Ok(HttpLiveStream {
         reader,
@@ -336,10 +337,10 @@ async fn run_http_live_stream(
     url: String,
     headers: std::collections::BTreeMap<String, String>,
     config: HttpLiveStreamConfig,
+    client: reqwest::Client,
     writer: StreamingByteWriter,
     cancellation: CancellationToken,
 ) -> Result<HttpLiveStreamReport> {
-    let client = shared_http_client();
     let mut report = HttpLiveStreamReport::default();
 
     loop {
@@ -628,6 +629,7 @@ mod tests {
                 max_retries: 0,
                 retry_backoff: Duration::from_millis(1),
             },
+            reqwest::Client::new(),
             writer,
             cancellation,
         )
@@ -671,6 +673,7 @@ mod tests {
                 max_retries: 0,
                 retry_backoff: Duration::from_millis(1),
             },
+            reqwest::Client::new(),
             writer,
             cancellation,
         )
@@ -722,6 +725,7 @@ mod tests {
                 max_retries: 2,
                 retry_backoff: Duration::from_millis(1),
             },
+            reqwest::Client::new(),
             writer,
             cancellation,
         )

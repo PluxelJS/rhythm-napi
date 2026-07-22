@@ -821,6 +821,7 @@ mod tests {
             format_hint: None,
             seekable: Some(true),
             headers: Default::default(),
+            network_policy: crate::model::NetworkPolicy::Provider,
         }
     }
 
@@ -833,6 +834,7 @@ mod tests {
             format_hint: None,
             seekable: None,
             headers: Default::default(),
+            network_policy: crate::model::NetworkPolicy::Provider,
         }
     }
 
@@ -845,6 +847,7 @@ mod tests {
             format_hint: None,
             seekable: Some(false),
             headers: Default::default(),
+            network_policy: crate::model::NetworkPolicy::Provider,
         }
     }
 
@@ -857,6 +860,7 @@ mod tests {
             format_hint: None,
             seekable: Some(true),
             headers: Default::default(),
+            network_policy: crate::model::NetworkPolicy::Provider,
         }
     }
 

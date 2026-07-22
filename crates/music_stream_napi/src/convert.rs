@@ -260,6 +260,15 @@ impl TryFrom<TrackSourceInput> for TrackSource {
             .format_hint
             .map(|hint| normalize_format_hint(&hint))
             .transpose()?;
+        let network_policy = match value.network_policy.as_deref() {
+            None => music_stream::NetworkPolicy::Provider,
+            Some("public-only") => music_stream::NetworkPolicy::PublicOnly,
+            Some(value) => {
+                return Err(music_stream::MusicStreamError::InvalidSource(format!(
+                    "unsupported network policy: {value}"
+                )));
+            }
+        };
 
         Ok(Self {
             id: value.id,
@@ -269,6 +278,7 @@ impl TryFrom<TrackSourceInput> for TrackSource {
             format_hint,
             seekable,
             headers: value.headers.unwrap_or_default().into_iter().collect(),
+            network_policy,
         })
     }
 }
@@ -544,6 +554,7 @@ mod tests {
             format_hint: Some(" MP3 ".to_owned()),
             seekable: None,
             headers: Some(headers),
+            network_policy: None,
         })
         .expect("format hint");
         assert_eq!(track.format_hint.as_deref(), Some("mp3"));
@@ -560,6 +571,7 @@ mod tests {
             format_hint: Some("audio/mpeg".to_owned()),
             seekable: None,
             headers: None,
+            network_policy: None,
         })
         .expect_err("MIME types are not format hints");
         assert_eq!(error.code(), music_stream::ErrorCode::InvalidSource);

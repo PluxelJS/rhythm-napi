@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
@@ -15,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::control::PauseGate;
 use crate::error::{MusicStreamError, Result};
-use crate::model::{TrackKind, TrackSource};
+use crate::model::{NetworkPolicy, TrackKind, TrackSource, is_public_ip};
 
 mod hls;
 mod live;
@@ -178,6 +179,7 @@ fn download_flight_key(source: &TrackSource, config: &HttpSourceConfig) -> Strin
     let mut request_hasher = DefaultHasher::new();
     source.url.hash(&mut request_hasher);
     source.headers.hash(&mut request_hasher);
+    source.network_policy.hash(&mut request_hasher);
     format!(
         "{}:{stable_key}:{:016x}:{}:{:?}:{}:{:?}:{}",
         stable_key.len(),
@@ -899,7 +901,7 @@ async fn run_shared_url_transfer(
     let artifact = download_http_artifact_with_writer_and_budget(
         &source,
         &config,
-        shared_http_client(),
+        http_client_for(&source),
         &runtime.gate,
         &runtime.cancellation,
         Some(runtime.reader),
@@ -1152,6 +1154,79 @@ async fn acquire_tempfile_quota(
 pub(super) fn shared_http_client() -> reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(reqwest::Client::new).clone()
+}
+
+pub(super) fn http_client_for(source: &TrackSource) -> reqwest::Client {
+    match source.network_policy {
+        NetworkPolicy::Provider => shared_http_client(),
+        NetworkPolicy::PublicOnly => public_http_client(),
+    }
+}
+
+fn public_http_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .no_proxy()
+                .dns_resolver(PublicDnsResolver)
+                .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                    if attempt.previous().len() >= 10 {
+                        attempt.error("too many public media redirects")
+                    } else if is_public_https_url(attempt.url()) {
+                        attempt.follow()
+                    } else {
+                        attempt.error("public media redirect target is not allowed")
+                    }
+                }))
+                .build()
+                .expect("public-only HTTP client configuration must be valid")
+        })
+        .clone()
+}
+
+#[derive(Debug)]
+struct PublicDnsResolver;
+
+impl reqwest::dns::Resolve for PublicDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let hostname = name.as_str().to_owned();
+        Box::pin(async move {
+            let addresses = tokio::net::lookup_host((hostname.as_str(), 0))
+                .await
+                .map_err(boxed_dns_error)?
+                .collect::<Vec<_>>();
+            if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
+                return Err(boxed_dns_error(std::io::Error::other(
+                    "public media DNS resolved to a non-global address",
+                )));
+            }
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+fn boxed_dns_error(
+    error: impl std::error::Error + Send + Sync + 'static,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(error)
+}
+
+fn is_public_https_url(url: &reqwest::Url) -> bool {
+    if url.scheme() != "https"
+        || url.username() != ""
+        || url.password().is_some()
+        || url.port().is_some()
+    {
+        return false;
+    }
+    match url
+        .host_str()
+        .and_then(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().ok())
+    {
+        Some(address) => is_public_ip(address),
+        None => url.host_str().is_some(),
+    }
 }
 
 pub async fn resolve_local_file(source: &TrackSource) -> Result<SourceArtifact> {
@@ -1705,6 +1780,29 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn public_dns_rejects_localhost_resolution() {
+        let name = "localhost".parse::<reqwest::dns::Name>().expect("DNS name");
+        let result = reqwest::dns::Resolve::resolve(&PublicDnsResolver, name).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn public_redirect_policy_accepts_only_default_port_https_targets() {
+        assert!(is_public_https_url(
+            &reqwest::Url::parse("https://media.example/live").expect("public URL")
+        ));
+        for value in [
+            "http://media.example/live",
+            "https://127.0.0.1/live",
+            "https://media.example:8443/live",
+        ] {
+            assert!(!is_public_https_url(
+                &reqwest::Url::parse(value).expect("test URL")
+            ));
+        }
+    }
+
     #[test]
     fn live_detection_requires_icecast_or_icy_evidence() {
         let mut icy = reqwest::header::HeaderMap::new();
@@ -1981,6 +2079,12 @@ mod tests {
             download_flight_key(&source, &first),
             download_flight_key(&authenticated, &first)
         );
+        let mut public_only = source.clone();
+        public_only.network_policy = NetworkPolicy::PublicOnly;
+        assert_ne!(
+            download_flight_key(&source, &first),
+            download_flight_key(&public_only, &first)
+        );
         assert_eq!(
             download_flight_key(&source, &first),
             download_flight_key(&source, &first)
@@ -2035,6 +2139,7 @@ mod tests {
             format_hint: None,
             seekable: Some(true),
             headers: Default::default(),
+            network_policy: NetworkPolicy::Provider,
         };
         let artifact = resolve_local_file(&source).await.expect("resolve");
         assert_eq!(artifact.len_bytes, 5);
@@ -2720,6 +2825,7 @@ mod tests {
             format_hint: None,
             seekable: Some(true),
             headers: Default::default(),
+            network_policy: NetworkPolicy::Provider,
         }
     }
 

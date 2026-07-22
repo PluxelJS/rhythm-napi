@@ -25,7 +25,8 @@ pub use audio::pipeline::{PipelineConfig, PlayoutPipeline, WorkerTurnReport};
 pub use error::{ErrorCode, MusicStreamError, Result};
 pub use event::{SourceRole, StreamEvent};
 pub use model::{
-    GainLevel, MediaBufferConfig, PlayState, StreamStatus, TrackKind, TrackSource, VolumeLevel,
+    GainLevel, MediaBufferConfig, NetworkPolicy, PlayState, StreamStatus, TrackKind, TrackSource,
+    VolumeLevel,
 };
 pub use quality::{RtcpNetworkQualityLevel, RtcpQualityWindowSnapshot};
 pub use runtime::{

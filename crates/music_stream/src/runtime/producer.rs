@@ -1273,6 +1273,7 @@ mod tests {
                 format_hint: None,
                 seekable: Some(true),
                 headers: Default::default(),
+                network_policy: crate::model::NetworkPolicy::Provider,
             },
             start_position_ms: 0,
             decode_batch_ms: 400,
@@ -1380,6 +1381,7 @@ mod tests {
                 format_hint: None,
                 seekable: Some(true),
                 headers: Default::default(),
+                network_policy: crate::model::NetworkPolicy::Provider,
             },
             start_position_ms: 0,
             decode_batch_ms: 80,
@@ -1469,6 +1471,7 @@ mod tests {
             format_hint: format_hint.map(str::to_owned),
             seekable: Some(true),
             headers: Default::default(),
+            network_policy: crate::model::NetworkPolicy::Provider,
         };
 
         assert!(supports_progressive_url(&source(

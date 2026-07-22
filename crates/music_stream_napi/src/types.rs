@@ -26,6 +26,8 @@ pub struct TrackSourceInput {
     pub format_hint: Option<String>,
     pub seekable: Option<bool>,
     pub headers: Option<HashMap<String, String>>,
+    #[napi(ts_type = "'public-only'")]
+    pub network_policy: Option<String>,
 }
 
 #[derive(Clone, Debug)]
