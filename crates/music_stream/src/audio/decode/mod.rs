@@ -618,6 +618,33 @@ mod tests {
         .expect("decode task");
     }
 
+    #[tokio::test]
+    async fn symphonia_stream_decoder_reads_fragmented_mp4_aac() {
+        use base64::Engine as _;
+
+        const INIT: &str = "AAAAHGZ0eXBpc281AAACAGlzbzVpc282bXA0MQAAAuFtb292AAAAbG12aGQAAAAAAAAAAAAAAAAAAAPoAAAAAAABAAABAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAB43RyYWsAAABcdGtoZAAAAAMAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAQEAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAACRlZHRzAAAAHGVsc3QAAAAAAAAAAQAAAAAAAAAAAAEAAAAAAVttZGlhAAAAIG1kaGQAAAAAAAAAAAAAAAAAAKxEAAAAAFXEAAAAAAAtaGRscgAAAAAAAAAAc291bgAAAAAAAAAAAAAAAFNvdW5kSGFuZGxlcgAAAAEGbWluZgAAABBzbWhkAAAAAAAAAAAAAAAkZGluZgAAABxkcmVmAAAAAAAAAAEAAAAMdXJsIAAAAAEAAADKc3RibAAAAH5zdHNkAAAAAAAAAAEAAABubXA0YQAAAAAAAAABAAAAAAAAAAAAAQAQAAAAAKxEAAAAAAA2ZXNkcwAAAAADgICAJQABAASAgIAXQBUAAAAAAfQAAAH0AAWAgIAFEghW5QAGgICAAQIAAAAUYnRydAAAAAAAAfQAAAH0AAAAABBzdHRzAAAAAAAAAAAAAAAQc3RzYwAAAAAAAAAAAAAAFHN0c3oAAAAAAAAAAAAAAAAAAAAQc3RjbwAAAAAAAAAAAAAAKG12ZXgAAAAgdHJleAAAAAAAAAABAAAAAQAAAAAAAAAAAAAAAAAAAGJ1ZHRhAAAAWm1ldGEAAAAAAAAAIWhkbHIAAAAAAAAAAG1kaXJhcHBsAAAAAAAAAAAAAAAALWlsc3QAAAAlqXRvbwAAAB1kYXRhAAAAAQAAAABMYXZmNjIuMTIuMTAy";
+        const FRAGMENT: &str = "AAAAGHN0eXBtc2RoAAAAAG1zZGhtc2l4AAAANHNpZHgBAAAAAAAAAQAArEQAAAAAAAFcAAAAAAAAAAAAAAAAAQAAAHEAAACIgAAAAAAAAGRtb29mAAAAEG1maGQAAAAAAAAAAwAAAEx0cmFmAAAAHHRmaGQAAgA4AAAAAQAAAIgAAAAFAgAAAAAAABR0ZmR0AQAAAAAAAAAAAVwAAAAAFHRydW4AAAABAAAAAQAAAGwAAAANbWRhdAEYgbRw";
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(INIT)
+            .expect("fMP4 initialization fixture");
+        bytes.extend(
+            base64::engine::general_purpose::STANDARD
+                .decode(FRAGMENT)
+                .expect("fMP4 media fixture"),
+        );
+        let (writer, reader) =
+            crate::source::StreamingByteReader::new(bytes.len() + 1024).expect("byte pipe");
+        writer.push(bytes::Bytes::from(bytes)).await.expect("push");
+        drop(writer);
+        tokio::task::spawn_blocking(move || {
+            let mut decoder = SymphoniaStreamDecoder::open(reader, None).expect("probe decoder");
+            let chunk = decoder.poll_decode().expect("decode");
+            assert!(matches!(chunk, DecodePoll::Chunk(_)), "got {chunk:?}");
+        })
+        .await
+        .expect("decode task");
+    }
+
     fn make_test_ogg_opus(channels: u8) -> Vec<u8> {
         use ogg::writing::{PacketWriteEndInfo, PacketWriter};
 

@@ -14,10 +14,10 @@ Opus queue、sender 和资源预算，不为每种协议复制播放状态机。
 ## P1：HLS 后续
 
 基础音频 HLS 已实现 master/media playlist、相对 URL、VOD/live reload、有界获取，以及 packed 或
-MPEG-TS 内的 ADTS AAC/MP3；以下能力继续按真实 provider 需求增加：
+MPEG-TS 内的 ADTS AAC/MP3、`EXT-X-MAP`/fMP4/CMAF 和 byte range；以下能力继续按真实 provider
+需求增加：
 
-- [ ] fMP4/CMAF 与 `EXT-X-MAP`；不能把 fragment 直接拼接成普通文件。
-- [ ] AES-128 等加密、byte range、midstream discontinuity 和 codec generation 切换。
+- [ ] AES-128 等加密、midstream discontinuity 和 codec generation 切换。
 - [ ] LL-HLS partial segment、blocking reload 和 preload hint。
 - [ ] 若语料需要，基于 PAT/PMT 扩展多 program/多 audio PID 选择，并评估 LATM AAC、AC-3/E-AC-3。
 

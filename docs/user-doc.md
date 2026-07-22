@@ -103,8 +103,9 @@ live，否则会失去 pause、seek、完整 artifact 和 cache语义。
 HLS 不依赖调用方准确传入 kind：URL path 以 `.m3u8` 结尾时会自动修正为 `live`；没有扩展名的
 签名 playlist 最好传 `formatHint: 'm3u8'`；遗漏 hint 时，标准 HLS Content-Type 或跳转后的
 `.m3u8` URL 也会在读取正文前触发一次安全重路由。当前常用路径支持 master/media playlist、相对 URL、
-live reload、packed ADTS AAC/MP3，以及 MPEG-TS 内的 ADTS AAC/MP3。fMP4/CMAF、加密、byte range、
-discontinuity 和 LL-HLS partial segment 尚未支持，会返回明确错误。
+live reload、packed ADTS AAC/MP3、MPEG-TS 内的 ADTS AAC/MP3，以及带 `EXT-X-MAP` 的
+fMP4/CMAF AAC；独立文件和共享文件 byte range 两种 CMAF 布局都支持。加密、discontinuity、
+初始化段/codec 切换和 LL-HLS partial segment 尚未支持，会返回明确错误。
 
 零起点 URL并非对所有容器都能渐进解码。无扩展名签名 URL应提供显式 `formatHint`；M4A/MP4仍
 等待完整 artifact。详细关键路径和格式边界见 [latency.md](latency.md)。hint描述媒体字节而不是

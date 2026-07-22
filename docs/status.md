@@ -11,8 +11,8 @@
 - current/next、预载、显式暂停、source refresh、ReplayGain 建议和 RTCP quality snapshot。
 - HTTP/UDP/timer/Node async 边界与受控 blocking codec worker。
 - CPU、blocking producer、HTTP/live、live bytes、Opus queue、tempfile/cache 和事件容量治理。
-- HLS master/media、live reload、相对 URL、packed AAC/MP3 和 MPEG-TS AAC/MP3；HLS 当前采用
-  current-only live 语义。
+- HLS master/media、live reload、相对 URL、packed AAC/MP3、MPEG-TS AAC/MP3，以及
+  `EXT-X-MAP`/byte-range fMP4/CMAF AAC；HLS 当前采用 current-only live 语义。
 - `maxStreams`、bounded stopped-status LRU和dead-flight key清理。
 - generation 过滤、staged commit、task supervision、deadline 和确定性 shutdown。
 - 迟滞上限、过期媒体丢弃、无 burst pacing 和可观测的首包/queue/RTCP 指标。
