@@ -113,7 +113,15 @@ async fn run_http_hls_stream(
             let segment = playlist.segments.get(index).ok_or_else(|| {
                 MusicStreamError::InvalidSource("HLS playlist sequence is inconsistent".to_owned())
             })?;
-            validate_segment(segment, delivered_segments > 0)?;
+            if segment_is_gap(segment) {
+                metrics::counter!("music_stream.source.hls_gap_segments").increment(1);
+                next_sequence = next_sequence.saturating_add(1);
+                continue;
+            }
+            validate_segment(segment)?;
+            if segment.discontinuity && delivered_segments > 0 {
+                metrics::counter!("music_stream.source.hls_discontinuities").increment(1);
+            }
             let mapped_fmp4 = segment.map.is_some();
             if let Some(map) = segment.map.as_ref() {
                 let map_url = media_url.join(&map.uri).map_err(|error| {
@@ -372,12 +380,61 @@ fn resolve_byte_range(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct AudioGroupProfile {
+    codec_rank: AudioCodecRank,
+    bandwidth: u64,
+}
+
 fn select_variant(master: &m3u8_rs::MasterPlaylist) -> Option<&str> {
+    // EXT-X-MEDIA has no CODECS or BANDWIDTH, so derive a compact profile for each
+    // referenced audio group in one pass over the variants.
+    let mut audio_groups = std::collections::HashMap::<&str, AudioGroupProfile>::new();
+    for variant in &master.variants {
+        let Some(group_id) = variant.audio.as_deref() else {
+            continue;
+        };
+        let codec = codec_profile(variant.codecs.as_deref()).audio_rank;
+        audio_groups
+            .entry(group_id)
+            .and_modify(|profile| {
+                profile.codec_rank = profile.codec_rank.min(codec);
+                profile.bandwidth = profile.bandwidth.min(variant.bandwidth);
+            })
+            .or_insert(AudioGroupProfile {
+                codec_rank: codec,
+                bandwidth: variant.bandwidth,
+            });
+    }
     master
         .alternatives
         .iter()
-        .filter(|media| media.media_type == AlternativeMediaType::Audio && media.uri.is_some())
-        .min_by_key(|media| (!media.default, !media.autoselect))
+        .filter(|media| {
+            media.media_type == AlternativeMediaType::Audio
+                && media.uri.is_some()
+                && (audio_groups.is_empty() || audio_groups.contains_key(media.group_id.as_str()))
+        })
+        .filter(|media| {
+            audio_groups
+                .get(media.group_id.as_str())
+                .is_none_or(|profile| profile.codec_rank != AudioCodecRank::Unsupported)
+        })
+        .min_by_key(|media| {
+            let profile = audio_groups
+                .get(media.group_id.as_str())
+                .copied()
+                .unwrap_or(AudioGroupProfile {
+                    codec_rank: AudioCodecRank::Unknown,
+                    bandwidth: u64::MAX,
+                });
+            (
+                profile.codec_rank,
+                !media.default,
+                !media.autoselect,
+                channel_rank(media.channels.as_deref()),
+                profile.bandwidth,
+            )
+        })
         .and_then(|media| media.uri.as_deref())
         .or_else(|| {
             master
@@ -385,19 +442,75 @@ fn select_variant(master: &m3u8_rs::MasterPlaylist) -> Option<&str> {
                 .iter()
                 .filter(|variant| !variant.is_i_frame)
                 .min_by_key(|variant| {
-                    let video = variant.resolution.is_some()
-                        || variant.codecs.as_deref().is_some_and(|codecs| {
-                            let codecs = codecs.to_ascii_lowercase();
-                            codecs.contains("avc")
-                                || codecs.contains("hvc")
-                                || codecs.contains("hev")
-                                || codecs.contains("vp9")
-                                || codecs.contains("av01")
-                        });
-                    (video, variant.bandwidth)
+                    let codec = codec_profile(variant.codecs.as_deref());
+                    (
+                        codec.audio_rank == AudioCodecRank::Unsupported,
+                        variant.resolution.is_some() || variant.video.is_some() || codec.has_video,
+                        codec.audio_rank,
+                        variant.bandwidth,
+                    )
                 })
                 .map(|variant| variant.uri.as_str())
         })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AudioCodecRank {
+    Verified,
+    Unknown,
+    Unsupported,
+}
+
+#[derive(Clone, Copy)]
+struct CodecProfile {
+    audio_rank: AudioCodecRank,
+    has_video: bool,
+}
+
+fn codec_profile(codecs: Option<&str>) -> CodecProfile {
+    let Some(codecs) = codecs else {
+        return CodecProfile {
+            audio_rank: AudioCodecRank::Unknown,
+            has_video: false,
+        };
+    };
+    let codecs = codecs.to_ascii_lowercase();
+    let mut audio_rank = AudioCodecRank::Unknown;
+    let mut has_video = false;
+    for codec in codecs.split(',').map(str::trim) {
+        if codec == "mp3" || codec_family(codec, "mp4a") {
+            audio_rank = AudioCodecRank::Verified;
+        } else if ["ac-3", "ec-3", "ac-4", "dtsc", "dtse", "dtsh", "dtsl"]
+            .iter()
+            .any(|family| codec_family(codec, family))
+            && audio_rank != AudioCodecRank::Verified
+        {
+            audio_rank = AudioCodecRank::Unsupported;
+        }
+        has_video |= [
+            "avc1", "avc3", "hvc1", "hev1", "dvh1", "dvhe", "vp09", "av01",
+        ]
+        .iter()
+        .any(|family| codec_family(codec, family));
+    }
+    CodecProfile {
+        audio_rank,
+        has_video,
+    }
+}
+
+fn codec_family(codec: &str, family: &str) -> bool {
+    codec == family
+        || codec
+            .strip_prefix(family)
+            .is_some_and(|suffix| suffix.starts_with('.'))
+}
+
+fn channel_rank(channels: Option<&str>) -> u16 {
+    channels
+        .and_then(|channels| channels.split('/').next())
+        .and_then(|channels| channels.parse::<u16>().ok())
+        .map_or(1, |channels| u16::from(channels > 2))
 }
 
 fn initial_sequence(playlist: &MediaPlaylist) -> u64 {
@@ -409,7 +522,7 @@ fn initial_sequence(playlist: &MediaPlaylist) -> u64 {
         .saturating_add(playlist.segments.len().saturating_sub(LIVE_EDGE_SEGMENTS) as u64)
 }
 
-fn validate_segment(segment: &m3u8_rs::MediaSegment, after_first: bool) -> Result<()> {
+fn validate_segment(segment: &m3u8_rs::MediaSegment) -> Result<()> {
     if segment
         .key
         .as_ref()
@@ -419,12 +532,14 @@ fn validate_segment(segment: &m3u8_rs::MediaSegment, after_first: bool) -> Resul
             "HLS encryption method is not supported".to_owned(),
         ));
     }
-    if after_first && segment.discontinuity {
-        return Err(MusicStreamError::Unsupported(
-            "HLS discontinuities require a new media generation".to_owned(),
-        ));
-    }
     Ok(())
+}
+
+fn segment_is_gap(segment: &m3u8_rs::MediaSegment) -> bool {
+    segment
+        .unknown_tags
+        .iter()
+        .any(|tag| tag.tag.eq_ignore_ascii_case("X-GAP"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1136,15 +1251,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn variant_selection_prefers_default_audio_rendition() {
+    fn variant_selection_avoids_unsupported_default_audio_rendition() {
         let master = m3u8_rs::parse_playlist_res(
-            b"#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"main\",DEFAULT=YES,URI=\"audio/index.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO=\"a\"\nvideo/index.m3u8\n",
+            b"#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"surround\",NAME=\"surround\",DEFAULT=YES,AUTOSELECT=YES,CHANNELS=\"6\",URI=\"audio/ac3.m3u8\"\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"stereo\",NAME=\"stereo\",DEFAULT=NO,AUTOSELECT=YES,CHANNELS=\"2\",URI=\"audio/aac.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=900000,CODECS=\"avc1.4d401e,ac-3\",AUDIO=\"surround\"\nvideo/ac3.m3u8\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,CODECS=\"avc1.4d401e,mp4a.40.2\",AUDIO=\"stereo\"\nvideo/aac.m3u8\n",
         )
         .expect("playlist");
         let Playlist::MasterPlaylist(master) = master else {
             panic!("master playlist");
         };
-        assert_eq!(select_variant(&master), Some("audio/index.m3u8"));
+        assert_eq!(select_variant(&master), Some("audio/aac.m3u8"));
     }
 
     #[test]
@@ -1180,7 +1295,21 @@ mod tests {
             playlist.segments[1].key.as_ref().map(|key| &key.method),
             Some(&KeyMethod::AES128)
         );
-        validate_segment(&playlist.segments[1], true).expect("AES-128 segment");
+        validate_segment(&playlist.segments[1]).expect("AES-128 segment");
+    }
+
+    #[test]
+    fn playlist_gap_tag_is_recognized() {
+        let Playlist::MediaPlaylist(playlist) = m3u8_rs::parse_playlist_res(
+            b"#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\nfirst.ts\n#EXTINF:1,\n#EXT-X-GAP\nmissing.ts\n#EXT-X-ENDLIST\n",
+        )
+        .expect("playlist")
+        else {
+            panic!("media playlist");
+        };
+
+        assert!(!segment_is_gap(&playlist.segments[0]));
+        assert!(segment_is_gap(&playlist.segments[1]));
     }
 
     #[test]
@@ -1432,9 +1561,9 @@ mod tests {
         let segment = make_test_ts(elementary);
         let key = [0x24; AES128_KEY_BYTES];
         let first = encrypt_test_aes128(&segment, key, sequence_iv(7));
-        let second = encrypt_test_aes128(&segment, key, sequence_iv(8));
+        let second = encrypt_test_aes128(&segment, key, sequence_iv(9));
         let encrypted_bytes = first.len() + second.len();
-        let playlist = b"#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:7\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:1,\nfirst.ts\n#EXTINF:1,\nsecond.ts\n#EXT-X-ENDLIST\n";
+        let playlist = b"#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:7\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:1,\nfirst.ts\n#EXTINF:1,\n#EXT-X-GAP\nmissing.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:1,\nsecond.ts\n#EXT-X-ENDLIST\n";
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let address = listener.local_addr().expect("address");
         let server = tokio::spawn(async move {

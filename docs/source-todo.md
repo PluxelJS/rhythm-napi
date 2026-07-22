@@ -17,7 +17,8 @@ Opus queue、sender 和资源预算，不为每种协议复制播放状态机。
 MPEG-TS 内的 ADTS AAC/MP3、`EXT-X-MAP`/fMP4/CMAF 和 byte range；以下能力继续按真实 provider
 需求增加：
 
-- [ ] SAMPLE-AES/DRM、midstream discontinuity 和 codec generation 切换；标准 AES-128 已支持。
+- [ ] SAMPLE-AES/DRM，以及跨 discontinuity 的初始化段/codec generation 切换；标准 AES-128、
+  `EXT-X-GAP` 和同初始化段/codec discontinuity 已支持。
 - [ ] LL-HLS partial segment、blocking reload 和 preload hint。
 - [ ] 若语料需要，基于 PAT/PMT 扩展多 program/多 audio PID 选择，并评估 LATM AAC、AC-3/E-AC-3。
 
