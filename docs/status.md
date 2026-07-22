@@ -4,7 +4,7 @@
 
 - 本地文件、有界 HTTP 文件、live HTTP 三种 source 语义，以及独立的 bounded HLS 获取路径。
 - 有界 URL 的渐进式 growing spool、内容+传输策略 single-flight、服从当前字节上限的
-  完整 artifact LRU 和磁盘配额。
+  完整 artifact LRU 和磁盘配额；faststart M4A/MP4经有界 BMFF布局检测后可条件渐进。
 - Symphonia demux/decode、Ogg Opus mono/stereo libopus decode、stereo normalize、Rubato 48 kHz
   resample、volume/gain/limiter 和 libopus encode。
 - 每 stream 一个长期 RTP/RTCP sender，seek、switch 和 promotion 保持 session clock 连续。

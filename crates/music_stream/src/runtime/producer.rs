@@ -22,7 +22,7 @@ use crate::session::WorkerEvent;
 use crate::source::{
     BlockingReadObserver, FileSourceResolver, LiveByteBudget, ProgressiveUrlSource,
     SharedUrlControl, SourceArtifact, SourceResolverConfig, UrlPlaybackSource,
-    spawn_http_hls_stream, spawn_http_live_stream,
+    spawn_http_hls_stream, spawn_http_live_stream, supports_progressive_url,
 };
 
 #[derive(Debug)]
@@ -1135,30 +1135,7 @@ fn record_decoder_open(job: &ProducerJob, started: std::time::Instant) {
 }
 
 fn decoder_hint(source: &TrackSource) -> Option<String> {
-    if let Some(hint) = source.format_hint.as_deref() {
-        let hint = hint.trim();
-        if !hint.is_empty()
-            && hint.len() <= 16
-            && hint.bytes().all(|byte| byte.is_ascii_alphanumeric())
-        {
-            return Some(hint.to_ascii_lowercase());
-        }
-    }
-    let path = source.url.as_deref()?.split(['?', '#']).next()?;
-    let extension = path.rsplit('/').next()?.rsplit_once('.')?.1;
-    (!extension.is_empty()
-        && extension.len() <= 16
-        && extension.bytes().all(|byte| byte.is_ascii_alphanumeric()))
-    .then(|| extension.to_ascii_lowercase())
-}
-
-fn supports_progressive_url(source: &TrackSource) -> bool {
-    decoder_hint(source).is_some_and(|extension| {
-        matches!(
-            extension.as_str(),
-            "aac" | "flac" | "mp3" | "oga" | "ogg" | "opus" | "wav" | "wave"
-        )
-    })
+    source.media_format_hint().map(str::to_ascii_lowercase)
 }
 
 #[cfg(test)]
@@ -1483,7 +1460,7 @@ mod tests {
     }
 
     #[test]
-    fn progressive_url_policy_prefers_explicit_format_hint_and_excludes_mp4() {
+    fn progressive_url_policy_prefers_explicit_format_hint_and_includes_mp4_candidates() {
         let source = |url: &str, format_hint: Option<&str>| TrackSource {
             id: url.to_owned(),
             kind: TrackKind::Url,
@@ -1502,7 +1479,7 @@ mod tests {
             "https://cdn.test/audio.flac",
             None,
         )));
-        assert!(!supports_progressive_url(&source(
+        assert!(supports_progressive_url(&source(
             "https://cdn.test/audio.m4a",
             None,
         )));
@@ -1514,7 +1491,7 @@ mod tests {
             "https://cdn.test/opaque?sig=1",
             Some("MP3"),
         )));
-        assert!(!supports_progressive_url(&source(
+        assert!(supports_progressive_url(&source(
             "https://cdn.test/audio.mp3",
             Some("m4a"),
         )));

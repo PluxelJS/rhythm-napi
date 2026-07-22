@@ -19,6 +19,7 @@ use crate::model::{TrackKind, TrackSource};
 
 mod hls;
 mod live;
+mod mp4;
 mod spool;
 pub(crate) use hls::spawn_http_hls_stream;
 pub use live::HttpLiveStreamConfig;
@@ -27,6 +28,7 @@ pub(crate) use live::StreamingByteReader;
 pub(crate) use live::{
     BlockingReadObserver, HttpLiveStream, LiveByteBudget, spawn_http_live_stream,
 };
+use mp4::{FastStartDecision, FastStartProbe};
 pub(crate) use spool::GrowingSpoolReader;
 use spool::{GrowingSpool, GrowingSpoolWriter, growing_spool};
 
@@ -400,6 +402,34 @@ pub(crate) struct SourceArtifact {
 pub(crate) enum UrlPlaybackSource {
     Cached(SourceArtifact),
     Progressive(ProgressiveUrlSource),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProgressiveSourceMode {
+    Immediate,
+    FastStartMp4,
+}
+
+fn progressive_source_mode(source: &TrackSource) -> Option<ProgressiveSourceMode> {
+    let hint = source.media_format_hint()?;
+    if is_mp4_format(hint) || source.url_extension().is_some_and(is_mp4_format) {
+        return Some(ProgressiveSourceMode::FastStartMp4);
+    }
+    if ["aac", "flac", "mp3", "oga", "ogg", "opus", "wav", "wave"]
+        .iter()
+        .any(|supported| hint.eq_ignore_ascii_case(supported))
+    {
+        return Some(ProgressiveSourceMode::Immediate);
+    }
+    None
+}
+
+fn is_mp4_format(hint: &str) -> bool {
+    hint.eq_ignore_ascii_case("m4a") || hint.eq_ignore_ascii_case("mp4")
+}
+
+pub(crate) fn supports_progressive_url(source: &TrackSource) -> bool {
+    progressive_source_mode(source).is_some()
 }
 
 #[derive(Debug)]
@@ -1255,7 +1285,6 @@ async fn download_http_artifact_with_writer_and_budget(
     mut tempfile: TempfileAdmission,
 ) -> Result<SourceArtifact> {
     let mut attempt = 0_u8;
-    let progressive = reader_sender.is_some();
     loop {
         if !gate.wait_async(cancellation).await {
             return Err(cancelled_transfer());
@@ -1285,9 +1314,7 @@ async fn download_http_artifact_with_writer_and_budget(
         {
             Ok(artifact) => return Ok(artifact),
             Err(error)
-                if attempt < config.max_retries
-                    && error.retryable
-                    && (!progressive || !error.partial) =>
+                if attempt < config.max_retries && error.retryable && !error.reader_published =>
             {
                 attempt += 1;
                 metrics::counter!("music_stream.source.http_retries").increment(1);
@@ -1325,11 +1352,12 @@ async fn download_http_artifact_once(
     if !gate.wait_async(cancellation).await {
         return Err(HttpAttemptError::terminal(cancelled_transfer()));
     }
+    let progressive_mode = reader_sender.and_then(|_| progressive_source_mode(source));
     let request_started = Instant::now();
-    let transfer_mode = if reader_sender.is_some() {
-        "progressive"
-    } else {
-        "artifact"
+    let transfer_mode = match progressive_mode {
+        Some(ProgressiveSourceMode::Immediate) => "progressive",
+        Some(ProgressiveSourceMode::FastStartMp4) => "faststart_probe",
+        None => "artifact",
     };
     let response = {
         let mut request = client.get(url);
@@ -1389,7 +1417,7 @@ async fn download_http_artifact_once(
         )));
     }
 
-    let suffix = source_suffix(source, url);
+    let suffix = source_suffix(source);
     let tempfile_started = Instant::now();
     let named =
         tokio::task::spawn_blocking(move || tempfile::Builder::new().suffix(&suffix).tempfile())
@@ -1413,15 +1441,27 @@ async fn download_http_artifact_once(
     if let Some(declared_length) = declared_length {
         cleanup.shrink_quota_to(declared_length);
     }
-    let progressive_reader_published = reader_sender.is_some();
-    let mut file = if let Some(sender) = reader_sender {
-        let (writer, spool) = growing_spool(std_file, path.clone(), Arc::clone(&cleanup));
-        sender.send_replace(Some(spool));
-        metrics::histogram!("music_stream.source.http_to_spool_ready_us")
-            .record(request_started.elapsed().as_micros() as f64);
-        ArtifactFileWriter::Growing(writer)
-    } else {
-        ArtifactFileWriter::File(tokio::fs::File::from_std(std_file))
+    let mut pending_reader = None;
+    let mut faststart_probe = None;
+    let mut progressive_reader_published = false;
+    let mut file = match (reader_sender, progressive_mode) {
+        (Some(sender), Some(mode)) => {
+            let (writer, spool) = growing_spool(std_file, path.clone(), Arc::clone(&cleanup));
+            match mode {
+                ProgressiveSourceMode::Immediate => {
+                    sender.send_replace(Some(spool));
+                    progressive_reader_published = true;
+                    metrics::histogram!("music_stream.source.http_to_spool_ready_us")
+                        .record(request_started.elapsed().as_micros() as f64);
+                }
+                ProgressiveSourceMode::FastStartMp4 => {
+                    pending_reader = Some((sender, spool));
+                    faststart_probe = Some(FastStartProbe::default());
+                }
+            }
+            ArtifactFileWriter::Growing(writer)
+        }
+        _ => ArtifactFileWriter::File(tokio::fs::File::from_std(std_file)),
     };
     let mut length = 0_u64;
     let mut first_body_byte_recorded = false;
@@ -1448,13 +1488,13 @@ async fn download_http_artifact_once(
                     result = &mut chunk => {
                         break result.map_err(|error| {
                             HttpAttemptError::from_http(error)
-                                .after_bytes(length > 0 || progressive_reader_published)
+                                .after_reader_published(progressive_reader_published)
                         })?;
                     }
                     _ = &mut deadline => {
                         return Err(HttpAttemptError::timeout(
                             "HTTP body stalled past the I/O deadline",
-                        ).after_bytes(length > 0 || progressive_reader_published));
+                        ).after_reader_published(progressive_reader_published));
                     }
                 }
             }
@@ -1475,22 +1515,46 @@ async fn download_http_artifact_once(
             return Err(HttpAttemptError::terminal(MusicStreamError::InvalidSource(
                 "HTTP source exceeds its declared Content-Length".to_owned(),
             ))
-            .after_bytes(length > chunk.len() as u64 || progressive_reader_published));
+            .after_reader_published(progressive_reader_published));
         }
         if length > config.max_bytes {
             return Err(HttpAttemptError::terminal(MusicStreamError::InvalidSource(
                 "HTTP source exceeds configured byte limit".to_owned(),
             ))
-            .after_bytes(length > chunk.len() as u64 || progressive_reader_published));
+            .after_reader_published(progressive_reader_published));
         }
         file.write_all(&chunk).await.map_err(|error| {
             HttpAttemptError::terminal(MusicStreamError::InvalidSource(error.to_string()))
-                .after_bytes(length > 0 || progressive_reader_published)
+                .after_reader_published(progressive_reader_published)
         })?;
+        if let Some(probe) = faststart_probe.as_mut() {
+            match probe.push(&chunk) {
+                FastStartDecision::Pending => {}
+                FastStartDecision::Progressive => {
+                    if let Some((sender, spool)) = pending_reader.take() {
+                        sender.send_replace(Some(spool));
+                        progressive_reader_published = true;
+                        metrics::counter!("music_stream.source.http_faststart_progressive")
+                            .increment(1);
+                        metrics::histogram!("music_stream.source.http_to_spool_ready_us")
+                            .record(request_started.elapsed().as_micros() as f64);
+                    }
+                    faststart_probe = None;
+                }
+                FastStartDecision::ArtifactOnly => {
+                    pending_reader = None;
+                    faststart_probe = None;
+                    metrics::counter!("music_stream.source.http_faststart_fallbacks").increment(1);
+                }
+            }
+        }
+    }
+    if faststart_probe.is_some() {
+        metrics::counter!("music_stream.source.http_faststart_fallbacks").increment(1);
     }
     file.finish().await.map_err(|error| {
         HttpAttemptError::terminal(MusicStreamError::InvalidSource(error.to_string()))
-            .after_bytes(length > 0 || progressive_reader_published)
+            .after_reader_published(progressive_reader_published)
     })?;
     if length == 0 {
         return Err(HttpAttemptError::terminal(MusicStreamError::InvalidSource(
@@ -1507,29 +1571,17 @@ async fn download_http_artifact_once(
     })
 }
 
-fn source_suffix(source: &TrackSource, url: &str) -> String {
-    if let Some(hint) = source.format_hint.as_deref()
-        && !hint.is_empty()
-        && hint.len() <= 16
-        && hint.bytes().all(|byte| byte.is_ascii_alphanumeric())
-    {
-        return format!(".{hint}");
-    }
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .filter(|extension| {
-            extension.len() <= 8 && extension.chars().all(|c| c.is_ascii_alphanumeric())
-        })
-        .map_or_else(String::new, |extension| format!(".{extension}"))
+fn source_suffix(source: &TrackSource) -> String {
+    source
+        .media_format_hint()
+        .map_or_else(String::new, |hint| format!(".{hint}"))
 }
 
 #[derive(Debug)]
 struct HttpAttemptError {
     error: MusicStreamError,
     retryable: bool,
-    partial: bool,
+    reader_published: bool,
 }
 
 impl HttpAttemptError {
@@ -1537,7 +1589,7 @@ impl HttpAttemptError {
         Self {
             retryable: is_retryable_http(&error),
             error: map_http_error(error),
-            partial: false,
+            reader_published: false,
         }
     }
 
@@ -1545,7 +1597,7 @@ impl HttpAttemptError {
         Self {
             error,
             retryable: false,
-            partial: false,
+            reader_published: false,
         }
     }
 
@@ -1553,12 +1605,12 @@ impl HttpAttemptError {
         Self {
             error: MusicStreamError::SourceTimeout(message.to_owned()),
             retryable: true,
-            partial: false,
+            reader_published: false,
         }
     }
 
-    fn after_bytes(mut self, partial: bool) -> Self {
-        self.partial = partial;
+    fn after_reader_published(mut self, reader_published: bool) -> Self {
+        self.reader_published = reader_published;
         self
     }
 }
@@ -1714,6 +1766,183 @@ mod tests {
             &headers,
             &reqwest::Url::parse("https://media.test/signed").expect("URL")
         ));
+    }
+
+    #[test]
+    fn progressive_policy_uses_mp4_safe_mode_when_hint_and_url_disagree() {
+        let mut mp4_url = url_source("https://media.test/audio.mp4".to_owned());
+        mp4_url.format_hint = Some("mp3".to_owned());
+        assert_eq!(
+            progressive_source_mode(&mp4_url),
+            Some(ProgressiveSourceMode::FastStartMp4)
+        );
+
+        let mut mp4_hint = url_source("https://media.test/audio.mp3".to_owned());
+        mp4_hint.format_hint = Some("m4a".to_owned());
+        assert_eq!(
+            progressive_source_mode(&mp4_hint),
+            Some(ProgressiveSourceMode::FastStartMp4)
+        );
+    }
+
+    #[tokio::test]
+    async fn faststart_m4a_decodes_before_http_download_completes() {
+        use crate::audio::decode::{DecodePoll, DecoderBackend, SymphoniaStreamDecoder};
+
+        let fixture = faststart_m4a_fixture();
+        let split = 1_800;
+        assert!(fixture.len() > split);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let server_fixture = fixture.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 1_024];
+            let _ = stream.read(&mut request).await.expect("request");
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                server_fixture.len()
+            );
+            stream.write_all(headers.as_bytes()).await.expect("headers");
+            stream
+                .write_all(&server_fixture[..split])
+                .await
+                .expect("faststart prefix");
+            stream.flush().await.expect("flush prefix");
+            let _ = release_rx.await;
+            stream
+                .write_all(&server_fixture[split..])
+                .await
+                .expect("faststart suffix");
+        });
+
+        let source = url_source(format!("http://{address}/audio.m4a"));
+        let config = HttpSourceConfig {
+            io_timeout: Duration::from_secs(2),
+            max_bytes: TEMPFILE_QUOTA_BYTES,
+            max_retries: 0,
+            ..HttpSourceConfig::default()
+        };
+        let gate = Arc::new(PauseGate::default());
+        let cancellation = CancellationToken::new();
+        let transfer_gate = Arc::clone(&gate);
+        let transfer_cancellation = cancellation.clone();
+        let (reader_sender, mut reader_receiver) = watch::channel(None);
+        let transfer = tokio::spawn(async move {
+            download_http_artifact_with_writer(
+                &source,
+                &config,
+                shared_http_client().clone(),
+                &transfer_gate,
+                &transfer_cancellation,
+                Some(reader_sender),
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), reader_receiver.changed())
+            .await
+            .expect("faststart reader publication timeout")
+            .expect("faststart reader channel");
+        let spool = reader_receiver
+            .borrow()
+            .clone()
+            .expect("faststart reader was published");
+        let reader = spool
+            .open_reader(cancellation.child_token())
+            .expect("faststart reader");
+        let mut decoder = tokio::task::spawn_blocking(move || {
+            let mut decoder = SymphoniaStreamDecoder::open(reader, Some("m4a"))?;
+            loop {
+                match decoder.poll_decode()? {
+                    DecodePoll::Chunk(chunk) => return Ok(chunk),
+                    DecodePoll::NeedMore => {}
+                    DecodePoll::End => {
+                        return Err(MusicStreamError::DecodeError(
+                            "faststart fixture ended before decoded audio".to_owned(),
+                        ));
+                    }
+                }
+            }
+        });
+        let decoded = tokio::time::timeout(Duration::from_secs(2), &mut decoder).await;
+        let _ = release_tx.send(());
+        let chunk = decoded
+            .expect("M4A decode waited for the HTTP suffix")
+            .expect("decoder task")
+            .expect("decode faststart M4A");
+        assert_eq!(chunk.sample_rate, 44_100);
+        assert_eq!(chunk.channels, 1);
+        assert!(!chunk.samples_interleaved.is_empty());
+
+        let artifact = transfer.await.expect("transfer task").expect("artifact");
+        assert_eq!(artifact.len_bytes, fixture.len() as u64);
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn faststart_m4a_retries_only_before_reader_publication() {
+        let fixture = faststart_m4a_fixture();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server_fixture = fixture.clone();
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut request = [0_u8; 1_024];
+                let _ = stream.read(&mut request).await.expect("request");
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    server_fixture.len()
+                );
+                stream.write_all(headers.as_bytes()).await.expect("headers");
+                if attempt == 0 {
+                    stream
+                        .write_all(&server_fixture[..4])
+                        .await
+                        .expect("incomplete prefix");
+                } else {
+                    stream
+                        .write_all(&server_fixture)
+                        .await
+                        .expect("complete retry");
+                }
+            }
+        });
+
+        let source = url_source(format!("http://{address}/audio.m4a"));
+        let config = HttpSourceConfig {
+            max_bytes: TEMPFILE_QUOTA_BYTES,
+            max_retries: 1,
+            retry_backoff: Duration::from_millis(1),
+            ..HttpSourceConfig::default()
+        };
+        let (reader_sender, reader_receiver) = watch::channel(None);
+        let artifact = download_http_artifact_with_writer(
+            &source,
+            &config,
+            shared_http_client().clone(),
+            &PauseGate::default(),
+            &CancellationToken::new(),
+            Some(reader_sender),
+        )
+        .await
+        .expect("faststart retry");
+
+        assert!(reader_receiver.borrow().is_some());
+        assert_eq!(artifact.len_bytes, fixture.len() as u64);
+        server.await.expect("server");
+    }
+
+    fn faststart_m4a_fixture() -> Vec<u8> {
+        use base64::Engine as _;
+
+        // A 0.5 s mono AAC file generated by FFmpeg with `-movflags +faststart`.
+        base64::engine::general_purpose::STANDARD
+            .decode(include_str!("../../testdata/faststart-aac.m4a.b64").trim())
+            .expect("faststart M4A fixture")
     }
 
     #[test]
@@ -2002,7 +2231,7 @@ mod tests {
                 server_connections.fetch_add(1, Ordering::Relaxed);
             }
         });
-        let source = url_source(format!("http://{address}/audio"));
+        let source = url_source(format!("http://{address}/audio.opus"));
         let config = HttpSourceConfig {
             max_retries: 2,
             retry_backoff: Duration::from_millis(1),
@@ -2092,7 +2321,8 @@ mod tests {
     #[tokio::test]
     async fn completed_progressive_download_is_promoted_to_artifact_cache() {
         let (url, server) = status_server(vec![(200, b"audio".to_vec())]).await;
-        let source = url_source(url);
+        let mut source = url_source(url);
+        source.format_hint = Some("mp3".to_owned());
         let config = SourceResolverConfig {
             http: HttpSourceConfig {
                 cache_temp_files: true,

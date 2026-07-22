@@ -60,6 +60,11 @@ body 写入使用 Tokio file。每次成功写入后，spool 更新 `available_b
 writer 未正常 finish 就 drop 会把 spool 标记为失败。partial spool 由 cleanup owner 删除，永远不会
 进入 artifact cache。
 
+M4A/MP4 是条件渐进候选：下载路径用 O(1) 额外内存顺序扫描顶层 BMFF box，只有在前 4 MiB 内确认
+完整 `ftyp` 和位于首个 `mdat` 前的完整 `moov` 后才发布同一个 growing spool。`mdat` 在前、box
+损坏、metadata超限或布局仍不明确时不发布 reader，subscriber在下载完成后直接得到 seekable
+artifact。检测不解析时间索引，也不改变非零 seek语义。
+
 ### Shared URL flight
 
 `TrackSource.id` 是内容身份，临时签名 URL 不是 key。single-flight key 由内容 ID、URL/header 的

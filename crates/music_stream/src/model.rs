@@ -86,26 +86,37 @@ impl TrackSource {
         self.kind == TrackKind::Live
     }
 
+    pub(crate) fn media_format_hint(&self) -> Option<&str> {
+        if let Some(hint) = self.format_hint.as_deref()
+            && !hint.is_empty()
+            && hint.len() <= 16
+            && hint.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            return Some(hint);
+        }
+        self.url_extension()
+    }
+
+    pub(crate) fn url_extension(&self) -> Option<&str> {
+        let path = self.url.as_deref()?.split(['?', '#']).next()?;
+        let extension = path.rsplit('/').next()?.rsplit_once('.')?.1;
+        (!extension.is_empty()
+            && extension.len() <= 16
+            && extension.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+        .then_some(extension)
+    }
+
     #[must_use]
     pub fn is_hls(&self) -> bool {
         if self.kind == TrackKind::File {
             return false;
         }
-        if self
-            .format_hint
+        self.format_hint
             .as_deref()
             .is_some_and(|hint| hint.eq_ignore_ascii_case("m3u8"))
-        {
-            return true;
-        }
-        let Some(url) = self.url.as_deref() else {
-            return false;
-        };
-        let path = url.split(['?', '#']).next().unwrap_or(url);
-        path.rsplit('/').next().is_some_and(|name| {
-            name.rsplit_once('.')
-                .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("m3u8"))
-        })
+            || self
+                .url_extension()
+                .is_some_and(|hint| hint.eq_ignore_ascii_case("m3u8"))
     }
 
     #[must_use]
@@ -437,5 +448,10 @@ mod tests {
         by_hint.url = Some("https://media.test/opaque".to_owned());
         by_hint.format_hint = Some("M3U8".to_owned());
         assert!(by_hint.is_hls());
+
+        let mut wrong_hint = source(TrackKind::Url, None);
+        wrong_hint.url = Some("https://media.test/audio/index.m3u8".to_owned());
+        wrong_hint.format_hint = Some("mp3".to_owned());
+        assert!(wrong_hint.is_hls());
     }
 }
