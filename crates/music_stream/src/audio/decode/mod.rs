@@ -291,7 +291,7 @@ fn poll_symphonia_decode(
         }
 
         if let PacketAudioDecoder::Opus(decoder) = decoder {
-            match decoder.decode(&packet) {
+            match decoder.decode(&packet, recycled_samples) {
                 Ok(Some(chunk)) => {
                     decode_errors.reset();
                     return Ok(DecodePoll::Chunk(chunk));
@@ -411,7 +411,11 @@ impl LibOpusPacketDecoder {
             .map_err(|error| MusicStreamError::DecodeError(error.to_string()))
     }
 
-    fn decode(&mut self, packet: &symphonia::core::packet::Packet) -> Result<Option<DecodedChunk>> {
+    fn decode(
+        &mut self,
+        packet: &symphonia::core::packet::Packet,
+        recycled_samples: &mut Vec<f32>,
+    ) -> Result<Option<DecodedChunk>> {
         if packet.data.is_empty() {
             return Err(MusicStreamError::DecodeError(
                 "Ogg Opus packet is empty".to_owned(),
@@ -434,10 +438,12 @@ impl LibOpusPacketDecoder {
         let channels = usize::from(self.channels);
         let start = trim_start * channels;
         let end = start + retained * channels;
+        recycled_samples.clear();
+        recycled_samples.extend_from_slice(&self.output[start..end]);
         Ok(Some(DecodedChunk {
             sample_rate: Self::SAMPLE_RATE,
             channels: self.channels,
-            samples_interleaved: self.output[start..end].to_vec(),
+            samples_interleaved: std::mem::take(recycled_samples),
         }))
     }
 }
