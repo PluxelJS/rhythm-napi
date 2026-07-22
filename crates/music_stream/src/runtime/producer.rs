@@ -428,7 +428,14 @@ pub(super) fn spawn(spec: ProducerSpec) -> ProducerHandle {
         if job.track.is_live() {
             run_live(job, spec.source, spec.live_byte_budget, spec.live_streams).await
         } else {
-            run_artifact(job, spec.resolver).await
+            run_artifact(
+                job,
+                spec.resolver,
+                spec.source,
+                spec.live_byte_budget,
+                spec.live_streams,
+            )
+            .await
         }
     };
     let task = supervise_producer(
@@ -519,14 +526,27 @@ struct AdmissionPermit {
     _global: OwnedSemaphorePermit,
 }
 
-async fn run_artifact(job: ProducerJob, resolver: FileSourceResolver) -> Result<()> {
+async fn run_artifact(
+    job: ProducerJob,
+    resolver: FileSourceResolver,
+    source_config: SourceResolverConfig,
+    live_byte_budget: Arc<tokio::sync::Semaphore>,
+    live_streams: Arc<Semaphore>,
+) -> Result<()> {
     if job.track.kind == TrackKind::Url
         && job.start_position_ms == 0
         && supports_progressive_url(&job.track)
     {
-        let source = resolver
+        let source = match resolver
             .resolve_url_playback(&job.track, Arc::clone(&job.control.gate), &job.cancellation)
-            .await?;
+            .await
+        {
+            Ok(source) => source,
+            Err(MusicStreamError::DetectedLiveSource(_)) => {
+                return run_detected_live(job, source_config, live_byte_budget, live_streams).await;
+            }
+            Err(error) => return Err(error),
+        };
         record_source_ready(&job);
         let admission = acquire_blocking_job(&job).await?;
         record_codec_start(&job);
@@ -539,13 +559,46 @@ async fn run_artifact(job: ProducerJob, resolver: FileSourceResolver) -> Result<
             }
         };
     }
-    let artifact = resolver
+    let artifact = match resolver
         .resolve(&job.track, &job.control.gate, &job.cancellation)
-        .await?;
+        .await
+    {
+        Ok(artifact) => artifact,
+        Err(MusicStreamError::DetectedLiveSource(_)) => {
+            return run_detected_live(job, source_config, live_byte_budget, live_streams).await;
+        }
+        Err(error) => return Err(error),
+    };
     record_source_ready(&job);
     let admission = acquire_blocking_job(&job).await?;
     record_codec_start(&job);
     run_file_artifact(job, artifact, admission).await
+}
+
+async fn run_detected_live(
+    mut job: ProducerJob,
+    source: SourceResolverConfig,
+    live_byte_budget: Arc<tokio::sync::Semaphore>,
+    live_streams: Arc<Semaphore>,
+) -> Result<()> {
+    if matches!(job.control.role(), ProducerRole::Next) {
+        return Err(MusicStreamError::Unsupported(
+            "detected live HTTP source cannot be preloaded as next without a timeshift model"
+                .to_owned(),
+        ));
+    }
+    metrics::counter!("music_stream.source.detected_live_fallbacks").increment(1);
+    job.track.kind = TrackKind::Live;
+    job.track.seekable = Some(false);
+    job.role = ProducerRole::Current;
+    job.next_prime_ms = None;
+    job.events
+        .send(WorkerEvent::CurrentSourceDetectedLive {
+            generation: job.generation,
+        })
+        .await
+        .map_err(|_| MusicStreamError::StreamClosed("worker event loop closed".to_owned()))?;
+    run_live(job, source, live_byte_budget, live_streams).await
 }
 
 async fn run_file_artifact(
@@ -1302,7 +1355,13 @@ mod tests {
             blocking_producers: Arc::clone(&blocking_producers),
             blocking_preloads,
         };
-        let task = tokio::spawn(run_artifact(job, resolver));
+        let task = tokio::spawn(run_artifact(
+            job,
+            resolver,
+            SourceResolverConfig::default(),
+            Arc::new(Semaphore::new(1)),
+            Arc::new(Semaphore::new(1)),
+        ));
         tokio::time::sleep(Duration::from_millis(20)).await;
 
         assert_eq!(blocking_producers.available_permits(), 1);

@@ -18,12 +18,13 @@ source、current/next、事件、错误恢复和 shutdown，不复制生成的 T
 - [testing.md](testing.md)：必须保护的不变量、验证层次和性能判断方法。
 - [dependencies.md](dependencies.md)：依赖边界以及为什么选择这些依赖。
 - [status.md](status.md)：当前能力边界、尚需产品输入的扩展和演进准入条件。
+- [source-todo.md](source-todo.md)：尚未实现的 source/格式改进清单，不代表当前能力。
 - [releasing.md](releasing.md)：napi-rs 平台包、GitHub Actions、npm OIDC 和版本发布契约。
 
 ## 文档维护规则
 
 - 文档只写当前模型、设计理由和可验证契约，不保留阶段计划、旧方案或完成记录。
 - 架构文档定义所有权；runtime 文档定义时序；implementation 文档定义实现约束。
-- 尚未实现的设想只能进入 `status.md`，不得混写成当前行为。
+- 尚未实现的设想只能进入 `status.md` 或明确标记的 `source-todo.md`，不得混写成当前行为。
 - 配置字段和 TypeScript 形状以构建生成的 `index.d.ts` 为准；使用文档只解释组合方式和语义。
 - 修改 pause、seek、source、错误或 RTP 时钟语义时，代码、测试和对应文档必须在同一改动中更新。

@@ -373,6 +373,43 @@ test('live HTTP uses the same bounded producer and persistent sender', async () 
   }
 })
 
+test('misclassified Icecast URL automatically uses live semantics', async () => {
+  const server = await createHttpServerWorker(makeSineWave(0.6), {
+    'icy-name': 'Rhythm Test Radio',
+  })
+  const socket = await createBoundUdpSocket()
+  const streamer = new Streamer()
+  const streamId = `detected-live-${Date.now()}`
+  const ssrc = 0x33445567
+
+  try {
+    const packet = waitForDatagram(socket, (message) => isRtpForSsrc(message, ssrc))
+    await streamer.startStream({
+      streamId,
+      current: {
+        id: 'misclassified-radio',
+        kind: 'url',
+        url: server.url,
+        formatHint: 'wav',
+        seekable: true,
+      },
+      transport: rtpTransport(socket, ssrc),
+    })
+    await packet
+    const playing = await waitForStatus(
+      () => streamer.getStatus(streamId),
+      (status) => status.playState === 'playing' && status.current?.kind === 'live',
+    )
+    expect(playing.current?.seekable).toBe(false)
+    await expect(streamer.pauseStream(streamId)).rejects.toThrow(/live sources cannot be paused/)
+    await expect(streamer.seekStream(streamId, 1)).rejects.toThrow(/not seekable/)
+  } finally {
+    await stopStreamIfPresent(streamer, streamId)
+    await server.close()
+    await closeSocket(socket)
+  }
+})
+
 test('concurrent starts reserve ids independently and reject duplicate races', async () => {
   const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'music-concurrent-'))
   const audioPath = path.join(directory, 'audio.wav')

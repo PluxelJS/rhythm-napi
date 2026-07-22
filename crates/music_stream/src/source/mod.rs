@@ -1364,6 +1364,13 @@ async fn download_http_artifact_once(
         "mode" => transfer_mode
     )
     .record(request_started.elapsed().as_micros() as f64);
+    if is_strong_live_http_response(response.headers()) {
+        return Err(HttpAttemptError::terminal(
+            MusicStreamError::DetectedLiveSource(
+                "response contains Icecast/ICY headers".to_owned(),
+            ),
+        ));
+    }
     let declared_length = response.content_length();
     if declared_length.is_some_and(|length| length > config.max_bytes) {
         return Err(HttpAttemptError::terminal(MusicStreamError::InvalidSource(
@@ -1578,6 +1585,26 @@ fn is_retryable_http(error: &reqwest::Error) -> bool {
     }
 }
 
+fn is_strong_live_http_response(headers: &reqwest::header::HeaderMap) -> bool {
+    if headers.keys().any(|name| name.as_str().starts_with("icy-")) {
+        return true;
+    }
+    let served_by_icecast = headers
+        .get(reqwest::header::SERVER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|server| server.to_ascii_lowercase().contains("icecast"));
+    served_by_icecast
+        && headers
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|content_type| {
+                let content_type = content_type.to_ascii_lowercase();
+                content_type.starts_with("audio/")
+                    || content_type.starts_with("application/ogg")
+                    || content_type.starts_with("application/octet-stream")
+            })
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Read as _;
@@ -1587,6 +1614,41 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    #[test]
+    fn live_detection_requires_icecast_or_icy_evidence() {
+        let mut icy = reqwest::header::HeaderMap::new();
+        icy.insert("icy-name", "Test Radio".parse().expect("icy header"));
+        assert!(is_strong_live_http_response(&icy));
+
+        let mut icecast = reqwest::header::HeaderMap::new();
+        icecast.insert(
+            reqwest::header::SERVER,
+            "Icecast 2.4.4".parse().expect("server header"),
+        );
+        icecast.insert(
+            reqwest::header::CONTENT_TYPE,
+            "audio/mpeg".parse().expect("content type"),
+        );
+        assert!(is_strong_live_http_response(&icecast));
+
+        icecast.insert(
+            reqwest::header::CONTENT_TYPE,
+            "text/html".parse().expect("content type"),
+        );
+        assert!(!is_strong_live_http_response(&icecast));
+
+        let mut ambiguous = reqwest::header::HeaderMap::new();
+        ambiguous.insert(
+            reqwest::header::CONTENT_TYPE,
+            "audio/mpeg".parse().expect("content type"),
+        );
+        ambiguous.insert(
+            reqwest::header::CACHE_CONTROL,
+            "no-cache".parse().expect("cache control"),
+        );
+        assert!(!is_strong_live_http_response(&ambiguous));
+    }
 
     #[test]
     fn download_registry_periodically_prunes_dead_flight_keys() {

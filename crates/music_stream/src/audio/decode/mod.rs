@@ -76,7 +76,7 @@ impl DecoderBackend for MemoryDecoder {
 }
 pub struct SymphoniaFileDecoder {
     format: SymphoniaFormatReader,
-    decoder: SymphoniaAudioDecoder,
+    decoder: PacketAudioDecoder,
     track_id: u32,
     decode_errors: DecodeErrorBudget,
 }
@@ -90,7 +90,7 @@ impl std::fmt::Debug for SymphoniaFileDecoder {
 }
 pub struct SymphoniaStreamDecoder {
     format: SymphoniaFormatReader,
-    decoder: SymphoniaAudioDecoder,
+    decoder: PacketAudioDecoder,
     track_id: u32,
     decode_errors: DecodeErrorBudget,
 }
@@ -152,7 +152,7 @@ impl SymphoniaFileDecoder {
                 },
             )
             .map_err(map_symphonia_error)?;
-        self.decoder.reset();
+        self.decoder.reset()?;
         Ok(())
     }
 }
@@ -228,15 +228,22 @@ fn open_symphonia_decoder(
         })?
         .clone();
 
-    let decoder = symphonia::default::get_codecs()
-        .make_audio_decoder(&codec_params, &AudioDecoderOptions::default())
-        .map_err(map_symphonia_error)?;
+    let decoder = if codec_params.codec == symphonia::core::codecs::audio::well_known::CODEC_ID_OPUS
+    {
+        PacketAudioDecoder::Opus(LibOpusPacketDecoder::new(&codec_params)?)
+    } else {
+        PacketAudioDecoder::Symphonia(
+            symphonia::default::get_codecs()
+                .make_audio_decoder(&codec_params, &AudioDecoderOptions::default())
+                .map_err(map_symphonia_error)?,
+        )
+    };
 
     Ok((format, decoder, track_id))
 }
 fn poll_symphonia_decode(
     format: &mut SymphoniaFormatReader,
-    decoder: &mut SymphoniaAudioDecoder,
+    decoder: &mut PacketAudioDecoder,
     track_id: u32,
     decode_errors: &mut DecodeErrorBudget,
 ) -> Result<DecodePoll> {
@@ -247,7 +254,7 @@ fn poll_symphonia_decode(
             Ok(Some(packet)) => packet,
             Ok(None) => return Ok(DecodePoll::End),
             Err(SymphoniaError::ResetRequired) => {
-                decoder.reset();
+                decoder.reset()?;
                 continue;
             }
             Err(error) => return Err(map_symphonia_error(error)),
@@ -261,6 +268,23 @@ fn poll_symphonia_decode(
             continue;
         }
 
+        if let PacketAudioDecoder::Opus(decoder) = decoder {
+            match decoder.decode(&packet) {
+                Ok(Some(chunk)) => {
+                    decode_errors.reset();
+                    return Ok(DecodePoll::Chunk(chunk));
+                }
+                Ok(None) => continue,
+                Err(error) => {
+                    decode_errors.record_message(&error.to_string())?;
+                    continue;
+                }
+            }
+        }
+
+        let PacketAudioDecoder::Symphonia(decoder) = decoder else {
+            unreachable!("Opus packets are handled above");
+        };
         match decoder.decode(&packet) {
             Ok(audio_buf) => {
                 decode_errors.reset();
@@ -291,6 +315,111 @@ fn poll_symphonia_decode(
     }
 }
 
+enum PacketAudioDecoder {
+    Symphonia(SymphoniaAudioDecoder),
+    Opus(LibOpusPacketDecoder),
+}
+
+impl std::fmt::Debug for PacketAudioDecoder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Symphonia(_) => "PacketAudioDecoder::Symphonia",
+            Self::Opus(_) => "PacketAudioDecoder::Opus",
+        })
+    }
+}
+
+impl PacketAudioDecoder {
+    fn reset(&mut self) -> Result<()> {
+        match self {
+            Self::Symphonia(decoder) => {
+                decoder.reset();
+                Ok(())
+            }
+            Self::Opus(decoder) => decoder.reset(),
+        }
+    }
+}
+
+struct LibOpusPacketDecoder {
+    inner: opus::Decoder,
+    channels: u16,
+    output: Vec<f32>,
+}
+
+impl std::fmt::Debug for LibOpusPacketDecoder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LibOpusPacketDecoder")
+            .field("channels", &self.channels)
+            .finish_non_exhaustive()
+    }
+}
+
+impl LibOpusPacketDecoder {
+    const SAMPLE_RATE: u32 = 48_000;
+    const MAX_SAMPLES_PER_CHANNEL: usize = 5_760;
+
+    fn new(params: &symphonia::core::codecs::audio::AudioCodecParameters) -> Result<Self> {
+        let channels = params
+            .channels
+            .as_ref()
+            .map_or(0, |channels| channels.count());
+        let opus_channels = match channels {
+            1 => opus::Channels::Mono,
+            2 => opus::Channels::Stereo,
+            _ => {
+                return Err(MusicStreamError::Unsupported(
+                    "Ogg Opus input currently supports mono or stereo streams".to_owned(),
+                ));
+            }
+        };
+        let inner = opus::Decoder::new(Self::SAMPLE_RATE, opus_channels)
+            .map_err(|error| MusicStreamError::DecodeError(error.to_string()))?;
+        Ok(Self {
+            inner,
+            channels: channels as u16,
+            output: vec![0.0; Self::MAX_SAMPLES_PER_CHANNEL * channels],
+        })
+    }
+
+    fn reset(&mut self) -> Result<()> {
+        self.inner
+            .reset_state()
+            .map_err(|error| MusicStreamError::DecodeError(error.to_string()))
+    }
+
+    fn decode(&mut self, packet: &symphonia::core::packet::Packet) -> Result<Option<DecodedChunk>> {
+        if packet.data.is_empty() {
+            return Err(MusicStreamError::DecodeError(
+                "Ogg Opus packet is empty".to_owned(),
+            ));
+        }
+        let samples_per_channel = self
+            .inner
+            .decode_float(&packet.data, &mut self.output, false)
+            .map_err(|error| MusicStreamError::DecodeError(error.to_string()))?;
+        let trim_start = usize::try_from(packet.trim_start.get())
+            .unwrap_or(usize::MAX)
+            .min(samples_per_channel);
+        let trim_end = usize::try_from(packet.trim_end.get())
+            .unwrap_or(usize::MAX)
+            .min(samples_per_channel.saturating_sub(trim_start));
+        let retained = samples_per_channel.saturating_sub(trim_start + trim_end);
+        if retained == 0 {
+            return Ok(None);
+        }
+        let channels = usize::from(self.channels);
+        let start = trim_start * channels;
+        let end = start + retained * channels;
+        Ok(Some(DecodedChunk {
+            sample_rate: Self::SAMPLE_RATE,
+            channels: self.channels,
+            samples_interleaved: self.output[start..end].to_vec(),
+        }))
+    }
+}
+
 #[derive(Debug, Default)]
 struct DecodeErrorBudget {
     consecutive: usize,
@@ -298,6 +427,10 @@ struct DecodeErrorBudget {
 
 impl DecodeErrorBudget {
     fn record(&mut self, error: &symphonia::core::errors::Error) -> Result<()> {
+        self.record_message(&error.to_string())
+    }
+
+    fn record_message(&mut self, error: &str) -> Result<()> {
         self.consecutive = self.consecutive.saturating_add(1);
         if self.consecutive > MAX_CONSECUTIVE_DECODE_ERRORS {
             return Err(MusicStreamError::DecodeError(format!(
@@ -313,7 +446,7 @@ impl DecodeErrorBudget {
 }
 type SymphoniaFormatReader = Box<dyn symphonia::core::formats::FormatReader>;
 type SymphoniaAudioDecoder = Box<dyn symphonia::core::codecs::audio::AudioDecoder>;
-type SymphoniaDecoderParts = (SymphoniaFormatReader, SymphoniaAudioDecoder, u32);
+type SymphoniaDecoderParts = (SymphoniaFormatReader, PacketAudioDecoder, u32);
 fn map_symphonia_error(error: symphonia::core::errors::Error) -> MusicStreamError {
     use symphonia::core::errors::Error as SymphoniaError;
 
@@ -417,6 +550,134 @@ mod tests {
         .await
         .expect("decode task");
     }
+
+    #[tokio::test]
+    async fn symphonia_stream_decoder_reads_ogg_opus_with_libopus() {
+        let bytes = make_test_ogg_opus(2);
+        let (writer, reader) =
+            crate::source::StreamingByteReader::new(bytes.len() + 1024).expect("byte pipe");
+        writer
+            .push(bytes::Bytes::from(bytes))
+            .await
+            .expect("push Ogg Opus bytes");
+        drop(writer);
+
+        tokio::task::spawn_blocking(move || {
+            let mut decoder = SymphoniaStreamDecoder::open(reader, Some("opus")).expect("decoder");
+            let mut decoded_samples = 0;
+            loop {
+                match decoder.poll_decode().expect("decode") {
+                    DecodePoll::Chunk(chunk) => {
+                        assert_eq!(chunk.sample_rate, 48_000);
+                        assert_eq!(chunk.channels, 2);
+                        assert!(
+                            chunk
+                                .samples_interleaved
+                                .iter()
+                                .any(|sample| *sample != 0.0)
+                        );
+                        decoded_samples += chunk.samples_per_channel();
+                    }
+                    DecodePoll::End => break,
+                    DecodePoll::NeedMore => continue,
+                }
+            }
+            assert_eq!(decoded_samples, 1_920);
+        })
+        .await
+        .expect("decode task");
+    }
+
+    #[tokio::test]
+    async fn symphonia_stream_decoder_reads_adts_aac() {
+        use base64::Engine as _;
+
+        const ADTS_AAC: &str = "//FQgBGf/N4CAExhdmM2Mi4yOC4xMDIAQlCf///4BNWeCo3UDGW1nCZJa5aSO2SLkDqdrqgsZRWRqR7GlgJMJd93HV+r47GuRKmtRUiUiRaW0sDAwMiRIgY2bBkSJEiNmzYMDIkSI2bNm0SJFKbNmzaJEilmhzqBjLazhMktctJHbJFyAAAAAAAAADj/8VCAHd/8IUps/h+H4fhNWUuyynVlOrJdOf59urbPF67/9P3641xq9fb/9v588a41ev0//D+fPGutasN/rZbZ48tyKaxDj2CkzBEddkySYZPm0lTrN5TG3OAznAYGdwmYGBncJCQYGdwkJBgYGd3CQlYMDAzu4SEnMg58lf29EutTuxIugJ4Pbup85cr0pW9KE3szcoSVJZg0oSEkrwNKEhJK84MbNhISVBs3BgY2EhJUmaES6fONRRRQaiiiijcbXRRNDtg74O+Dvjn+fbq2zxq+//T9+uNBf/7fz540D/8P588aAAAAAAAAAAHA//FQgBHf/CFK2P4fgAAATdFinNoeQ7Dt1xxxrjV6//s8cOJq70KHoEB8y9et4NpTQ4Mo4DOcBnCQYk7hISDAzuEhIMDO4SEgwMDO7hISEgwMDO7hISVxvNzT445VlOY2ASnb/HyIZWn0B64B8IBhwAeHJjEDzYss2O+Dvgdh264440H+vHDiAAAAAAAAOP/xUIAB3/whQNpGCMHA";
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(ADTS_AAC)
+            .expect("AAC fixture");
+        let (writer, reader) =
+            crate::source::StreamingByteReader::new(bytes.len() + 1024).expect("byte pipe");
+        writer
+            .push(bytes::Bytes::from(bytes))
+            .await
+            .expect("push ADTS AAC bytes");
+        drop(writer);
+
+        tokio::task::spawn_blocking(move || {
+            let mut decoder = SymphoniaStreamDecoder::open(reader, Some("aac")).expect("decoder");
+            let chunk = match decoder.poll_decode().expect("decode") {
+                DecodePoll::Chunk(chunk) => chunk,
+                other => panic!("expected AAC chunk, got {other:?}"),
+            };
+            assert_eq!(chunk.sample_rate, 44_100);
+            assert_eq!(chunk.channels, 2);
+            assert!(!chunk.samples_interleaved.is_empty());
+        })
+        .await
+        .expect("decode task");
+    }
+
+    fn make_test_ogg_opus(channels: u8) -> Vec<u8> {
+        use ogg::writing::{PacketWriteEndInfo, PacketWriter};
+
+        let opus_channels = match channels {
+            1 => opus::Channels::Mono,
+            2 => opus::Channels::Stereo,
+            _ => panic!("test helper supports mono or stereo"),
+        };
+        let mut encoder = opus::Encoder::new(48_000, opus_channels, opus::Application::Audio)
+            .expect("Opus encoder");
+        let mut writer = PacketWriter::new(Vec::new());
+        let serial = 0x5248_5954;
+
+        let mut head = Vec::with_capacity(19);
+        head.extend_from_slice(b"OpusHead");
+        head.push(1);
+        head.push(channels);
+        head.extend_from_slice(&0_u16.to_le_bytes());
+        head.extend_from_slice(&48_000_u32.to_le_bytes());
+        head.extend_from_slice(&0_i16.to_le_bytes());
+        head.push(0);
+        writer
+            .write_packet(head, serial, PacketWriteEndInfo::EndPage, 0)
+            .expect("OpusHead");
+
+        let mut tags = Vec::with_capacity(16);
+        tags.extend_from_slice(b"OpusTags");
+        tags.extend_from_slice(&0_u32.to_le_bytes());
+        tags.extend_from_slice(&0_u32.to_le_bytes());
+        writer
+            .write_packet(tags, serial, PacketWriteEndInfo::EndPage, 0)
+            .expect("OpusTags");
+
+        for packet_index in 0..2 {
+            let mut pcm = Vec::with_capacity(960 * usize::from(channels));
+            for sample in 0..960 {
+                let value = ((sample + packet_index * 960) as f32 * std::f32::consts::TAU * 440.0
+                    / 48_000.0)
+                    .sin()
+                    * 0.25;
+                pcm.extend(std::iter::repeat_n(value, usize::from(channels)));
+            }
+            let mut packet = vec![0_u8; 1_500];
+            let packet_len = encoder
+                .encode_float(&pcm, &mut packet)
+                .expect("encode Opus packet");
+            packet.truncate(packet_len);
+            let end = if packet_index == 1 {
+                PacketWriteEndInfo::EndStream
+            } else {
+                PacketWriteEndInfo::EndPage
+            };
+            writer
+                .write_packet(packet, serial, end, ((packet_index + 1) * 960) as u64)
+                .expect("audio packet");
+        }
+
+        writer.into_inner()
+    }
+
     fn write_test_wav(path: &Path, samples_per_channel: usize) -> std::io::Result<()> {
         use std::io::Write;
 

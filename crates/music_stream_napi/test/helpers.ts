@@ -120,7 +120,10 @@ function bind(socket: Socket, host: string): Promise<void> {
   })
 }
 
-export function createHttpServerWorker(body: Buffer): Promise<HttpServerWorker> {
+export function createHttpServerWorker(
+  body: Buffer,
+  responseHeaders: Record<string, string> = {},
+): Promise<HttpServerWorker> {
   const code = `
     const http = require('node:http')
     const { parentPort, workerData } = require('node:worker_threads')
@@ -129,6 +132,7 @@ export function createHttpServerWorker(body: Buffer): Promise<HttpServerWorker> 
       response.writeHead(200, {
         'content-length': body.length,
         'content-type': 'audio/wav',
+        ...workerData.responseHeaders,
       })
       response.end(body)
     })
@@ -143,7 +147,7 @@ export function createHttpServerWorker(body: Buffer): Promise<HttpServerWorker> 
       }
     })
   `
-  return createHttpWorker(code, { body }, 'tone.wav')
+  return createHttpWorker(code, { body, responseHeaders }, 'tone.wav')
 }
 
 export function createHttpStatusServerWorker(statusCode: number): Promise<HttpServerWorker> {

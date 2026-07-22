@@ -58,6 +58,12 @@ pub enum MusicStreamError {
     #[error("invalid source: {0}")]
     InvalidSource(String),
 
+    /// Internal routing signal emitted before any response body is consumed.
+    /// Producers must convert it into the live HTTP path rather than expose it.
+    #[doc(hidden)]
+    #[error("detected live HTTP source: {0}")]
+    DetectedLiveSource(String),
+
     #[error("source timed out: {0}")]
     SourceTimeout(String),
 
@@ -100,6 +106,7 @@ impl MusicStreamError {
             Self::StreamAlreadyExists(_) => ErrorCode::StreamAlreadyExists,
             Self::InvalidConfig(_) => ErrorCode::InvalidConfig,
             Self::InvalidSource(_) => ErrorCode::InvalidSource,
+            Self::DetectedLiveSource(_) => ErrorCode::Unsupported,
             Self::SourceTimeout(_) => ErrorCode::SourceTimeout,
             Self::SourceAuthExpired(_) => ErrorCode::SourceAuthExpired,
             Self::Unsupported(_) => ErrorCode::Unsupported,

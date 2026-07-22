@@ -5,7 +5,8 @@
 - 本地文件、有界 HTTP 文件和 live HTTP 三种 source 模型。
 - 有界 URL 的渐进式 growing spool、内容+传输策略 single-flight、服从当前字节上限的
   完整 artifact LRU 和磁盘配额。
-- Symphonia decode、stereo normalize、Rubato 48 kHz resample、volume/gain/limiter 和 libopus。
+- Symphonia demux/decode、Ogg Opus mono/stereo libopus decode、stereo normalize、Rubato 48 kHz
+  resample、volume/gain/limiter 和 libopus encode。
 - 每 stream 一个长期 RTP/RTCP sender，seek、switch 和 promotion 保持 session clock 连续。
 - current/next、预载、显式暂停、source refresh、ReplayGain 建议和 RTCP quality snapshot。
 - HTTP/UDP/timer/Node async 边界与受控 blocking codec worker。

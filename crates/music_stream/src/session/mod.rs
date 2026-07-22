@@ -34,6 +34,9 @@ pub enum StreamCommand {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum WorkerEvent {
+    CurrentSourceDetectedLive {
+        generation: u64,
+    },
     CurrentPrebufferReady {
         generation: u64,
     },
@@ -251,6 +254,14 @@ impl StreamActor {
         let mut output = ActorEffects::default();
 
         match event {
+            WorkerEvent::CurrentSourceDetectedLive { generation } => {
+                if self.is_current_generation(generation)
+                    && let Some(current) = self.current.as_mut()
+                {
+                    current.source.kind = crate::model::TrackKind::Live;
+                    current.source.seekable = Some(false);
+                }
+            }
             WorkerEvent::CurrentPrebufferReady { generation } => {
                 if self.is_current_generation(generation) {
                     if let Some(current) = self.current.as_mut() {

@@ -8,7 +8,7 @@
 | `reqwest` | async HTTP、连接池、TLS | 禁止 blocking client；业务鉴权和 URL 解析留给宿主 |
 | `symphonia` | 容器 probe、demux、decode、seek | 只在受控 blocking worker 中调用 |
 | `rubato` | 高质量 sample-rate conversion | 只处理 PCM，不负责调度或 buffering |
-| `opus` | libopus 安全封装 | 固定媒体格式，编码不进入 sender task |
+| `opus` | libopus 安全封装 | 解码 Ogg Opus mono/stereo packet，并编码固定输出格式；codec 不进入 sender task |
 | `rtp`, `rtcp`, `webrtc-util` | 标准协议对象与 marshal/parse | 不承载 pacing、网关协商或 protection 策略 |
 | `bytes` | immutable payload 和低成本 slice | 不作为无界缓存容器 |
 | `tempfile`, `lru` | 完整 HTTP artifact 生命周期与内存索引 | 磁盘容量由 runtime semaphore 约束 |
