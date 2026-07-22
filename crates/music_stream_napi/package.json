@@ -43,10 +43,10 @@
 		"version": "napi version && git add npm"
 	},
 	"devDependencies": {
-		"@napi-rs/cli": "3.7.2",
-		"@types/node": "24.13.2",
-		"typescript": "6.0.3",
-		"vitest": "4.1.9"
+		"@napi-rs/cli": "3.7.4",
+		"@types/node": "26.1.1",
+		"typescript": "7.0.2",
+		"vitest": "4.1.10"
 	},
 	"napi": {
 		"binaryName": "rhythm_streamer",
