@@ -6,8 +6,8 @@ Opus queue、sender 和资源预算，不为每种协议复制播放状态机。
 ## P0：能力准确性
 
 - [ ] 若真实语料需要，扩展 Ogg Opus multistream/channel mapping；当前输入支持常见 mono/stereo。
-- [ ] 继续扩大小型格式语料测试；当前已有 ADTS AAC、Ogg Opus、WAV和faststart M4A AAC，仍需覆盖
-  MP3、FLAC、Ogg Vorbis及更多损坏输入。
+- [ ] 继续扩充生产语料；小型确定性测试现已覆盖 ADTS AAC、MP3、FLAC、Ogg Opus/Vorbis、WAV、
+  faststart M4A AAC/ALAC和损坏 FLAC header，仍需真实 VBR、多声道、超大 metadata及更多损坏样本。
 - [ ] 评估仍返回非标准 `ICY 200 OK` 状态行的老式 Shoutcast 服务；当前标准 HTTP Icecast/ICY
   响应已支持。
 

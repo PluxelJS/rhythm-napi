@@ -552,6 +552,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn symphonia_stream_decoder_reads_common_progressive_formats() {
+        let fixtures = [
+            ("mp3", include_str!("../../../testdata/sine-mono.mp3.b64")),
+            ("flac", include_str!("../../../testdata/sine-mono.flac.b64")),
+            (
+                "ogg",
+                include_str!("../../../testdata/sine-mono-vorbis.ogg.b64"),
+            ),
+            (
+                "m4a",
+                include_str!("../../../testdata/sine-mono-alac.m4a.b64"),
+            ),
+        ];
+
+        for (hint, fixture) in fixtures {
+            let bytes = decode_test_fixture(fixture);
+            let (writer, reader) =
+                crate::source::StreamingByteReader::new(bytes.len() + 1024).expect("byte pipe");
+            writer
+                .push(bytes::Bytes::from(bytes))
+                .await
+                .expect("push fixture");
+            drop(writer);
+
+            let label = hint;
+            let hint = hint.to_owned();
+            let chunk = tokio::task::spawn_blocking(move || {
+                decode_first_non_silent_stream_chunk(reader, hint)
+            })
+            .await
+            .expect("decode task")
+            .expect("decode fixture");
+
+            assert_eq!(chunk.sample_rate, 44_100, "{label}");
+            assert_eq!(chunk.channels, 1, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mp3_and_flac_decode_before_stream_completion() {
+        let fixtures = [
+            (
+                "mp3",
+                include_str!("../../../testdata/sine-mono.mp3.b64"),
+                900,
+            ),
+            (
+                "flac",
+                include_str!("../../../testdata/sine-mono.flac.b64"),
+                2_400,
+            ),
+        ];
+
+        for (hint, fixture, split) in fixtures {
+            let bytes = decode_test_fixture(fixture);
+            assert!(split < bytes.len(), "{hint}");
+            let (writer, reader) =
+                crate::source::StreamingByteReader::new(bytes.len() + 1024).expect("byte pipe");
+            writer
+                .push(bytes::Bytes::copy_from_slice(&bytes[..split]))
+                .await
+                .expect("push fixture prefix");
+
+            let label = hint;
+            let hint = hint.to_owned();
+            let mut decoder = tokio::task::spawn_blocking(move || {
+                decode_first_non_silent_stream_chunk(reader, hint)
+            });
+            let early = tokio::time::timeout(std::time::Duration::from_secs(2), &mut decoder).await;
+            let _ = writer
+                .push(bytes::Bytes::copy_from_slice(&bytes[split..]))
+                .await;
+            drop(writer);
+
+            match early {
+                Ok(result) => {
+                    let chunk = result.expect("decode task").expect("decode fixture prefix");
+                    assert_eq!(chunk.sample_rate, 44_100);
+                    assert_eq!(chunk.channels, 1);
+                }
+                Err(_) => {
+                    let _ = decoder.await;
+                    panic!("{label} decoder waited for stream completion");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn symphonia_stream_decoder_rejects_corrupted_container_header() {
+        let mut bytes = decode_test_fixture(include_str!("../../../testdata/sine-mono.flac.b64"));
+        bytes[..4].copy_from_slice(b"bad!");
+        let (writer, reader) =
+            crate::source::StreamingByteReader::new(bytes.len() + 1024).expect("byte pipe");
+        writer
+            .push(bytes::Bytes::from(bytes))
+            .await
+            .expect("push corrupt fixture");
+        drop(writer);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || {
+                SymphoniaStreamDecoder::open(reader, Some("flac"))
+                    .expect_err("corrupt FLAC header must fail")
+            }),
+        )
+        .await
+        .expect("corrupt decoder timeout")
+        .expect("decode task");
+    }
+
+    #[tokio::test]
     async fn symphonia_stream_decoder_reads_ogg_opus_with_libopus() {
         let bytes = make_test_ogg_opus(2);
         let (writer, reader) =
@@ -643,6 +756,40 @@ mod tests {
         })
         .await
         .expect("decode task");
+    }
+
+    fn decode_test_fixture(encoded: &str) -> Vec<u8> {
+        use base64::Engine as _;
+
+        let compact = encoded.split_whitespace().collect::<String>();
+        base64::engine::general_purpose::STANDARD
+            .decode(compact)
+            .expect("base64 fixture")
+    }
+
+    fn decode_first_non_silent_stream_chunk(
+        reader: crate::source::StreamingByteReader,
+        hint: String,
+    ) -> Result<DecodedChunk> {
+        let mut decoder = SymphoniaStreamDecoder::open(reader, Some(&hint))?;
+        loop {
+            match decoder.poll_decode()? {
+                DecodePoll::Chunk(chunk)
+                    if chunk
+                        .samples_interleaved
+                        .iter()
+                        .any(|sample| *sample != 0.0) =>
+                {
+                    return Ok(chunk);
+                }
+                DecodePoll::Chunk(_) | DecodePoll::NeedMore => {}
+                DecodePoll::End => {
+                    return Err(MusicStreamError::DecodeError(format!(
+                        "{hint} fixture ended before decoded audio"
+                    )));
+                }
+            }
+        }
     }
 
     fn make_test_ogg_opus(channels: u8) -> Vec<u8> {
