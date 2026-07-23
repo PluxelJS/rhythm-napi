@@ -19,6 +19,10 @@ const MAX_SOURCE_LOCATION_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrackSource {
+    /// Identity of this playback occurrence. It is deliberately separate from `id`: multiple
+    /// queue entries may share one media/cache identity while still requiring independent
+    /// lifecycle and failure accounting.
+    pub attempt_id: Option<String>,
     pub id: String,
     pub kind: TrackKind,
     pub url: Option<String>,
@@ -34,6 +38,15 @@ pub struct TrackSource {
 
 impl TrackSource {
     pub fn validate(&self) -> crate::Result<()> {
+        if self
+            .attempt_id
+            .as_deref()
+            .is_some_and(|id| id.trim().is_empty() || id.len() > MAX_TRACK_ID_BYTES)
+        {
+            return Err(crate::MusicStreamError::InvalidSource(
+                "attempt id must contain 1 to 512 bytes".to_owned(),
+            ));
+        }
         if self.id.trim().is_empty() || self.id.len() > MAX_TRACK_ID_BYTES {
             return Err(crate::MusicStreamError::InvalidSource(
                 "track id must contain 1 to 512 bytes".to_owned(),
@@ -87,8 +100,17 @@ impl TrackSource {
     }
 
     #[must_use]
-    pub fn same_identity_as(&self, other: &Self) -> bool {
-        self.stable_key() == other.stable_key()
+    pub fn same_attempt_as(&self, other: &Self) -> bool {
+        self.attempt_key() == other.attempt_key()
+    }
+
+    /// Stable lifecycle identity. Legacy callers that do not provide an occurrence id retain the
+    /// old source-id semantics.
+    #[must_use]
+    pub fn attempt_key(&self) -> &str {
+        self.attempt_id
+            .as_deref()
+            .unwrap_or_else(|| self.stable_key())
     }
 
     #[must_use]
@@ -393,6 +415,8 @@ pub struct StreamStatus {
     pub play_state: PlayState,
     pub time_played_ms: u64,
     pub generation: u64,
+    /// Last accepted desired-plan version. Zero denotes the legacy command path.
+    pub plan_version: u64,
     pub volume: VolumeLevel,
     pub gain: GainLevel,
 }
@@ -458,6 +482,7 @@ mod tests {
 
     fn source(kind: TrackKind, seekable: Option<bool>) -> TrackSource {
         TrackSource {
+            attempt_id: None,
             id: "track-a".to_owned(),
             kind,
             url: Some("https://example.test/audio".to_owned()),

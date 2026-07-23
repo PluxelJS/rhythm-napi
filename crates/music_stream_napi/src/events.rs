@@ -36,11 +36,14 @@ impl EventQueue {
             event,
         };
         if let Ok(mut events) = self.events.write() {
-            if let Some(position) = events
-                .iter()
-                .rposition(|existing| coalesces(&existing.event, &queued.event))
+            // Coalesce only an adjacent projection. Removing an older state across a demand or
+            // failure event would move the replacement behind that event and invert the actor's
+            // fact-before-request ordering.
+            if events
+                .back()
+                .is_some_and(|existing| coalesces(&existing.event, &queued.event))
             {
-                events.remove(position);
+                events.pop_back();
             }
             if events.len() == 4_096 {
                 let removable = events
@@ -112,18 +115,21 @@ pub(crate) fn event_output(queued: QueuedStreamEvent) -> StreamEventOutput {
             sequence,
             r#type: "stateChanged".to_owned(),
             stream_id: Some(status.stream_id.clone()),
-            status: Some(StreamStatusOutput::from(status)),
+            status: Some(StreamStatusOutput::from(*status)),
             ..empty()
         },
         StreamEvent::NextNeeded { stream_id } => base(sequence, "nextNeeded", stream_id),
         StreamEvent::SourceRefreshNeeded {
             stream_id,
+            attempt_id,
             track_id,
             source_role,
+            generation,
         } => StreamEventOutput {
             sequence,
             r#type: "sourceRefreshNeeded".to_owned(),
             stream_id: Some(stream_id),
+            attempt_id: Some(attempt_id),
             track_id: Some(track_id),
             source_role: Some(
                 match source_role {
@@ -132,6 +138,7 @@ pub(crate) fn event_output(queued: QueuedStreamEvent) -> StreamEventOutput {
                 }
                 .to_owned(),
             ),
+            generation: Some(i64::try_from(generation).unwrap_or(i64::MAX)),
             ..empty()
         },
         StreamEvent::NetworkQualityChanged {
@@ -164,6 +171,32 @@ pub(crate) fn event_output(queued: QueuedStreamEvent) -> StreamEventOutput {
                 .map(|v| v as f64 / 1_000.0),
             ..empty()
         },
+        StreamEvent::AttemptFailed {
+            stream_id,
+            attempt_id,
+            track_id,
+            source_role,
+            generation,
+            code,
+            message,
+        } => StreamEventOutput {
+            sequence,
+            r#type: "attemptFailed".to_owned(),
+            stream_id: Some(stream_id),
+            attempt_id: Some(attempt_id),
+            track_id: Some(track_id),
+            source_role: Some(
+                match source_role {
+                    SourceRole::Current => "current",
+                    SourceRole::Next => "next",
+                }
+                .to_owned(),
+            ),
+            generation: Some(i64::try_from(generation).unwrap_or(i64::MAX)),
+            code: Some(code.as_str().to_owned()),
+            message: Some(message),
+            ..empty()
+        },
         StreamEvent::Error {
             stream_id,
             code,
@@ -187,6 +220,7 @@ fn belongs_to(event: &StreamEvent, stream_id: &str) -> bool {
         | StreamEvent::NextNeeded { stream_id: id }
         | StreamEvent::SourceRefreshNeeded { stream_id: id, .. }
         | StreamEvent::NetworkQualityChanged { stream_id: id, .. }
+        | StreamEvent::AttemptFailed { stream_id: id, .. }
         | StreamEvent::Error { stream_id: id, .. } => id == stream_id,
     }
 }
@@ -206,6 +240,8 @@ fn empty() -> StreamEventOutput {
         r#type: String::new(),
         stream_id: None,
         track_id: None,
+        attempt_id: None,
+        generation: None,
         source_role: None,
         quality: None,
         quality_samples: None,

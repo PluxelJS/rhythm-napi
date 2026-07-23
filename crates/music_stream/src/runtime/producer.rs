@@ -1277,6 +1277,7 @@ mod tests {
             activation_started: std::time::Instant::now(),
             generation: 11,
             track: TrackSource {
+                attempt_id: None,
                 id: "prime-test".to_owned(),
                 kind: TrackKind::File,
                 url: None,
@@ -1385,6 +1386,7 @@ mod tests {
             activation_started: std::time::Instant::now(),
             generation: 1,
             track: TrackSource {
+                attempt_id: None,
                 id: "slow-url".to_owned(),
                 kind: TrackKind::Url,
                 url: Some("http://127.0.0.1:9/audio.mp3".to_owned()),
@@ -1475,6 +1477,7 @@ mod tests {
     #[test]
     fn progressive_url_policy_prefers_explicit_format_hint_and_includes_mp4_candidates() {
         let source = |url: &str, format_hint: Option<&str>| TrackSource {
+            attempt_id: None,
             id: url.to_owned(),
             kind: TrackKind::Url,
             url: Some(url.to_owned()),

@@ -1540,6 +1540,7 @@ mod tests {
             }
         });
         let source = TrackSource {
+            attempt_id: None,
             id: "hls-test".to_owned(),
             kind: crate::model::TrackKind::Url,
             url: Some(format!("http://{address}/playlist.m3u8")),
@@ -1646,6 +1647,7 @@ mod tests {
             }
         });
         let source = TrackSource {
+            attempt_id: None,
             id: "fmp4-hls-test".to_owned(),
             kind: crate::model::TrackKind::Url,
             url: Some(format!("http://{address}/playlist.m3u8")),
@@ -1718,6 +1720,7 @@ mod tests {
             }
         });
         let source = TrackSource {
+            attempt_id: None,
             id: "aes128-hls-test".to_owned(),
             kind: crate::model::TrackKind::Url,
             url: Some(format!("http://{address}/playlist.m3u8")),

@@ -41,6 +41,7 @@ fn write_wav(path: &Path, seconds: f32) {
 
 fn file_track(id: &str, path: &Path) -> TrackSource {
     TrackSource {
+        attempt_id: None,
         id: id.to_owned(),
         kind: TrackKind::File,
         url: None,
@@ -263,6 +264,7 @@ async fn preloaded_progressive_url_promotes_and_reaches_playing() {
         "url-promotion",
         file_track("a", first_wav.path()),
         Some(TrackSource {
+            attempt_id: None,
             id: "b".to_owned(),
             kind: TrackKind::Url,
             url: Some(format!("http://{address}/next.wav")),
@@ -326,6 +328,7 @@ async fn stalled_live_decode_never_blocks_rtp_deadlines() {
 
     let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("RTP bind");
     let live = TrackSource {
+        attempt_id: None,
         id: "stalled-live".to_owned(),
         kind: TrackKind::Live,
         url: Some(format!("http://{address}/live.wav")),
@@ -536,6 +539,7 @@ async fn pause_during_url_download_excludes_paused_time_from_io_timeout() {
     let runtime = StreamRuntime::start(
         "paused-download".to_owned(),
         TrackSource {
+            attempt_id: None,
             id: "paused-url".to_owned(),
             kind: TrackKind::Url,
             url: Some(format!("http://{address}/opaque")),
@@ -621,6 +625,7 @@ async fn progressive_url_sends_rtp_before_http_download_completes() {
     let runtime = StreamRuntime::start(
         "progressive-url".to_owned(),
         TrackSource {
+            attempt_id: None,
             id: "progressive-url".to_owned(),
             kind: TrackKind::Url,
             url: Some(format!("http://{address}/opaque")),
@@ -679,6 +684,7 @@ async fn next_url_added_while_paused_starts_no_download_until_resume() {
     runtime.command(StreamCommand::Pause).await.expect("pause");
     runtime
         .command(StreamCommand::SetNext(Some(TrackSource {
+            attempt_id: None,
             id: "next-url".to_owned(),
             kind: TrackKind::Url,
             url: Some(format!("http://{address}/next.wav")),
@@ -745,6 +751,7 @@ async fn switching_to_url_while_paused_preserves_pause_and_defers_download() {
     let switched = runtime
         .command(StreamCommand::SwitchTrack {
             current: TrackSource {
+                attempt_id: None,
                 id: "switched-url".to_owned(),
                 kind: TrackKind::Url,
                 url: Some(format!("http://{address}/switched.wav")),

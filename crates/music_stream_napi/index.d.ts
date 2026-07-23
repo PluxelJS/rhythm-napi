@@ -10,6 +10,7 @@ export declare class Streamer {
   getStatus(streamId: string): Promise<StreamStatusOutput>
   getStatuses(streamIds: Array<string>): Promise<Array<StreamStatusBatchItemOutput>>
   setNext(streamId: string, next?: TrackSourceInput | undefined | null): Promise<StreamStatusOutput>
+  reconcilePlan(streamId: string, plan: DesiredPlaybackPlanInput): Promise<StreamStatusOutput>
   switchTrack(streamId: string, current: TrackSourceInput, next?: TrackSourceInput | undefined | null): Promise<StreamStatusOutput>
   refreshCurrentSource(streamId: string, current: TrackSourceInput): Promise<StreamStatusOutput>
   seekStream(streamId: string, seconds: number): Promise<StreamStatusOutput>
@@ -24,6 +25,12 @@ export declare class Streamer {
   validateSourceResolverConfig(config: SourceResolverConfigInput): SourceResolverConfigOutput
   recommendReplayGain(input: ReplayGainInput): ReplayGainRecommendationOutput
   shutdown(): Promise<void>
+}
+
+export interface DesiredPlaybackPlanInput {
+  version: number
+  current?: TrackSourceInput
+  next?: TrackSourceInput
 }
 
 export interface ExternalOpusFrameAckInput {
@@ -205,6 +212,7 @@ export interface StartExternalStreamInput {
   buffer?: MediaBufferConfigInput
   volume?: number
   gainDb?: number
+  attemptStartTimeoutMs?: number
 }
 
 export interface StartStreamInput {
@@ -216,13 +224,16 @@ export interface StartStreamInput {
   buffer?: MediaBufferConfigInput
   volume?: number
   gainDb?: number
+  attemptStartTimeoutMs?: number
 }
 
 export interface StreamEventOutput {
   sequence: number
-  type: 'streamStarted' | 'streamStopped' | 'stateChanged' | 'nextNeeded' | 'sourceRefreshNeeded' | 'networkQualityChanged' | 'error'
+  type: 'streamStarted' | 'streamStopped' | 'stateChanged' | 'nextNeeded' | 'sourceRefreshNeeded' | 'networkQualityChanged' | 'attemptFailed' | 'error'
   streamId?: string
   trackId?: string
+  attemptId?: string
+  generation?: number
   sourceRole?: 'current' | 'next'
   quality?: 'good' | 'degraded' | 'poor'
   qualitySamples?: number
@@ -253,6 +264,7 @@ export interface StreamStatusOutput {
   playState: 'idle' | 'buffering' | 'playing' | 'paused' | 'stopped'
   timePlayedMs: number
   generation: number
+  planVersion: number
   volume: number
   gainDb: number
   playoutDiagnostics?: PlayoutDiagnosticsOutput
@@ -260,6 +272,7 @@ export interface StreamStatusOutput {
 }
 
 export interface TrackSourceInput {
+  attemptId?: string
   id: string
   kind: 'file' | 'url' | 'live'
   url?: string
@@ -271,6 +284,7 @@ export interface TrackSourceInput {
 }
 
 export interface TrackSourceOutput {
+  attemptId?: string
   id: string
   kind: 'file' | 'url' | 'live'
   formatHint?: string

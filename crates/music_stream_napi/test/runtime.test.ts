@@ -350,6 +350,126 @@ test('failed next preload after current end exits buffering and requests a repla
   }
 })
 
+test('a pending promoted preload is bounded by its attempt startup deadline', async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'music-next-deadline-'))
+  const currentPath = path.join(directory, 'current.wav')
+  await fs.promises.writeFile(currentPath, makeSineWave(0.04))
+  const server = http.createServer(() => {
+    // Deliberately never publish response headers. The attempt supervisor, rather than the
+    // longer source I/O timeout, must terminate this occurrence.
+  })
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('HTTP test server did not bind')
+  const socket = await createBoundUdpSocket()
+  const streamer = new Streamer()
+  const streamId = `next-deadline-${Date.now()}`
+
+  try {
+    await streamer.startStream({
+      streamId,
+      current: { id: 'current', attemptId: 'entry-a:attempt-1', kind: 'file', path: currentPath },
+      next: {
+        id: 'pending-next',
+        attemptId: 'entry-b:attempt-2',
+        kind: 'url',
+        url: `http://127.0.0.1:${address.port}/next.wav`,
+        formatHint: 'wav',
+      },
+      transport: rtpTransport(socket, 0x33445568),
+      attemptStartTimeoutMs: 80,
+      source: { http: { ioTimeoutMs: 5_000, maxRetries: 0 } },
+    })
+
+    await waitForStatus(
+      () => streamer.getStatus(streamId),
+      (status) => status.playState === 'idle' && !status.current && !status.next,
+    )
+    const events = streamer.drainEvents(streamId)
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'attemptFailed',
+        attemptId: 'entry-b:attempt-2',
+        trackId: 'pending-next',
+        sourceRole: 'next',
+        code: 'SOURCE_TIMEOUT',
+      }),
+    )
+    const state = events.find(
+      (event) => event.type === 'stateChanged' && event.status?.playState === 'idle',
+    )
+    const request = events.find((event) => event.type === 'nextNeeded')
+    expect(state).toBeDefined()
+    expect(request).toBeDefined()
+    expect(state!.sequence).toBeLessThan(request!.sequence)
+  } finally {
+    await stopStreamIfPresent(streamer, streamId)
+    server.closeAllConnections()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+    await closeSocket(socket)
+    await fs.promises.rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('desired plans are versioned and promote the exact prepared attempt', async () => {
+  const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'music-plan-version-'))
+  const firstPath = path.join(directory, 'first.wav')
+  const secondPath = path.join(directory, 'second.wav')
+  const thirdPath = path.join(directory, 'third.wav')
+  const audio = makeSineWave(2)
+  await Promise.all([
+    fs.promises.writeFile(firstPath, audio),
+    fs.promises.writeFile(secondPath, audio),
+    fs.promises.writeFile(thirdPath, audio),
+  ])
+  const socket = await createBoundUdpSocket()
+  const streamer = new Streamer()
+  const streamId = `desired-plan-${Date.now()}`
+
+  try {
+    await streamer.startStream({
+      streamId,
+      current: { id: 'first', attemptId: 'attempt-a', kind: 'file', path: firstPath },
+      next: { id: 'second', attemptId: 'attempt-b', kind: 'file', path: secondPath },
+      transport: rtpTransport(socket, 0x33445569),
+    })
+    const before = await waitForStatus(
+      () => streamer.getStatus(streamId),
+      (status) => status.next?.attemptId === 'attempt-b',
+    )
+    const preparedGeneration = before.next ? before.generation + 1 : -1
+
+    const promoted = await streamer.reconcilePlan(streamId, {
+      version: 1,
+      current: { id: 'second', attemptId: 'attempt-b', kind: 'file', path: secondPath },
+      next: { id: 'third', attemptId: 'attempt-c', kind: 'file', path: thirdPath },
+    })
+    expect(promoted).toMatchObject({
+      current: { id: 'second', attemptId: 'attempt-b' },
+      next: { id: 'third', attemptId: 'attempt-c' },
+      planVersion: 1,
+    })
+    expect(promoted.generation).toBe(preparedGeneration)
+
+    const stale = await streamer.reconcilePlan(streamId, {
+      version: 1,
+      current: { id: 'first', attemptId: 'stale-attempt', kind: 'file', path: firstPath },
+    })
+    expect(stale).toMatchObject({
+      current: { id: 'second', attemptId: 'attempt-b' },
+      next: { id: 'third', attemptId: 'attempt-c' },
+      planVersion: 1,
+    })
+  } finally {
+    await stopStreamIfPresent(streamer, streamId)
+    await closeSocket(socket)
+    await fs.promises.rm(directory, { recursive: true, force: true })
+  }
+})
+
 test('live HTTP uses the same bounded producer and persistent sender', async () => {
   const server = await createHttpServerWorker(makeSineWave(0.6))
   const socket = await createBoundUdpSocket()

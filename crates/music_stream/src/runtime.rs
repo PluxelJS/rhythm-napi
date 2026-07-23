@@ -3,6 +3,7 @@
 //! A stream owns one persistent output. Tracks are replaceable Opus producers;
 //! decode/resample/encode always runs on blocking CPU workers and can never delay output pacing.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -20,7 +21,7 @@ use sender::SenderHandle;
 
 use crate::audio::opus::LibOpusEncoderConfig;
 use crate::error::{MusicStreamError, Result};
-use crate::event::StreamEvent;
+use crate::event::{SourceRole, StreamEvent};
 use crate::model::{
     GainLevel, MediaBufferConfig, PlayState, StreamStatus, TrackSource, VolumeLevel,
 };
@@ -36,6 +37,8 @@ const SAMPLE_RATE: u32 = 48_000;
 const CHANNELS: u16 = 2;
 const FRAME_SAMPLES: u32 = 960;
 const PREBUFFER_MS: u64 = 100;
+const ATTEMPT_START_TIMEOUT: Duration = Duration::from_secs(45);
+const MAX_ATTEMPT_START_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const RTCP_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_STREAMS: usize = 1_024;
 const MAX_STREAM_ID_BYTES: usize = 512;
@@ -211,6 +214,8 @@ pub struct StreamRuntimeConfig {
     pub resources: Arc<RuntimeResources>,
     pub buffer: MediaBufferConfig,
     pub rtcp_interval: Duration,
+    /// Maximum active wall-clock time for one current/next attempt to reach its ready fact.
+    pub attempt_start_timeout: Duration,
     pub on_event: Option<Arc<dyn Fn(StreamEvent) + Send + Sync>>,
 }
 
@@ -222,6 +227,7 @@ impl std::fmt::Debug for StreamRuntimeConfig {
             .field("source", &self.source)
             .field("buffer", &self.buffer)
             .field("rtcp_interval", &self.rtcp_interval)
+            .field("attempt_start_timeout", &self.attempt_start_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -238,6 +244,7 @@ impl StreamRuntimeConfig {
                 ..MediaBufferConfig::default()
             },
             rtcp_interval: RTCP_INTERVAL,
+            attempt_start_timeout: ATTEMPT_START_TIMEOUT,
             on_event: None,
         }
     }
@@ -253,6 +260,7 @@ impl StreamRuntimeConfig {
                 ..MediaBufferConfig::default()
             },
             rtcp_interval: RTCP_INTERVAL,
+            attempt_start_timeout: ATTEMPT_START_TIMEOUT,
             on_event: None,
         }
     }
@@ -282,6 +290,13 @@ impl StreamRuntimeConfig {
         if self.rtcp_interval.is_zero() {
             return Err(MusicStreamError::InvalidConfig(
                 "RTCP interval must be greater than zero".to_owned(),
+            ));
+        }
+        if self.attempt_start_timeout.is_zero()
+            || self.attempt_start_timeout > MAX_ATTEMPT_START_TIMEOUT
+        {
+            return Err(MusicStreamError::InvalidConfig(
+                "attempt startup timeout must be between 1 millisecond and 15 minutes".to_owned(),
             ));
         }
         Ok(())
@@ -341,6 +356,24 @@ struct StreamRuntimeInner {
     next: Mutex<Option<ProducerHandle>>,
     config: StreamRuntimeConfig,
     worker_events: mpsc::Sender<WorkerEvent>,
+    startup_deadlines: std::sync::Mutex<HashMap<StartupDeadlineKey, tokio::task::AbortHandle>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct StartupDeadlineKey {
+    source_role: SourceRole,
+    generation: u64,
+    watchdog_epoch: u64,
+}
+
+impl Drop for StreamRuntimeInner {
+    fn drop(&mut self) {
+        if let Ok(deadlines) = self.startup_deadlines.get_mut() {
+            for (_, task) in deadlines.drain() {
+                task.abort();
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -480,6 +513,7 @@ impl StreamRuntime {
             next: Mutex::new(None),
             config,
             worker_events: worker_tx,
+            startup_deadlines: std::sync::Mutex::new(HashMap::new()),
         });
         spawn_worker_event_loop(Arc::downgrade(&inner), worker_rx);
         let runtime = Self { inner };
@@ -567,6 +601,12 @@ fn normalize_command_sources(command: &mut StreamCommand) {
         StreamCommand::RefreshCurrentSource { current } => {
             *current = current.clone().with_normalized_capabilities();
         }
+        StreamCommand::ReconcilePlan { current, next, .. } => {
+            *current = current
+                .take()
+                .map(TrackSource::with_normalized_capabilities);
+            *next = next.take().map(TrackSource::with_normalized_capabilities);
+        }
         StreamCommand::Play
         | StreamCommand::Pause
         | StreamCommand::Stop
@@ -587,6 +627,26 @@ fn validate_command_sources(command: &StreamCommand) -> Result<()> {
             Ok(())
         }
         StreamCommand::RefreshCurrentSource { current } => current.validate(),
+        StreamCommand::ReconcilePlan {
+            version,
+            current,
+            next,
+        } => {
+            if *version == 0 {
+                return Err(MusicStreamError::InvalidConfig(
+                    "desired playback plan version must be positive".to_owned(),
+                ));
+            }
+            if let Some(current) = current {
+                validate_planned_source(current)?;
+                current.validate()?;
+            }
+            if let Some(next) = next {
+                validate_planned_source(next)?;
+                validate_next_source(next)?;
+            }
+            Ok(())
+        }
         StreamCommand::Play
         | StreamCommand::Pause
         | StreamCommand::Stop
@@ -595,6 +655,15 @@ fn validate_command_sources(command: &StreamCommand) -> Result<()> {
         | StreamCommand::SetVolume { .. }
         | StreamCommand::SetGain { .. } => Ok(()),
     }
+}
+
+fn validate_planned_source(source: &TrackSource) -> Result<()> {
+    if source.attempt_id.is_none() {
+        return Err(MusicStreamError::InvalidSource(
+            "desired playback plan sources require an attempt id".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_next_source(next: &TrackSource) -> Result<()> {
@@ -617,6 +686,7 @@ fn spawn_worker_event_loop(
                 return;
             };
             let _guard = inner.orchestration.lock().await;
+            inner.observe_worker_event_deadline(&event);
             let (planned, output) = {
                 let actor = inner.actor.lock().await;
                 let mut planned = actor.clone();
@@ -671,6 +741,7 @@ impl StreamRuntimeInner {
     }
 
     async fn fail_runtime(&self, error: &MusicStreamError) {
+        self.cancel_all_startup_deadlines();
         let current = self.current.lock().await.take();
         let next = self.next.lock().await.take();
         let (current_result, next_result, sender_result) = tokio::join!(
@@ -698,7 +769,13 @@ impl StreamRuntimeInner {
         paused: bool,
     ) -> Result<()> {
         match action {
-            TaskAction::StartCurrent { generation, track } => {
+            TaskAction::StartCurrent {
+                generation,
+                watchdog_epoch,
+                track,
+            } => {
+                self.cancel_startup_deadlines(SourceRole::Current, None);
+                self.cancel_startup_deadlines(SourceRole::Next, Some(generation));
                 if let Some(mut producer) = take_generation(&self.next, generation).await {
                     producer.promote_to_current();
                     let receiver = producer.take_receiver()?;
@@ -724,8 +801,14 @@ impl StreamRuntimeInner {
                         .await?;
                     replace_producer(&self.current, producer).await?;
                 }
+                self.arm_startup_deadline(SourceRole::Current, generation, watchdog_epoch);
             }
-            TaskAction::PrepareNext { generation, track } => {
+            TaskAction::PrepareNext {
+                generation,
+                watchdog_epoch,
+                track,
+            } => {
+                self.cancel_startup_deadlines(SourceRole::Next, None);
                 let producer = self
                     .spawn_producer(ProducerRequest {
                         role: ProducerRole::Next,
@@ -738,22 +821,28 @@ impl StreamRuntimeInner {
                     })
                     .await?;
                 replace_producer(&self.next, producer).await?;
+                self.arm_startup_deadline(SourceRole::Next, generation, watchdog_epoch);
             }
             TaskAction::CancelCurrent { generation } => {
+                self.cancel_startup_deadlines(SourceRole::Current, Some(generation));
                 let sender_result = self.output.deactivate(generation).await;
                 let producer_result = cancel_generation(&self.current, generation).await;
                 sender_result?;
                 producer_result?;
             }
             TaskAction::CancelNext { generation } => {
+                self.cancel_startup_deadlines(SourceRole::Next, Some(generation));
                 cancel_generation(&self.next, generation).await?;
             }
             TaskAction::PauseCurrent { generation } => {
+                self.cancel_startup_deadlines(SourceRole::Current, Some(generation));
+                self.cancel_startup_deadlines(SourceRole::Next, None);
                 pause_generation(&self.current, generation).await;
                 pause_slot(&self.next).await;
                 self.output.pause(generation).await?;
             }
             TaskAction::PauseNext { generation } => {
+                self.cancel_startup_deadlines(SourceRole::Next, Some(generation));
                 pause_generation(&self.next, generation).await;
             }
             TaskAction::ResumeCurrent { generation } => {
@@ -764,6 +853,11 @@ impl StreamRuntimeInner {
             TaskAction::ResumeNext { generation } => {
                 resume_generation(&self.next, generation).await;
             }
+            TaskAction::ArmStartupDeadline {
+                source_role,
+                generation,
+                watchdog_epoch,
+            } => self.arm_startup_deadline(source_role, generation, watchdog_epoch),
             TaskAction::SetCurrentVolume { generation, volume } => {
                 set_volume(&self.current, generation, volume).await;
             }
@@ -777,6 +871,7 @@ impl StreamRuntimeInner {
                 set_gain(&self.next, generation, gain).await;
             }
             TaskAction::StopSender => {
+                self.cancel_all_startup_deadlines();
                 let current = self.current.lock().await.take();
                 let next = self.next.lock().await.take();
                 let (current_result, next_result) =
@@ -789,6 +884,86 @@ impl StreamRuntimeInner {
             }
         }
         Ok(())
+    }
+
+    fn arm_startup_deadline(&self, source_role: SourceRole, generation: u64, watchdog_epoch: u64) {
+        let key = StartupDeadlineKey {
+            source_role,
+            generation,
+            watchdog_epoch,
+        };
+        let timeout = self.config.attempt_start_timeout;
+        let events = self.worker_events.clone();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            let _ = events
+                .send(WorkerEvent::StartupTimedOut {
+                    source_role,
+                    generation,
+                    watchdog_epoch,
+                })
+                .await;
+        });
+        let mut deadlines = self
+            .startup_deadlines
+            .lock()
+            .expect("startup deadline registry poisoned");
+        if let Some(old) = deadlines.insert(key, task.abort_handle()) {
+            old.abort();
+        }
+    }
+
+    fn observe_worker_event_deadline(&self, event: &WorkerEvent) {
+        match event {
+            WorkerEvent::CurrentPrebufferReady { generation }
+            | WorkerEvent::CurrentEnded { generation }
+            | WorkerEvent::CurrentFailed { generation, .. } => {
+                self.cancel_startup_deadlines(SourceRole::Current, Some(*generation));
+            }
+            WorkerEvent::NextReady { generation } | WorkerEvent::NextFailed { generation, .. } => {
+                self.cancel_startup_deadlines(SourceRole::Next, Some(*generation));
+            }
+            WorkerEvent::StartupTimedOut {
+                source_role,
+                generation,
+                watchdog_epoch,
+            } => {
+                self.startup_deadlines
+                    .lock()
+                    .expect("startup deadline registry poisoned")
+                    .remove(&StartupDeadlineKey {
+                        source_role: *source_role,
+                        generation: *generation,
+                        watchdog_epoch: *watchdog_epoch,
+                    });
+            }
+            WorkerEvent::CurrentSourceClassified { .. }
+            | WorkerEvent::CurrentNetworkQualityChanged { .. } => {}
+        }
+    }
+
+    fn cancel_startup_deadlines(&self, source_role: SourceRole, generation: Option<u64>) {
+        self.startup_deadlines
+            .lock()
+            .expect("startup deadline registry poisoned")
+            .retain(|key, task| {
+                let remove = key.source_role == source_role
+                    && generation.is_none_or(|generation| key.generation == generation);
+                if remove {
+                    task.abort();
+                }
+                !remove
+            });
+    }
+
+    fn cancel_all_startup_deadlines(&self) {
+        let mut deadlines = self
+            .startup_deadlines
+            .lock()
+            .expect("startup deadline registry poisoned");
+        for (_, task) in deadlines.drain() {
+            task.abort();
+        }
     }
 
     async fn spawn_producer(&self, request: ProducerRequest) -> Result<ProducerHandle> {

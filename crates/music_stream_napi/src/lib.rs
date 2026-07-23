@@ -12,8 +12,9 @@ mod events;
 mod types;
 
 use convert::{
-    external_pull_config_from_input, media_buffer_config_from_input, replay_gain_from_input,
-    runtime_resource_limits_from_input, source_config_from_input,
+    attempt_start_timeout_from_input, external_pull_config_from_input,
+    media_buffer_config_from_input, replay_gain_from_input, runtime_resource_limits_from_input,
+    source_config_from_input,
 };
 use events::{EventCallback, EventQueue, event_output};
 use types::*;
@@ -82,6 +83,9 @@ impl Streamer {
             VolumeLevel::from_unit(options.volume.unwrap_or(1.0) as f32).map_err(to_napi_error)?;
         let gain =
             GainLevel::from_db(options.gain_db.unwrap_or(0.0) as f32).map_err(to_napi_error)?;
+        let attempt_start_timeout =
+            attempt_start_timeout_from_input(options.attempt_start_timeout_ms)
+                .map_err(to_napi_error)?;
 
         {
             let mut runtimes = self.runtimes.write().await;
@@ -103,6 +107,9 @@ impl Streamer {
         let callback = Arc::clone(&self.event_callback);
         let mut config = StreamRuntimeConfig::new(transport, source);
         config.buffer = buffer;
+        if let Some(timeout) = attempt_start_timeout {
+            config.attempt_start_timeout = timeout;
+        }
         config.resources = Arc::clone(&self.resources);
         config.on_event = Some(Arc::new(move |event| events.publish(&callback, event)));
         let runtime = match StreamRuntime::start(
@@ -165,6 +172,9 @@ impl Streamer {
             VolumeLevel::from_unit(options.volume.unwrap_or(1.0) as f32).map_err(to_napi_error)?;
         let gain =
             GainLevel::from_db(options.gain_db.unwrap_or(0.0) as f32).map_err(to_napi_error)?;
+        let attempt_start_timeout =
+            attempt_start_timeout_from_input(options.attempt_start_timeout_ms)
+                .map_err(to_napi_error)?;
 
         {
             let mut runtimes = self.runtimes.write().await;
@@ -186,6 +196,9 @@ impl Streamer {
         let callback = Arc::clone(&self.event_callback);
         let mut config = StreamRuntimeConfig::new_external_pull(output, source);
         config.buffer = buffer;
+        if let Some(timeout) = attempt_start_timeout {
+            config.attempt_start_timeout = timeout;
+        }
         config.resources = Arc::clone(&self.resources);
         config.on_event = Some(Arc::new(move |event| events.publish(&callback, event)));
         let runtime = match StreamRuntime::start(
@@ -347,6 +360,41 @@ impl Streamer {
             .transpose()
             .map_err(to_napi_error)?;
         self.command(&stream_id, StreamCommand::SetNext(next)).await
+    }
+
+    #[napi]
+    pub async fn reconcile_plan(
+        &self,
+        stream_id: String,
+        plan: DesiredPlaybackPlanInput,
+    ) -> Result<StreamStatusOutput> {
+        let version = u64::try_from(plan.version)
+            .ok()
+            .filter(|version| *version > 0)
+            .ok_or_else(|| {
+                to_napi_error(MusicStreamError::InvalidConfig(
+                    "desired plan version must be a positive integer".to_owned(),
+                ))
+            })?;
+        let current = plan
+            .current
+            .map(TrackSource::try_from)
+            .transpose()
+            .map_err(to_napi_error)?;
+        let next = plan
+            .next
+            .map(TrackSource::try_from)
+            .transpose()
+            .map_err(to_napi_error)?;
+        self.command(
+            &stream_id,
+            StreamCommand::ReconcilePlan {
+                version,
+                current,
+                next,
+            },
+        )
+        .await
     }
 
     #[napi]

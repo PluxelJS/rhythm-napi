@@ -47,6 +47,7 @@ type _EventTypeContract = Assert<Equal<
   | 'nextNeeded'
   | 'sourceRefreshNeeded'
   | 'networkQualityChanged'
+  | 'attemptFailed'
   | 'error'
 >>
 type _SourceRoleContract = Assert<Equal<

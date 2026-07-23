@@ -2143,6 +2143,7 @@ mod tests {
             .await
             .expect("write");
         let source = TrackSource {
+            attempt_id: None,
             id: "a".to_owned(),
             kind: TrackKind::File,
             url: None,
@@ -2829,6 +2830,7 @@ mod tests {
 
     fn url_source(url: String) -> TrackSource {
         TrackSource {
+            attempt_id: None,
             id: "http-test".to_owned(),
             kind: TrackKind::Url,
             url: Some(url),

@@ -781,7 +781,8 @@ impl PendingWorkerEvents {
             }
             WorkerEvent::CurrentSourceClassified { .. }
             | WorkerEvent::NextReady { .. }
-            | WorkerEvent::NextFailed { .. } => {
+            | WorkerEvent::NextFailed { .. }
+            | WorkerEvent::StartupTimedOut { .. } => {
                 unreachable!("producer events never originate from the RTP sender");
             }
         }

@@ -18,6 +18,7 @@ pub struct RuntimeResourceLimitsInput {
 #[derive(Debug)]
 #[napi(object)]
 pub struct TrackSourceInput {
+    pub attempt_id: Option<String>,
     pub id: String,
     #[napi(ts_type = "'file' | 'url' | 'live'")]
     pub kind: String,
@@ -30,6 +31,14 @@ pub struct TrackSourceInput {
     pub network_policy: Option<String>,
 }
 
+#[derive(Debug)]
+#[napi(object)]
+pub struct DesiredPlaybackPlanInput {
+    pub version: i64,
+    pub current: Option<TrackSourceInput>,
+    pub next: Option<TrackSourceInput>,
+}
+
 #[derive(Clone, Debug)]
 #[napi(object)]
 pub struct StreamStatusOutput {
@@ -40,6 +49,7 @@ pub struct StreamStatusOutput {
     pub play_state: String,
     pub time_played_ms: i64,
     pub generation: i64,
+    pub plan_version: i64,
     pub volume: f64,
     pub gain_db: f64,
     pub playout_diagnostics: Option<PlayoutDiagnosticsOutput>,
@@ -79,6 +89,7 @@ pub struct StreamStatusBatchItemOutput {
 #[derive(Clone, Debug)]
 #[napi(object)]
 pub struct TrackSourceOutput {
+    pub attempt_id: Option<String>,
     pub id: String,
     #[napi(ts_type = "'file' | 'url' | 'live'")]
     pub kind: String,
@@ -91,11 +102,13 @@ pub struct TrackSourceOutput {
 pub struct StreamEventOutput {
     pub sequence: i64,
     #[napi(
-        ts_type = "'streamStarted' | 'streamStopped' | 'stateChanged' | 'nextNeeded' | 'sourceRefreshNeeded' | 'networkQualityChanged' | 'error'"
+        ts_type = "'streamStarted' | 'streamStopped' | 'stateChanged' | 'nextNeeded' | 'sourceRefreshNeeded' | 'networkQualityChanged' | 'attemptFailed' | 'error'"
     )]
     pub r#type: String,
     pub stream_id: Option<String>,
     pub track_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub generation: Option<i64>,
     #[napi(ts_type = "'current' | 'next'")]
     pub source_role: Option<String>,
     #[napi(ts_type = "'good' | 'degraded' | 'poor'")]
@@ -298,6 +311,7 @@ pub struct StartStreamInput {
     pub buffer: Option<MediaBufferConfigInput>,
     pub volume: Option<f64>,
     pub gain_db: Option<f64>,
+    pub attempt_start_timeout_ms: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -311,6 +325,7 @@ pub struct StartExternalStreamInput {
     pub buffer: Option<MediaBufferConfigInput>,
     pub volume: Option<f64>,
     pub gain_db: Option<f64>,
+    pub attempt_start_timeout_ms: Option<i64>,
 }
 
 #[derive(Debug)]

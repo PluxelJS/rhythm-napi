@@ -92,6 +92,14 @@ fn positive_millis(value: i64, name: &str) -> std::result::Result<u64, MusicStre
     Ok(value as u64)
 }
 
+pub(crate) fn attempt_start_timeout_from_input(
+    value: Option<i64>,
+) -> std::result::Result<Option<Duration>, MusicStreamError> {
+    value
+        .map(|value| positive_millis(value, "attemptStartTimeoutMs").map(Duration::from_millis))
+        .transpose()
+}
+
 fn non_negative_millis(value: i64, name: &str) -> std::result::Result<u64, MusicStreamError> {
     u64::try_from(value)
         .map_err(|_| MusicStreamError::InvalidConfig(format!("{name} must be non-negative")))
@@ -333,6 +341,7 @@ impl TryFrom<TrackSourceInput> for TrackSource {
         };
 
         Ok(Self {
+            attempt_id: value.attempt_id,
             id: value.id,
             kind,
             url: value.url,
@@ -365,6 +374,7 @@ impl From<music_stream::StreamStatus> for StreamStatusOutput {
             play_state: format!("{:?}", value.play_state).to_ascii_lowercase(),
             time_played_ms: value.time_played_ms as i64,
             generation: value.generation as i64,
+            plan_version: value.plan_version as i64,
             volume: f64::from(value.volume.as_unit()),
             gain_db: f64::from(value.gain.as_db()),
             playout_diagnostics: None,
@@ -425,6 +435,7 @@ impl From<TrackSource> for TrackSourceOutput {
         };
 
         Self {
+            attempt_id: value.attempt_id,
             id: value.id,
             kind: kind.to_owned(),
             format_hint: value.format_hint,
@@ -610,6 +621,7 @@ mod tests {
         let headers =
             HashMap::from([("referer".to_owned(), "https://www.example.test/".to_owned())]);
         let track = TrackSource::try_from(TrackSourceInput {
+            attempt_id: None,
             id: "opaque".to_owned(),
             kind: "url".to_owned(),
             url: Some("https://cdn.test/signed".to_owned()),
@@ -627,6 +639,7 @@ mod tests {
         );
 
         let error = TrackSource::try_from(TrackSourceInput {
+            attempt_id: None,
             id: "invalid".to_owned(),
             kind: "url".to_owned(),
             url: Some("https://cdn.test/signed".to_owned()),
