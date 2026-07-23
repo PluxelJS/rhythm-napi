@@ -3,6 +3,10 @@
 export declare class Streamer {
   constructor(options?: RuntimeResourceLimitsInput | undefined | null)
   startStream(options: StartStreamInput): Promise<StreamStatusOutput>
+  startExternalStream(options: StartExternalStreamInput): Promise<StreamStatusOutput>
+  pullExternalFrame(streamId: string, previous?: ExternalOpusFrameAckInput | undefined | null): Promise<ExternalOpusFrameOutput | null>
+  finishExternalFrame(streamId: string, ack: ExternalOpusFrameAckInput): Promise<void>
+  cancelExternalPull(streamId: string): Promise<void>
   getStatus(streamId: string): Promise<StreamStatusOutput>
   getStatuses(streamIds: Array<string>): Promise<Array<StreamStatusBatchItemOutput>>
   setNext(streamId: string, next?: TrackSourceInput | undefined | null): Promise<StreamStatusOutput>
@@ -20,6 +24,25 @@ export declare class Streamer {
   validateSourceResolverConfig(config: SourceResolverConfigInput): SourceResolverConfigOutput
   recommendReplayGain(input: ReplayGainInput): ReplayGainRecommendationOutput
   shutdown(): Promise<void>
+}
+
+export interface ExternalOpusFrameAckInput {
+  leaseId: number
+  generation: number
+  outcome: 'sent' | 'late' | 'cancelled' | 'outputUnavailable'
+}
+
+export interface ExternalOpusFrameOutput {
+  leaseId: number
+  generation: number
+  payload: Buffer
+  samplesPerChannel: number
+  mediaPositionMs: number
+  deadlineMonotonicNs: bigint
+}
+
+export interface ExternalPullConfigInput {
+  bitrate?: number
 }
 
 export interface HttpLiveSourceConfigInput {
@@ -171,6 +194,17 @@ export interface SourceResolverConfigInput {
 export interface SourceResolverConfigOutput {
   http: HttpSourceConfigOutput
   liveHttp: HttpLiveSourceConfigOutput
+}
+
+export interface StartExternalStreamInput {
+  streamId: string
+  current: TrackSourceInput
+  next?: TrackSourceInput
+  output?: ExternalPullConfigInput
+  source?: SourceResolverConfigInput
+  buffer?: MediaBufferConfigInput
+  volume?: number
+  gainDb?: number
 }
 
 export interface StartStreamInput {

@@ -1,4 +1,4 @@
-use napi::bindgen_prelude::Buffer;
+use napi::bindgen_prelude::{BigInt, Buffer};
 use napi_derive::napi;
 use std::collections::HashMap;
 
@@ -283,6 +283,12 @@ pub struct MediaBufferConfigInput {
 
 #[derive(Debug)]
 #[napi(object)]
+pub struct ExternalPullConfigInput {
+    pub bitrate: Option<i64>,
+}
+
+#[derive(Debug)]
+#[napi(object)]
 pub struct StartStreamInput {
     pub stream_id: String,
     pub current: TrackSourceInput,
@@ -292,6 +298,52 @@ pub struct StartStreamInput {
     pub buffer: Option<MediaBufferConfigInput>,
     pub volume: Option<f64>,
     pub gain_db: Option<f64>,
+}
+
+#[derive(Debug)]
+#[napi(object)]
+pub struct StartExternalStreamInput {
+    pub stream_id: String,
+    pub current: TrackSourceInput,
+    pub next: Option<TrackSourceInput>,
+    pub output: Option<ExternalPullConfigInput>,
+    pub source: Option<SourceResolverConfigInput>,
+    pub buffer: Option<MediaBufferConfigInput>,
+    pub volume: Option<f64>,
+    pub gain_db: Option<f64>,
+}
+
+#[derive(Debug)]
+#[napi(object)]
+pub struct ExternalOpusFrameAckInput {
+    pub lease_id: u32,
+    pub generation: i64,
+    #[napi(ts_type = "'sent' | 'late' | 'cancelled' | 'outputUnavailable'")]
+    pub outcome: String,
+}
+
+#[napi(object)]
+pub struct ExternalOpusFrameOutput {
+    pub lease_id: u32,
+    pub generation: i64,
+    pub payload: Buffer,
+    pub samples_per_channel: u32,
+    pub media_position_ms: i64,
+    pub deadline_monotonic_ns: BigInt,
+}
+
+impl std::fmt::Debug for ExternalOpusFrameOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExternalOpusFrameOutput")
+            .field("lease_id", &self.lease_id)
+            .field("generation", &self.generation)
+            .field("payload_len", &self.payload.len())
+            .field("samples_per_channel", &self.samples_per_channel)
+            .field("media_position_ms", &self.media_position_ms)
+            .field("deadline_monotonic_ns", &self.deadline_monotonic_ns)
+            .finish()
+    }
 }
 
 #[derive(Debug)]

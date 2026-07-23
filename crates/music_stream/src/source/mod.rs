@@ -92,7 +92,7 @@ impl SourceResolverConfig {
 #[derive(Debug)]
 pub struct SourceArtifactCache {
     max_bytes: u64,
-    total_bytes: u64,
+    retained_quota_bytes: u64,
     entries: LruCache<String, SourceArtifact>,
 }
 
@@ -107,7 +107,7 @@ impl SourceArtifactCache {
     pub fn new(max_bytes: u64) -> Self {
         Self {
             max_bytes,
-            total_bytes: 0,
+            retained_quota_bytes: 0,
             entries: LruCache::unbounded(),
         }
     }
@@ -125,21 +125,28 @@ impl SourceArtifactCache {
     }
 
     fn insert(&mut self, artifact: SourceArtifact) -> bool {
-        if !artifact.cacheable || artifact.len_bytes > self.max_bytes {
+        let retained_quota_bytes = artifact_tempfile_quota_bytes(artifact.len_bytes);
+        if !artifact.cacheable || retained_quota_bytes > self.max_bytes {
             return false;
         }
         if let Some(old) = self
             .entries
             .put(artifact.stable_key.clone(), artifact.clone())
         {
-            self.total_bytes = self.total_bytes.saturating_sub(old.len_bytes);
+            self.retained_quota_bytes = self
+                .retained_quota_bytes
+                .saturating_sub(artifact_tempfile_quota_bytes(old.len_bytes));
         }
-        self.total_bytes = self.total_bytes.saturating_add(artifact.len_bytes);
-        while self.total_bytes > self.max_bytes {
+        self.retained_quota_bytes = self
+            .retained_quota_bytes
+            .saturating_add(retained_quota_bytes);
+        while self.retained_quota_bytes > self.max_bytes {
             let Some((_, old)) = self.entries.pop_lru() else {
                 break;
             };
-            self.total_bytes = self.total_bytes.saturating_sub(old.len_bytes);
+            self.retained_quota_bytes = self
+                .retained_quota_bytes
+                .saturating_sub(artifact_tempfile_quota_bytes(old.len_bytes));
         }
         true
     }
@@ -148,10 +155,14 @@ impl SourceArtifactCache {
     pub fn take(&mut self) -> Self {
         Self {
             max_bytes: self.max_bytes,
-            total_bytes: std::mem::take(&mut self.total_bytes),
+            retained_quota_bytes: std::mem::take(&mut self.retained_quota_bytes),
             entries: std::mem::replace(&mut self.entries, LruCache::unbounded()),
         }
     }
+}
+
+fn artifact_tempfile_quota_bytes(bytes: u64) -> u64 {
+    u64::from(tempfile_quota_units(bytes)).saturating_mul(TEMPFILE_QUOTA_BYTES)
 }
 
 pub type SharedSourceArtifactCache = Arc<Mutex<SourceArtifactCache>>;
@@ -2092,19 +2103,19 @@ mod tests {
     }
 
     #[test]
-    fn artifact_cache_evicts_lru_entries_by_total_bytes() {
-        let mut cache = SourceArtifactCache::new(10);
-        assert!(cache.insert(test_artifact("first", 6)));
-        assert!(cache.insert(test_artifact("second", 5)));
+    fn artifact_cache_evicts_lru_entries_by_retained_tempfile_quota() {
+        let mut cache = SourceArtifactCache::new(2 * TEMPFILE_QUOTA_BYTES);
+        assert!(cache.insert(test_artifact("first", TEMPFILE_QUOTA_BYTES + 1)));
+        assert!(cache.insert(test_artifact("second", 1)));
 
-        assert_eq!(cache.total_bytes, 5);
+        assert_eq!(cache.retained_quota_bytes, TEMPFILE_QUOTA_BYTES);
         assert!(cache.get("first", u64::MAX).is_none());
-        assert_eq!(cache.get("second", u64::MAX).expect("cached").len_bytes, 5);
+        assert_eq!(cache.get("second", u64::MAX).expect("cached").len_bytes, 1);
     }
 
     #[test]
     fn artifact_cache_hit_respects_the_callers_byte_limit() {
-        let mut cache = SourceArtifactCache::new(10);
+        let mut cache = SourceArtifactCache::new(TEMPFILE_QUOTA_BYTES);
         assert!(cache.insert(test_artifact("entry", 6)));
 
         assert!(cache.get("entry", 5).is_none());
@@ -2113,15 +2124,15 @@ mod tests {
 
     #[test]
     fn taking_artifact_cache_preserves_capacity_and_empties_source() {
-        let mut cache = SourceArtifactCache::new(10);
+        let mut cache = SourceArtifactCache::new(TEMPFILE_QUOTA_BYTES);
         assert!(cache.insert(test_artifact("entry", 4)));
 
         let mut taken = cache.take();
 
-        assert_eq!(cache.max_bytes, 10);
-        assert_eq!(cache.total_bytes, 0);
+        assert_eq!(cache.max_bytes, TEMPFILE_QUOTA_BYTES);
+        assert_eq!(cache.retained_quota_bytes, 0);
         assert!(cache.get("entry", u64::MAX).is_none());
-        assert_eq!(taken.total_bytes, 4);
+        assert_eq!(taken.retained_quota_bytes, TEMPFILE_QUOTA_BYTES);
         assert!(taken.get("entry", u64::MAX).is_some());
     }
 
@@ -2388,7 +2399,7 @@ mod tests {
         let resolver = FileSourceResolver::new(
             config,
             SourceRuntimeResources {
-                cache: Arc::new(Mutex::new(SourceArtifactCache::new(1024))),
+                cache: Arc::new(Mutex::new(SourceArtifactCache::new(TEMPFILE_QUOTA_BYTES))),
                 http_downloads: Arc::new(Semaphore::new(2)),
                 http_preloads: Arc::new(Semaphore::new(1)),
                 // One worst-case reservation remains available while the first
@@ -2439,7 +2450,7 @@ mod tests {
         let resolver = FileSourceResolver::new(
             config,
             SourceRuntimeResources {
-                cache: Arc::new(Mutex::new(SourceArtifactCache::new(1024))),
+                cache: Arc::new(Mutex::new(SourceArtifactCache::new(TEMPFILE_QUOTA_BYTES))),
                 http_downloads: Arc::new(Semaphore::new(1)),
                 http_preloads: Arc::new(Semaphore::new(1)),
                 tempfile_budget: Arc::new(Semaphore::new(256)),

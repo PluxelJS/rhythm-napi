@@ -1,15 +1,61 @@
 use std::time::Duration;
 
 use music_stream::{
-    GainLevel, HttpLiveStreamConfig, HttpSourceConfig, MediaBufferConfig, MusicStreamError,
-    ReplayGainConfig, ReplayGainMetadata, ReplayGainMode, ReplayGainRecommendation,
-    ReplayGainSource, RtcpReceiverReportSnapshot, RtpEncryptionConfig, RtpTransportConfig,
-    RuntimeResourceLimits, SourceResolverConfig, StreamRuntimeProgress, TrackSource,
+    ExternalFrameAck, ExternalFrameOutcome, ExternalPullConfig, GainLevel, HttpLiveStreamConfig,
+    HttpSourceConfig, MediaBufferConfig, MusicStreamError, ReplayGainConfig, ReplayGainMetadata,
+    ReplayGainMode, ReplayGainRecommendation, ReplayGainSource, RtcpReceiverReportSnapshot,
+    RtpEncryptionConfig, RtpTransportConfig, RuntimeResourceLimits, SourceResolverConfig,
+    StreamRuntimeProgress, TrackSource,
 };
 
 use crate::types::*;
 
 const DEFAULT_MUSIC_OPUS_BITRATE_BPS: u32 = 128_000;
+
+pub(crate) fn external_pull_config_from_input(
+    input: Option<ExternalPullConfigInput>,
+) -> std::result::Result<ExternalPullConfig, MusicStreamError> {
+    let bitrate = input.and_then(|input| input.bitrate);
+    let opus_bitrate_bps = match bitrate {
+        Some(value) => Some(u32::try_from(value).map_err(|_| {
+            MusicStreamError::InvalidConfig(
+                "external output bitrate must fit in a positive u32".to_owned(),
+            )
+        })?),
+        None => Some(DEFAULT_MUSIC_OPUS_BITRATE_BPS),
+    };
+    let config = ExternalPullConfig { opus_bitrate_bps };
+    config.validate()?;
+    Ok(config)
+}
+
+impl TryFrom<ExternalOpusFrameAckInput> for ExternalFrameAck {
+    type Error = MusicStreamError;
+
+    fn try_from(value: ExternalOpusFrameAckInput) -> std::result::Result<Self, Self::Error> {
+        let generation = u64::try_from(value.generation).map_err(|_| {
+            MusicStreamError::InvalidConfig(
+                "external frame generation must be non-negative".to_owned(),
+            )
+        })?;
+        let outcome = match value.outcome.as_str() {
+            "sent" => ExternalFrameOutcome::Sent,
+            "late" => ExternalFrameOutcome::Late,
+            "cancelled" => ExternalFrameOutcome::Cancelled,
+            "outputUnavailable" => ExternalFrameOutcome::OutputUnavailable,
+            _ => {
+                return Err(MusicStreamError::InvalidConfig(
+                    "external frame outcome is invalid".to_owned(),
+                ));
+            }
+        };
+        Ok(Self {
+            lease_id: value.lease_id,
+            generation,
+            outcome,
+        })
+    }
+}
 
 pub(crate) fn media_buffer_config_from_input(
     input: Option<MediaBufferConfigInput>,

@@ -11,7 +11,7 @@ use super::StreamRuntimeProgress;
 use super::opus_queue::OpusQueueReceiver;
 use crate::audio::frame::OpusFrame;
 use crate::error::{MusicStreamError, Result};
-use crate::quality::{RtcpNetworkQualityLevel, RtcpQualityWindow};
+use crate::quality::RtcpQualityWindow;
 use crate::session::WorkerEvent;
 use crate::transport::{
     RTP_OPUS_CLOCK_RATE_HZ, RtpPacketizer, RtpTransportConfig, build_rtcp_sender_report,
@@ -388,7 +388,6 @@ async fn run_sender(
     let mut receiver_reports = 0_usize;
     let mut latest_receiver_report = None;
     let mut quality_window = RtcpQualityWindow::default();
-    let mut quality_level: Option<RtcpNetworkQualityLevel> = None;
     let mut pending_events = PendingWorkerEvents::default();
     let mut keepalive = config.rtp_keepalive_interval.map(tokio::time::interval);
     if let Some(keepalive) = keepalive.as_mut() {
@@ -728,19 +727,16 @@ async fn run_sender(
                     metrics::counter!("music_stream.runtime.rtcp_receiver_reports").increment(1);
                     latest_receiver_report = Some(snapshot);
                     let quality = quality_window.observe(snapshot);
-                    if quality_level != Some(quality.level) {
-                        quality_level = Some(quality.level);
-                        if let Some(media) = active.as_ref() {
-                            emit_worker_event(
-                                &events,
-                                &mut pending_events,
-                                WorkerEvent::CurrentNetworkQualityChanged {
-                                    generation: media.generation,
-                                    quality: quality.level,
-                                    snapshot: quality,
-                                },
-                            );
-                        }
+                    if let Some(media) = active.as_ref() {
+                        emit_worker_event(
+                            &events,
+                            &mut pending_events,
+                            WorkerEvent::CurrentNetworkQualityChanged {
+                                generation: media.generation,
+                                quality: quality.level,
+                                snapshot: quality,
+                            },
+                        );
                     }
                     if let Some(media) = active.as_ref() {
                         let _ = progress_tx.send(StreamRuntimeProgress {
@@ -886,6 +882,69 @@ mod tests {
 
         assert_eq!(samples, OPUS_FRAME_SAMPLES as usize);
         assert!(pcm.into_iter().all(|sample| sample == 0));
+    }
+
+    #[tokio::test]
+    async fn same_quality_receiver_reports_refresh_network_diagnostics() {
+        let remote = UdpSocket::bind("127.0.0.1:0").await.expect("remote");
+        let mut config = RtpTransportConfig::new(
+            "127.0.0.1",
+            remote.local_addr().expect("remote address").port(),
+            80,
+        );
+        config.local_ip = "127.0.0.1".to_owned();
+        let (events, mut event_rx) = mpsc::channel(8);
+        let sender = SenderHandle::spawn(config, 20, 100, Duration::from_secs(60), events)
+            .await
+            .expect("sender");
+        let (output, receiver) = opus_queue::bounded(400);
+        let cancellation = CancellationToken::new();
+        for _ in 0..20 {
+            output
+                .send_blocking(
+                    OpusFrame {
+                        generation: 1,
+                        payload: Bytes::from_static(b"opus"),
+                        samples_per_channel: 960,
+                        duration_ms: 20,
+                        marker: false,
+                        track_position_samples: 0,
+                    },
+                    &cancellation,
+                )
+                .expect("queue frame");
+        }
+        sender
+            .activate(1, 0, false, receiver)
+            .await
+            .expect("activate");
+
+        let mut packet = [0_u8; 1_500];
+        let (_, sender_address) =
+            tokio::time::timeout(Duration::from_secs(1), remote.recv_from(&mut packet))
+                .await
+                .expect("RTP timeout")
+                .expect("RTP receive");
+
+        remote
+            .send_to(&receiver_report(80, 0), sender_address)
+            .await
+            .expect("first receiver report");
+        let first = recv_quality_snapshot(&mut event_rx).await;
+        assert_eq!(first.samples, 1);
+        assert_eq!(first.latest_fraction_lost, 0);
+
+        remote
+            .send_to(&receiver_report(80, 1), sender_address)
+            .await
+            .expect("second receiver report");
+        let second = recv_quality_snapshot(&mut event_rx).await;
+        assert_eq!(second.samples, 2);
+        assert_eq!(second.latest_fraction_lost, 1);
+        assert_eq!(second.level, crate::quality::RtcpNetworkQualityLevel::Good);
+
+        drop(output);
+        sender.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]
@@ -1164,5 +1223,32 @@ mod tests {
         assert_eq!(progress.buffered_ms, 0);
         drop(output);
         sender.shutdown().await.expect("shutdown");
+    }
+
+    fn receiver_report(source_ssrc: u32, fraction_lost: u8) -> [u8; 32] {
+        let mut report = [0_u8; 32];
+        report[0] = 0x81;
+        report[1] = 201;
+        report[2..4].copy_from_slice(&7_u16.to_be_bytes());
+        report[4..8].copy_from_slice(&1_u32.to_be_bytes());
+        report[8..12].copy_from_slice(&source_ssrc.to_be_bytes());
+        report[12] = fraction_lost;
+        report
+    }
+
+    async fn recv_quality_snapshot(
+        events: &mut mpsc::Receiver<WorkerEvent>,
+    ) -> crate::quality::RtcpQualityWindowSnapshot {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(WorkerEvent::CurrentNetworkQualityChanged { snapshot, .. }) =
+                    events.recv().await
+                {
+                    return snapshot;
+                }
+            }
+        })
+        .await
+        .expect("network quality event timeout")
     }
 }

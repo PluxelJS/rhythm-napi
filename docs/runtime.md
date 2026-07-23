@@ -153,6 +153,8 @@ tempfile worst-case quota
 
 每个 source 的 `maxBytes` 不得超过 `Streamer` tempfile 预算的四分之一，单个 live bridge 也必须
 小于共享 live byte 预算。这些关系在启动前校验，避免运行中等待永远无法满足的 semaphore。
+artifact cache 最多保留一半 tempfile 预算，并按与 semaphore 相同的 1 MiB quota unit 计算占用；
+不能按裸文件字节淘汰，否则许多小文件会让 cache 看似未满、实际却耗尽全部 tempfile permit。
 
 ## 背压
 

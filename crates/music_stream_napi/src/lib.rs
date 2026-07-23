@@ -12,16 +12,16 @@ mod events;
 mod types;
 
 use convert::{
-    media_buffer_config_from_input, replay_gain_from_input, runtime_resource_limits_from_input,
-    source_config_from_input,
+    external_pull_config_from_input, media_buffer_config_from_input, replay_gain_from_input,
+    runtime_resource_limits_from_input, source_config_from_input,
 };
 use events::{EventCallback, EventQueue, event_output};
 use types::*;
 
 use music_stream::{
-    GainLevel, MusicStreamError, RtpTransportConfig, RuntimeResources, StreamCommand,
-    StreamRuntime, StreamRuntimeConfig, StreamRuntimeSnapshot, TrackSource, VolumeLevel,
-    recommend_replay_gain,
+    ExternalFrameAck, ExternalOpusFrame, GainLevel, MusicStreamError, RtpTransportConfig,
+    RuntimeResources, StreamCommand, StreamRuntime, StreamRuntimeConfig, StreamRuntimeSnapshot,
+    TrackSource, VolumeLevel, recommend_replay_gain,
 };
 
 type Result<T> = std::result::Result<T, Error>;
@@ -141,6 +141,135 @@ impl Streamer {
             ))));
         }
         Ok(status_output(snapshot))
+    }
+
+    #[napi]
+    pub async fn start_external_stream(
+        &self,
+        options: StartExternalStreamInput,
+    ) -> Result<StreamStatusOutput> {
+        let _lifecycle = self.lifecycle.read().await;
+        self.ensure_open().map_err(to_napi_error)?;
+        let stream_id = options.stream_id;
+        StreamRuntime::validate_stream_id(&stream_id).map_err(to_napi_error)?;
+        let current = TrackSource::try_from(options.current).map_err(to_napi_error)?;
+        let next = options
+            .next
+            .map(TrackSource::try_from)
+            .transpose()
+            .map_err(to_napi_error)?;
+        let output = external_pull_config_from_input(options.output).map_err(to_napi_error)?;
+        let source = source_config_from_input(options.source).map_err(to_napi_error)?;
+        let buffer = media_buffer_config_from_input(options.buffer).map_err(to_napi_error)?;
+        let volume =
+            VolumeLevel::from_unit(options.volume.unwrap_or(1.0) as f32).map_err(to_napi_error)?;
+        let gain =
+            GainLevel::from_db(options.gain_db.unwrap_or(0.0) as f32).map_err(to_napi_error)?;
+
+        {
+            let mut runtimes = self.runtimes.write().await;
+            if runtimes.contains_key(&stream_id) {
+                return Err(to_napi_error(MusicStreamError::StreamAlreadyExists(
+                    stream_id,
+                )));
+            }
+            if runtimes.len() >= self.resources.limits().max_streams {
+                return Err(to_napi_error(MusicStreamError::Busy(format!(
+                    "stream limit {} is exhausted",
+                    self.resources.limits().max_streams
+                ))));
+            }
+            runtimes.insert(stream_id.clone(), RuntimeEntry::Starting);
+            self.inactive.write().await.pop(&stream_id);
+        }
+        let events = self.events.clone();
+        let callback = Arc::clone(&self.event_callback);
+        let mut config = StreamRuntimeConfig::new_external_pull(output, source);
+        config.buffer = buffer;
+        config.resources = Arc::clone(&self.resources);
+        config.on_event = Some(Arc::new(move |event| events.publish(&callback, event)));
+        let runtime = match StreamRuntime::start(
+            stream_id.clone(),
+            current,
+            next,
+            config,
+            volume,
+            gain,
+        )
+        .await
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                let mut runtimes = self.runtimes.write().await;
+                if matches!(runtimes.get(&stream_id), Some(RuntimeEntry::Starting)) {
+                    runtimes.remove(&stream_id);
+                }
+                return Err(to_napi_error(error));
+            }
+        };
+        let snapshot = runtime.snapshot().await;
+        let committed = {
+            let mut runtimes = self.runtimes.write().await;
+            if matches!(runtimes.get(&stream_id), Some(RuntimeEntry::Starting)) {
+                runtimes.insert(stream_id.clone(), RuntimeEntry::Active(runtime.clone()));
+                true
+            } else {
+                false
+            }
+        };
+        if !committed {
+            let _ = runtime.shutdown().await;
+            return Err(to_napi_error(MusicStreamError::StreamClosed(format!(
+                "stream {stream_id} was removed while starting"
+            ))));
+        }
+        Ok(status_output(snapshot))
+    }
+
+    #[napi]
+    pub async fn pull_external_frame(
+        &self,
+        stream_id: String,
+        previous: Option<ExternalOpusFrameAckInput>,
+    ) -> Result<Option<ExternalOpusFrameOutput>> {
+        let runtime = self
+            .active_runtime(&stream_id)
+            .await
+            .map_err(to_napi_error)?;
+        let previous = previous
+            .map(ExternalFrameAck::try_from)
+            .transpose()
+            .map_err(to_napi_error)?;
+        runtime
+            .pull_external_frame(previous)
+            .await
+            .map(|frame| frame.map(external_frame_output))
+            .map_err(to_napi_error)
+    }
+
+    #[napi]
+    pub async fn finish_external_frame(
+        &self,
+        stream_id: String,
+        ack: ExternalOpusFrameAckInput,
+    ) -> Result<()> {
+        let runtime = self
+            .active_runtime(&stream_id)
+            .await
+            .map_err(to_napi_error)?;
+        runtime
+            .finish_external_frame(ExternalFrameAck::try_from(ack).map_err(to_napi_error)?)
+            .await
+            .map_err(to_napi_error)
+    }
+
+    #[napi]
+    pub async fn cancel_external_pull(&self, stream_id: String) -> Result<()> {
+        let runtime = self
+            .active_runtime(&stream_id)
+            .await
+            .map_err(to_napi_error)?;
+        runtime.cancel_external_pull().await.map_err(to_napi_error)
     }
 
     #[napi]
@@ -448,6 +577,21 @@ impl Streamer {
         Ok(())
     }
 
+    async fn active_runtime(
+        &self,
+        stream_id: &str,
+    ) -> std::result::Result<StreamRuntime, MusicStreamError> {
+        self.ensure_open()?;
+        StreamRuntime::validate_stream_id(stream_id)?;
+        match self.runtimes.read().await.get(stream_id).cloned() {
+            Some(RuntimeEntry::Active(runtime)) => Ok(runtime),
+            Some(RuntimeEntry::Starting) => Err(MusicStreamError::Busy(format!(
+                "stream {stream_id} is still starting"
+            ))),
+            None => Err(MusicStreamError::StreamNotFound(stream_id.to_owned())),
+        }
+    }
+
     async fn command(&self, stream_id: &str, command: StreamCommand) -> Result<StreamStatusOutput> {
         let _lifecycle = self.lifecycle.read().await;
         self.ensure_open().map_err(to_napi_error)?;
@@ -492,6 +636,31 @@ fn status_output(snapshot: StreamRuntimeSnapshot) -> StreamStatusOutput {
         output.apply_progress(snapshot.progress);
     }
     output
+}
+
+fn external_frame_output(frame: ExternalOpusFrame) -> ExternalOpusFrameOutput {
+    let remaining_ns = u64::try_from(frame.deadline_remaining().as_nanos()).unwrap_or(u64::MAX);
+    ExternalOpusFrameOutput {
+        lease_id: frame.lease_id,
+        generation: i64::try_from(frame.generation).unwrap_or(i64::MAX),
+        payload: frame.payload.to_vec().into(),
+        samples_per_channel: frame.samples_per_channel,
+        media_position_ms: i64::try_from(frame.media_position_ms).unwrap_or(i64::MAX),
+        deadline_monotonic_ns: uv_hrtime().saturating_add(remaining_ns).into(),
+    }
+}
+
+// `process.hrtime.bigint()` is backed by this same libuv clock. Calling it directly is the only
+// way to hand JavaScript an absolute monotonic deadline without a wall-clock race or per-frame JS
+// callback. Node exports the zero-argument function for every supported addon target.
+#[allow(unsafe_code)]
+fn uv_hrtime() -> u64 {
+    unsafe extern "C" {
+        #[link_name = "uv_hrtime"]
+        fn libuv_hrtime() -> u64;
+    }
+    // SAFETY: Node links libuv and `uv_hrtime` has no arguments or preconditions.
+    unsafe { libuv_hrtime() }
 }
 
 fn lock_error<T>(_: std::sync::PoisonError<T>) -> Error {

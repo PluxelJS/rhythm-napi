@@ -1,17 +1,20 @@
 //! Per-stream asynchronous media runtime.
 //!
-//! A stream owns one persistent RTP session. Tracks are replaceable Opus producers;
-//! decode/resample/encode always runs on blocking CPU workers and can never delay RTP pacing.
+//! A stream owns one persistent output. Tracks are replaceable Opus producers;
+//! decode/resample/encode always runs on blocking CPU workers and can never delay output pacing.
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 
+mod external_pull;
 mod opus_queue;
 mod producer;
 mod sender;
 
+use external_pull::ExternalPullHandle;
+pub use external_pull::{ExternalFrameAck, ExternalFrameOutcome, ExternalOpusFrame};
 use producer::{ProducerHandle, ProducerRole, ProducerSpec};
 use sender::SenderHandle;
 
@@ -43,6 +46,40 @@ const MAX_TEMPFILE_BYTES: u64 = 1024 * 1024 * 1024;
 const TEMPFILE_QUOTA_BYTES: u64 = 1024 * 1024;
 const MIN_BLOCKING_PRODUCERS: usize = 64;
 const MAX_BLOCKING_PRODUCERS: usize = 256;
+const EXTERNAL_OPUS_MAX_PACKET_BYTES: usize = 1_500;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExternalPullConfig {
+    pub opus_bitrate_bps: Option<u32>,
+}
+
+impl Default for ExternalPullConfig {
+    fn default() -> Self {
+        Self {
+            opus_bitrate_bps: Some(128_000),
+        }
+    }
+}
+
+impl ExternalPullConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self
+            .opus_bitrate_bps
+            .is_some_and(|bitrate| !(500..=512_000).contains(&bitrate))
+        {
+            return Err(MusicStreamError::InvalidConfig(
+                "external Opus bitrate must be between 500 and 512000 bps".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamOutputConfig {
+    Rtp(RtpTransportConfig),
+    ExternalPull(ExternalPullConfig),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeResourceLimits {
@@ -169,7 +206,7 @@ impl RuntimeResources {
 
 #[derive(Clone)]
 pub struct StreamRuntimeConfig {
-    pub transport: RtpTransportConfig,
+    pub output: StreamOutputConfig,
     pub source: SourceResolverConfig,
     pub resources: Arc<RuntimeResources>,
     pub buffer: MediaBufferConfig,
@@ -181,7 +218,7 @@ impl std::fmt::Debug for StreamRuntimeConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("StreamRuntimeConfig")
-            .field("transport", &self.transport)
+            .field("output", &self.output)
             .field("source", &self.source)
             .field("buffer", &self.buffer)
             .field("rtcp_interval", &self.rtcp_interval)
@@ -193,7 +230,22 @@ impl StreamRuntimeConfig {
     #[must_use]
     pub fn new(transport: RtpTransportConfig, source: SourceResolverConfig) -> Self {
         Self {
-            transport,
+            output: StreamOutputConfig::Rtp(transport),
+            source,
+            resources: Arc::new(RuntimeResources::default()),
+            buffer: MediaBufferConfig {
+                prebuffer_ms: PREBUFFER_MS,
+                ..MediaBufferConfig::default()
+            },
+            rtcp_interval: RTCP_INTERVAL,
+            on_event: None,
+        }
+    }
+
+    #[must_use]
+    pub fn new_external_pull(output: ExternalPullConfig, source: SourceResolverConfig) -> Self {
+        Self {
+            output: StreamOutputConfig::ExternalPull(output),
             source,
             resources: Arc::new(RuntimeResources::default()),
             buffer: MediaBufferConfig {
@@ -206,7 +258,10 @@ impl StreamRuntimeConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        self.transport.validate()?;
+        match &self.output {
+            StreamOutputConfig::Rtp(transport) => transport.validate()?,
+            StreamOutputConfig::ExternalPull(output) => output.validate()?,
+        }
         self.source.validate()?;
         self.buffer.validate()?;
         if self.source.live_http.max_buffered_bytes > self.resources.limits.max_live_buffered_bytes
@@ -281,11 +336,75 @@ struct StreamRuntimeInner {
     stream_permit: Mutex<Option<OwnedSemaphorePermit>>,
     actor: Mutex<StreamActor>,
     orchestration: Mutex<()>,
-    sender: SenderHandle,
+    output: OutputHandle,
     current: Mutex<Option<ProducerHandle>>,
     next: Mutex<Option<ProducerHandle>>,
     config: StreamRuntimeConfig,
     worker_events: mpsc::Sender<WorkerEvent>,
+}
+
+#[derive(Clone, Debug)]
+enum OutputHandle {
+    Rtp(SenderHandle),
+    ExternalPull(ExternalPullHandle),
+}
+
+impl OutputHandle {
+    fn progress(&self) -> StreamRuntimeProgress {
+        match self {
+            Self::Rtp(sender) => sender.progress(),
+            Self::ExternalPull(output) => output.progress(),
+        }
+    }
+
+    async fn activate(
+        &self,
+        generation: u64,
+        start_position_ms: u64,
+        paused: bool,
+        receiver: opus_queue::OpusQueueReceiver,
+    ) -> Result<()> {
+        match self {
+            Self::Rtp(sender) => {
+                sender
+                    .activate(generation, start_position_ms, paused, receiver)
+                    .await
+            }
+            Self::ExternalPull(output) => {
+                output
+                    .activate(generation, start_position_ms, paused, receiver)
+                    .await
+            }
+        }
+    }
+
+    async fn deactivate(&self, generation: u64) -> Result<()> {
+        match self {
+            Self::Rtp(sender) => sender.deactivate(generation).await,
+            Self::ExternalPull(output) => output.deactivate(generation).await,
+        }
+    }
+
+    async fn pause(&self, generation: u64) -> Result<()> {
+        match self {
+            Self::Rtp(sender) => sender.pause(generation).await,
+            Self::ExternalPull(output) => output.pause(generation).await,
+        }
+    }
+
+    async fn resume(&self, generation: u64) -> Result<()> {
+        match self {
+            Self::Rtp(sender) => sender.resume(generation).await,
+            Self::ExternalPull(output) => output.resume(generation).await,
+        }
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        match self {
+            Self::Rtp(sender) => sender.shutdown().await,
+            Self::ExternalPull(output) => output.shutdown().await,
+        }
+    }
 }
 
 struct ProducerRequest {
@@ -333,19 +452,30 @@ impl StreamRuntime {
                 ))
             })?;
         let (worker_tx, worker_rx) = mpsc::channel(64);
-        let sender = SenderHandle::spawn(
-            config.transport.clone(),
-            config.buffer.prebuffer_ms,
-            config.buffer.max_playout_lateness_ms,
-            config.rtcp_interval,
-            worker_tx.clone(),
-        )
-        .await?;
+        let output = match &config.output {
+            StreamOutputConfig::Rtp(transport) => OutputHandle::Rtp(
+                SenderHandle::spawn(
+                    transport.clone(),
+                    config.buffer.prebuffer_ms,
+                    config.buffer.max_playout_lateness_ms,
+                    config.rtcp_interval,
+                    worker_tx.clone(),
+                )
+                .await?,
+            ),
+            StreamOutputConfig::ExternalPull(_) => {
+                OutputHandle::ExternalPull(ExternalPullHandle::spawn(
+                    config.buffer.prebuffer_ms,
+                    config.buffer.max_playout_lateness_ms,
+                    worker_tx.clone(),
+                ))
+            }
+        };
         let inner = Arc::new(StreamRuntimeInner {
             stream_permit: Mutex::new(Some(stream_permit)),
             actor: Mutex::new(StreamActor::new(stream_id, Some(current), next)),
             orchestration: Mutex::new(()),
-            sender,
+            output,
             current: Mutex::new(None),
             next: Mutex::new(None),
             config,
@@ -383,7 +513,7 @@ impl StreamRuntime {
 
     pub async fn snapshot(&self) -> StreamRuntimeSnapshot {
         let mut status = self.inner.actor.lock().await.status();
-        let progress = self.inner.sender.progress();
+        let progress = self.inner.output.progress();
         if progress.generation == status.generation {
             status.time_played_ms = progress.stream_position_ms();
         }
@@ -392,6 +522,36 @@ impl StreamRuntime {
 
     pub async fn shutdown(&self) -> Result<StreamRuntimeSnapshot> {
         self.command(StreamCommand::Stop).await
+    }
+
+    pub async fn pull_external_frame(
+        &self,
+        previous: Option<ExternalFrameAck>,
+    ) -> Result<Option<ExternalOpusFrame>> {
+        match &self.inner.output {
+            OutputHandle::ExternalPull(output) => output.pull(previous).await,
+            OutputHandle::Rtp(_) => Err(MusicStreamError::Unsupported(
+                "RTP streams do not expose external Opus frames".to_owned(),
+            )),
+        }
+    }
+
+    pub async fn finish_external_frame(&self, ack: ExternalFrameAck) -> Result<()> {
+        match &self.inner.output {
+            OutputHandle::ExternalPull(output) => output.finish(ack).await,
+            OutputHandle::Rtp(_) => Err(MusicStreamError::Unsupported(
+                "RTP streams do not expose external Opus frames".to_owned(),
+            )),
+        }
+    }
+
+    pub async fn cancel_external_pull(&self) -> Result<()> {
+        match &self.inner.output {
+            OutputHandle::ExternalPull(output) => output.cancel_pull().await,
+            OutputHandle::Rtp(_) => Err(MusicStreamError::Unsupported(
+                "RTP streams do not expose external Opus frames".to_owned(),
+            )),
+        }
     }
 }
 
@@ -503,7 +663,7 @@ impl StreamRuntimeInner {
             }
         }
         let mut status = output.status;
-        let progress = self.sender.progress();
+        let progress = self.output.progress();
         if progress.generation == status.generation {
             status.time_played_ms = progress.stream_position_ms();
         }
@@ -516,7 +676,7 @@ impl StreamRuntimeInner {
         let (current_result, next_result, sender_result) = tokio::join!(
             stop_producer(current),
             stop_producer(next),
-            self.sender.shutdown(),
+            self.output.shutdown(),
         );
         self.stream_permit.lock().await.take();
         for cleanup_error in [current_result, next_result, sender_result]
@@ -542,7 +702,7 @@ impl StreamRuntimeInner {
                 if let Some(mut producer) = take_generation(&self.next, generation).await {
                     producer.promote_to_current();
                     let receiver = producer.take_receiver()?;
-                    self.sender
+                    self.output
                         .activate(generation, start_position_ms, paused, receiver)
                         .await?;
                     replace_producer(&self.current, producer).await?;
@@ -559,7 +719,7 @@ impl StreamRuntimeInner {
                         })
                         .await?;
                     let receiver = producer.take_receiver()?;
-                    self.sender
+                    self.output
                         .activate(generation, start_position_ms, paused, receiver)
                         .await?;
                     replace_producer(&self.current, producer).await?;
@@ -580,7 +740,7 @@ impl StreamRuntimeInner {
                 replace_producer(&self.next, producer).await?;
             }
             TaskAction::CancelCurrent { generation } => {
-                let sender_result = self.sender.deactivate(generation).await;
+                let sender_result = self.output.deactivate(generation).await;
                 let producer_result = cancel_generation(&self.current, generation).await;
                 sender_result?;
                 producer_result?;
@@ -591,7 +751,7 @@ impl StreamRuntimeInner {
             TaskAction::PauseCurrent { generation } => {
                 pause_generation(&self.current, generation).await;
                 pause_slot(&self.next).await;
-                self.sender.pause(generation).await?;
+                self.output.pause(generation).await?;
             }
             TaskAction::PauseNext { generation } => {
                 pause_generation(&self.next, generation).await;
@@ -599,7 +759,7 @@ impl StreamRuntimeInner {
             TaskAction::ResumeCurrent { generation } => {
                 resume_generation(&self.current, generation).await;
                 resume_slot(&self.next).await;
-                self.sender.resume(generation).await?;
+                self.output.resume(generation).await?;
             }
             TaskAction::ResumeNext { generation } => {
                 resume_generation(&self.next, generation).await;
@@ -621,7 +781,7 @@ impl StreamRuntimeInner {
                 let next = self.next.lock().await.take();
                 let (current_result, next_result) =
                     tokio::join!(stop_producer(current), stop_producer(next));
-                let sender_result = self.sender.shutdown().await;
+                let sender_result = self.output.shutdown().await;
                 self.stream_permit.lock().await.take();
                 current_result?;
                 next_result?;
@@ -644,13 +804,19 @@ impl StreamRuntimeInner {
             },
             matches!(request.role, ProducerRole::Next),
         );
+        let (max_packet_bytes, bitrate_bps) = match &self.config.output {
+            StreamOutputConfig::Rtp(transport) => (
+                transport.mtu.saturating_sub(12),
+                transport.opus_bitrate_bps.map(|value| value as i32),
+            ),
+            StreamOutputConfig::ExternalPull(output) => (
+                EXTERNAL_OPUS_MAX_PACKET_BYTES,
+                output.opus_bitrate_bps.map(|value| value as i32),
+            ),
+        };
         let opus = LibOpusEncoderConfig {
-            max_packet_bytes: self.config.transport.mtu.saturating_sub(12),
-            bitrate_bps: self
-                .config
-                .transport
-                .opus_bitrate_bps
-                .map(|value| value as i32),
+            max_packet_bytes,
+            bitrate_bps,
             ..LibOpusEncoderConfig::default()
         };
         Ok(producer::spawn(ProducerSpec {
