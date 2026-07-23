@@ -93,8 +93,10 @@ next 失败只移除 next 并报告错误，不中断仍在播放的 current。c
 - switch 接受新的 current/next，是宿主主动改变播放内容；
 - source refresh 只允许相同稳定内容身份，用于 provider URL 过期后替换临时 URL。
 
-文件和有界 URL 默认 seekable。文件直接 seek；有界 URL 非零 seek 等待完整 artifact 后使用
-Symphonia accurate seek。live 永远 non-seekable。所有旧 generation 的异步结果都由 actor 丢弃。
+文件和有界 URL 默认 seekable，也可以由宿主显式声明为 non-seekable。文件直接 seek；可 seek 的
+有界 URL 在非零 seek 时等待完整 artifact 后使用 Symphonia accurate seek。渐进 direct URL 与 HLS VOD
+可以保持 `kind: url`、`seekable: false`；live 永远 non-seekable。所有旧 generation 的异步结果都由
+actor 丢弃。
 
 替换遵循“先建新、后覆盖旧”的可原子部分；若 sender activate 等不可回滚动作失败，runtime
 统一进入 stopped，而不是提交一半状态。

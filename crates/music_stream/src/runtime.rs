@@ -316,8 +316,8 @@ impl StreamRuntime {
         volume: VolumeLevel,
         gain: GainLevel,
     ) -> Result<Self> {
-        let current = current.with_detected_kind();
-        let next = next.map(TrackSource::with_detected_kind);
+        let current = current.with_normalized_capabilities();
+        let next = next.map(TrackSource::with_normalized_capabilities);
         Self::validate_stream_id(&stream_id)?;
         config.validate()?;
         current.validate()?;
@@ -398,14 +398,14 @@ impl StreamRuntime {
 fn normalize_command_sources(command: &mut StreamCommand) {
     match command {
         StreamCommand::SetNext(next) => {
-            *next = next.take().map(TrackSource::with_detected_kind);
+            *next = next.take().map(TrackSource::with_normalized_capabilities);
         }
         StreamCommand::SwitchTrack { current, next } => {
-            *current = current.clone().with_detected_kind();
-            *next = next.take().map(TrackSource::with_detected_kind);
+            *current = current.clone().with_normalized_capabilities();
+            *next = next.take().map(TrackSource::with_normalized_capabilities);
         }
         StreamCommand::RefreshCurrentSource { current } => {
-            *current = current.clone().with_detected_kind();
+            *current = current.clone().with_normalized_capabilities();
         }
         StreamCommand::Play
         | StreamCommand::Pause
@@ -439,9 +439,9 @@ fn validate_command_sources(command: &StreamCommand) -> Result<()> {
 
 fn validate_next_source(next: &TrackSource) -> Result<()> {
     next.validate()?;
-    if next.is_live() {
+    if next.is_live() || next.is_hls() {
         return Err(MusicStreamError::Unsupported(
-            "live sources cannot be preloaded as next without a timeshift model".to_owned(),
+            "live and HLS sources cannot be preloaded as next without a timeshift model".to_owned(),
         ));
     }
     Ok(())

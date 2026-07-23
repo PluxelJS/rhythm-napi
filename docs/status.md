@@ -13,7 +13,7 @@
 - CPU、blocking producer、HTTP/live、live bytes、Opus queue、tempfile/cache 和事件容量治理。
 - HLS master/media、live reload、相对 URL、packed AAC/MP3、MPEG-TS AAC/MP3，以及
   `EXT-X-MAP`/byte-range fMP4/CMAF AAC、标准 AES-128、GAP跳过和同 codec discontinuity；master
-  选择会避开已知不支持的音频 codec，HLS 当前采用 current-only live语义。
+  选择会避开已知不支持的音频 codec；HLS 当前保持 current-only，但会用 `ENDLIST` 区分 VOD 与 live。
 - `maxStreams`、bounded stopped-status LRU和dead-flight key清理。
 - generation 过滤、staged commit、task supervision、deadline 和确定性 shutdown。
 - 迟滞上限、过期媒体丢弃、无 burst pacing 和可观测的首包/queue/RTCP 指标。

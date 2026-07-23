@@ -416,7 +416,7 @@ test('misclassified Icecast URL automatically uses live semantics', async () => 
   }
 })
 
-test('m3u8 URL automatically uses the bounded HLS source path', async () => {
+test('HLS VOD remains a finite non-seekable streaming source', async () => {
   const server = await createHlsServerWorker(makeSineWave(0.6))
   const socket = await createBoundUdpSocket()
   const streamer = new Streamer()
@@ -435,7 +435,7 @@ test('m3u8 URL automatically uses the bounded HLS source path', async () => {
       },
       transport: rtpTransport(socket, ssrc),
     })
-    expect(started.current?.kind).toBe('live')
+    expect(started.current?.kind).toBe('url')
     expect(started.current?.seekable).toBe(false)
     await packet
     const playing = await waitForStatus(
@@ -443,6 +443,8 @@ test('m3u8 URL automatically uses the bounded HLS source path', async () => {
       (status) => status.playState === 'playing',
     )
     expect(playing.current?.id).toBe('hls-radio')
+    expect(playing.current?.kind).toBe('url')
+    expect(playing.current?.seekable).toBe(false)
   } finally {
     await stopStreamIfPresent(streamer, streamId)
     await server.close()
@@ -450,7 +452,7 @@ test('m3u8 URL automatically uses the bounded HLS source path', async () => {
   }
 })
 
-test('opaque playlist URL is corrected to HLS from its response type', async () => {
+test('opaque HLS VOD is detected without being mislabeled as live', async () => {
   const server = await createHlsServerWorker(makeSineWave(0.6), 'signed-manifest')
   const socket = await createBoundUdpSocket()
   const streamer = new Streamer()
@@ -472,9 +474,44 @@ test('opaque playlist URL is corrected to HLS from its response type', async () 
     await packet
     const playing = await waitForStatus(
       () => streamer.getStatus(streamId),
+      (status) => status.playState === 'playing' && status.current?.kind === 'url',
+    )
+    expect(playing.current?.seekable).toBe(false)
+  } finally {
+    await stopStreamIfPresent(streamer, streamId)
+    await server.close()
+    await closeSocket(socket)
+  }
+})
+
+test('HLS without an end list is classified as live after probing the media playlist', async () => {
+  const server = await createHlsServerWorker(makeSineWave(0.6), 'live.m3u8', true)
+  const socket = await createBoundUdpSocket()
+  const streamer = new Streamer()
+  const streamId = `live-hls-${Date.now()}`
+  const ssrc = 0x33445570
+
+  try {
+    const packet = waitForDatagram(socket, (message) => isRtpForSsrc(message, ssrc))
+    const started = await streamer.startStream({
+      streamId,
+      current: {
+        id: 'live-hls-radio',
+        kind: 'url',
+        url: server.url,
+        seekable: true,
+      },
+      transport: rtpTransport(socket, ssrc),
+    })
+    expect(started.current?.kind).toBe('url')
+    expect(started.current?.seekable).toBe(false)
+    await packet
+    const playing = await waitForStatus(
+      () => streamer.getStatus(streamId),
       (status) => status.playState === 'playing' && status.current?.kind === 'live',
     )
     expect(playing.current?.seekable).toBe(false)
+    await expect(streamer.pauseStream(streamId)).rejects.toThrow(/live sources cannot be paused/)
   } finally {
     await stopStreamIfPresent(streamer, streamId)
     await server.close()

@@ -20,9 +20,9 @@ use crate::error::{MusicStreamError, Result};
 use crate::model::{GainLevel, MediaBufferConfig, TrackKind, TrackSource, VolumeLevel};
 use crate::session::WorkerEvent;
 use crate::source::{
-    BlockingReadObserver, FileSourceResolver, LiveByteBudget, ProgressiveUrlSource,
-    SharedUrlControl, SourceArtifact, SourceResolverConfig, UrlPlaybackSource,
-    spawn_http_hls_stream, spawn_http_live_stream, supports_progressive_url,
+    BlockingReadObserver, FileSourceResolver, HlsPlaylistKind, LiveByteBudget,
+    ProgressiveUrlSource, SharedUrlControl, SourceArtifact, SourceResolverConfig,
+    UrlPlaybackSource, spawn_http_hls_stream, spawn_http_live_stream, supports_progressive_url,
 };
 
 #[derive(Debug)]
@@ -602,8 +602,10 @@ async fn run_detected_live(
     job.role = ProducerRole::Current;
     job.next_prime_ms = None;
     job.events
-        .send(WorkerEvent::CurrentSourceDetectedLive {
+        .send(WorkerEvent::CurrentSourceClassified {
             generation: job.generation,
+            kind: TrackKind::Live,
+            seekable: false,
         })
         .await
         .map_err(|_| MusicStreamError::StreamClosed("worker event loop closed".to_owned()))?;
@@ -622,17 +624,10 @@ async fn run_detected_hls(
         ));
     }
     metrics::counter!("music_stream.source.detected_hls_fallbacks").increment(1);
-    job.track.kind = TrackKind::Live;
     job.track.seekable = Some(false);
     job.track.format_hint = Some("m3u8".to_owned());
     job.role = ProducerRole::Current;
     job.next_prime_ms = None;
-    job.events
-        .send(WorkerEvent::CurrentSourceDetectedLive {
-            generation: job.generation,
-        })
-        .await
-        .map_err(|_| MusicStreamError::StreamClosed("worker event loop closed".to_owned()))?;
     run_hls(job, source, live_byte_budget, live_streams).await
 }
 
@@ -782,7 +777,23 @@ async fn run_hls(
         acquire_job_slot(live_streams, &job.control.gate, &job.cancellation).await?;
     let admission = acquire_blocking_job(&job).await?;
     record_codec_start(&job);
-    let stream = spawn_http_hls_stream(&job.track, source.live_http, live_byte_budget)?;
+    let (stream, playlist_kind) =
+        spawn_http_hls_stream(&job.track, source.live_http, live_byte_budget).await?;
+    let mut job = job;
+    let kind = match playlist_kind {
+        HlsPlaylistKind::Vod => TrackKind::Url,
+        HlsPlaylistKind::Live => TrackKind::Live,
+    };
+    job.track.kind = kind.clone();
+    job.track.seekable = Some(false);
+    job.events
+        .send(WorkerEvent::CurrentSourceClassified {
+            generation: job.generation,
+            kind,
+            seekable: false,
+        })
+        .await
+        .map_err(|_| MusicStreamError::StreamClosed("worker event loop closed".to_owned()))?;
     run_http_stream(job, stream, None, admission).await
 }
 

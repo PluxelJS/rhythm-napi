@@ -22,7 +22,7 @@ mod hls;
 mod live;
 mod mp4;
 mod spool;
-pub(crate) use hls::spawn_http_hls_stream;
+pub(crate) use hls::{HlsPlaylistKind, spawn_http_hls_stream};
 pub use live::HttpLiveStreamConfig;
 #[cfg(test)]
 pub(crate) use live::StreamingByteReader;

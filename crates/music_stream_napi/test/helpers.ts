@@ -178,12 +178,13 @@ export function createHttpStatusServerWorker(statusCode: number): Promise<HttpSe
 export function createHlsServerWorker(
   body: Buffer,
   playlistPath = 'playlist.m3u8',
+  live = false,
 ): Promise<HttpServerWorker> {
   const code = `
     const http = require('node:http')
     const { parentPort, workerData } = require('node:worker_threads')
     const body = Buffer.from(workerData.body)
-    const playlist = Buffer.from('#EXTM3U\\n#EXT-X-TARGETDURATION:1\\n#EXT-X-MEDIA-SEQUENCE:0\\n#EXTINF:0.6,\\nsegment.wav\\n#EXT-X-ENDLIST\\n')
+    const playlist = Buffer.from('#EXTM3U\\n#EXT-X-TARGETDURATION:1\\n#EXT-X-MEDIA-SEQUENCE:0\\n#EXTINF:0.6,\\nsegment.wav\\n' + (workerData.live ? '' : '#EXT-X-ENDLIST\\n'))
     const server = http.createServer((request, response) => {
       if (request.url === '/segment.wav') {
         response.writeHead(200, {
@@ -210,7 +211,7 @@ export function createHlsServerWorker(
       }
     })
   `
-  return createHttpWorker(code, { body }, playlistPath)
+  return createHttpWorker(code, { body, live }, playlistPath)
 }
 
 function createHttpWorker(

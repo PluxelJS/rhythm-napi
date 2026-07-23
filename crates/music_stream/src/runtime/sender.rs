@@ -783,7 +783,7 @@ impl PendingWorkerEvents {
             event @ WorkerEvent::CurrentNetworkQualityChanged { .. } => {
                 self.quality = Some(event);
             }
-            WorkerEvent::CurrentSourceDetectedLive { .. }
+            WorkerEvent::CurrentSourceClassified { .. }
             | WorkerEvent::NextReady { .. }
             | WorkerEvent::NextFailed { .. } => {
                 unreachable!("producer events never originate from the RTP sender");

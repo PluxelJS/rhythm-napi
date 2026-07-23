@@ -130,9 +130,8 @@ impl TrackSource {
     }
 
     #[must_use]
-    pub fn with_detected_kind(mut self) -> Self {
+    pub fn with_normalized_capabilities(mut self) -> Self {
         if self.is_hls() {
-            self.kind = TrackKind::Live;
             self.seekable = Some(false);
         }
         self
@@ -554,12 +553,12 @@ mod tests {
     }
 
     #[test]
-    fn hls_detection_normalizes_url_sources_to_live_semantics() {
+    fn hls_detection_preserves_bounded_semantics_until_the_playlist_is_probed() {
         let mut by_extension = source(TrackKind::Url, Some(true));
         by_extension.url = Some("https://media.test/audio/index.m3u8?token=1".to_owned());
         assert!(by_extension.is_hls());
-        let normalized = by_extension.with_detected_kind();
-        assert_eq!(normalized.kind, TrackKind::Live);
+        let normalized = by_extension.with_normalized_capabilities();
+        assert_eq!(normalized.kind, TrackKind::Url);
         assert_eq!(normalized.seekable, Some(false));
 
         let mut by_hint = source(TrackKind::Url, None);

@@ -25,11 +25,26 @@ const AES128_KEY_BYTES: usize = 16;
 const MAX_MASTER_DEPTH: usize = 3;
 const LIVE_EDGE_SEGMENTS: usize = 3;
 
-pub(crate) fn spawn_http_hls_stream(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HlsPlaylistKind {
+    Vod,
+    Live,
+}
+
+struct HlsStreamSpec {
+    media_url: reqwest::Url,
+    playlist: MediaPlaylist,
+    headers: BTreeMap<String, String>,
+    network_policy: NetworkPolicy,
+    client: reqwest::Client,
+    config: HttpLiveStreamConfig,
+}
+
+pub(crate) async fn spawn_http_hls_stream(
     source: &TrackSource,
     config: HttpLiveStreamConfig,
     global_byte_budget: LiveByteBudget,
-) -> Result<HttpLiveStream> {
+) -> Result<(HttpLiveStream, HlsPlaylistKind)> {
     config.validate()?;
     if !source.is_hls() {
         return Err(MusicStreamError::InvalidSource(
@@ -48,14 +63,34 @@ pub(crate) fn spawn_http_hls_stream(
     let (writer, reader) =
         StreamingByteReader::with_global_budget(config.max_buffered_bytes, global_byte_budget)?;
     let cancellation = CancellationToken::new();
+    let byte_budget = writer.global_byte_budget();
+    let (media_url, playlist) = {
+        let http = HlsHttp {
+            client: &client,
+            headers: &headers,
+            network_policy: &network_policy,
+            config: &config,
+            cancellation: &cancellation,
+            byte_budget: &byte_budget,
+        };
+        resolve_media_playlist(&http, url).await?
+    };
+    let playlist_kind = if playlist.end_list {
+        HlsPlaylistKind::Vod
+    } else {
+        HlsPlaylistKind::Live
+    };
     let worker_cancellation = cancellation.clone();
     let task = tokio::spawn(async move {
         let result = run_http_hls_stream(
-            url,
-            headers,
-            network_policy,
-            client,
-            config,
+            HlsStreamSpec {
+                media_url,
+                playlist,
+                headers,
+                network_policy,
+                client,
+                config,
+            },
             writer.clone(),
             worker_cancellation.clone(),
         )
@@ -65,22 +100,29 @@ pub(crate) fn spawn_http_hls_stream(
         }
         result
     });
-    Ok(HttpLiveStream {
-        reader,
-        cancellation,
-        task,
-    })
+    Ok((
+        HttpLiveStream {
+            reader,
+            cancellation,
+            task,
+        },
+        playlist_kind,
+    ))
 }
 
 async fn run_http_hls_stream(
-    url: reqwest::Url,
-    headers: BTreeMap<String, String>,
-    network_policy: NetworkPolicy,
-    client: reqwest::Client,
-    config: HttpLiveStreamConfig,
+    spec: HlsStreamSpec,
     writer: StreamingByteWriter,
     cancellation: CancellationToken,
 ) -> Result<HttpLiveStreamReport> {
+    let HlsStreamSpec {
+        mut media_url,
+        mut playlist,
+        headers,
+        network_policy,
+        client,
+        config,
+    } = spec;
     let byte_budget = writer.global_byte_budget();
     let http = HlsHttp {
         client: &client,
@@ -90,7 +132,6 @@ async fn run_http_hls_stream(
         cancellation: &cancellation,
         byte_budget: &byte_budget,
     };
-    let (mut media_url, mut playlist) = resolve_media_playlist(&http, url).await?;
     let mut report = HttpLiveStreamReport::default();
     let mut next_sequence = initial_sequence(&playlist);
     let mut segment_kind = None;
@@ -1508,7 +1549,7 @@ mod tests {
             headers: BTreeMap::from([("x-provider-token".to_owned(), "trusted".to_owned())]),
             network_policy: crate::model::NetworkPolicy::Provider,
         };
-        let stream = spawn_http_hls_stream(
+        let (stream, playlist_kind) = spawn_http_hls_stream(
             &source,
             HttpLiveStreamConfig {
                 max_buffered_bytes: 32,
@@ -1516,7 +1557,9 @@ mod tests {
             },
             LiveByteBudget::new(1024).expect("budget"),
         )
+        .await
         .expect("HLS stream");
+        assert_eq!(playlist_kind, HlsPlaylistKind::Vod);
         let HttpLiveStream {
             mut reader, task, ..
         } = stream;
@@ -1612,7 +1655,7 @@ mod tests {
             headers: BTreeMap::new(),
             network_policy: crate::model::NetworkPolicy::Provider,
         };
-        let stream = spawn_http_hls_stream(
+        let (stream, playlist_kind) = spawn_http_hls_stream(
             &source,
             HttpLiveStreamConfig {
                 max_buffered_bytes: 32,
@@ -1620,7 +1663,9 @@ mod tests {
             },
             LiveByteBudget::new(1024).expect("budget"),
         )
+        .await
         .expect("HLS stream");
+        assert_eq!(playlist_kind, HlsPlaylistKind::Vod);
         let HttpLiveStream {
             mut reader, task, ..
         } = stream;
@@ -1682,7 +1727,7 @@ mod tests {
             headers: BTreeMap::new(),
             network_policy: crate::model::NetworkPolicy::Provider,
         };
-        let stream = spawn_http_hls_stream(
+        let (stream, playlist_kind) = spawn_http_hls_stream(
             &source,
             HttpLiveStreamConfig {
                 max_buffered_bytes: 32,
@@ -1690,7 +1735,9 @@ mod tests {
             },
             LiveByteBudget::new(1024).expect("budget"),
         )
+        .await
         .expect("HLS stream");
+        assert_eq!(playlist_kind, HlsPlaylistKind::Vod);
         let HttpLiveStream {
             mut reader, task, ..
         } = stream;

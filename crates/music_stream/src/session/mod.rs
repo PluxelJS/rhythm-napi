@@ -5,7 +5,7 @@
 
 use crate::error::{ErrorCode, MusicStreamError, Result};
 use crate::event::{SourceRole, StreamEvent};
-use crate::model::{GainLevel, PlayState, StreamStatus, TrackSource, VolumeLevel};
+use crate::model::{GainLevel, PlayState, StreamStatus, TrackKind, TrackSource, VolumeLevel};
 use crate::quality::{RtcpNetworkQualityLevel, RtcpQualityWindowSnapshot};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,8 +34,10 @@ pub enum StreamCommand {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum WorkerEvent {
-    CurrentSourceDetectedLive {
+    CurrentSourceClassified {
         generation: u64,
+        kind: TrackKind,
+        seekable: bool,
     },
     CurrentPrebufferReady {
         generation: u64,
@@ -254,12 +256,16 @@ impl StreamActor {
         let mut output = ActorEffects::default();
 
         match event {
-            WorkerEvent::CurrentSourceDetectedLive { generation } => {
+            WorkerEvent::CurrentSourceClassified {
+                generation,
+                kind,
+                seekable,
+            } => {
                 if self.is_current_generation(generation)
                     && let Some(current) = self.current.as_mut()
                 {
-                    current.source.kind = crate::model::TrackKind::Live;
-                    current.source.seekable = Some(false);
+                    current.source.kind = kind;
+                    current.source.seekable = Some(seekable);
                 }
             }
             WorkerEvent::CurrentPrebufferReady { generation } => {
