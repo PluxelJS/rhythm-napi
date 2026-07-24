@@ -39,9 +39,9 @@ pub use model::{
 };
 pub use quality::{RtcpNetworkQualityLevel, RtcpQualityWindowSnapshot};
 pub use runtime::{
-    ExternalFrameAck, ExternalFrameOutcome, ExternalOpusFrame, ExternalPullConfig,
-    RuntimeResourceLimits, RuntimeResources, StreamOutputConfig, StreamRuntime,
-    StreamRuntimeConfig, StreamRuntimeProgress, StreamRuntimeSnapshot,
+    ExternalFrameAck, ExternalFrameOutcome, ExternalOpusFrame, RuntimeResourceLimits,
+    RuntimeResources, StreamOutputConfig, StreamRuntime, StreamRuntimeConfig,
+    StreamRuntimeProgress, StreamRuntimeSnapshot,
 };
 pub use session::StreamCommand;
 pub use source::{

@@ -144,6 +144,7 @@ const status = await streamer.startStream({
     url: signedNextUrl,
     formatHint: 'mp3',
   },
+  opusBitrateBps: 128_000,
   transport: {
     ip: gatewayIp,
     port: gatewayRtpPort,
@@ -151,7 +152,6 @@ const status = await streamer.startStream({
     rtcpMux: false,
     audioSsrc: negotiatedSsrc,
     audioPt: 96,
-    bitrate: 128_000,
     // Optional sparse Opus silence RTP during idle/buffering/paused gaps.
     // This preserves NAT/media-server state without advancing track progress.
     rtpKeepaliveIntervalMs: 5_000,

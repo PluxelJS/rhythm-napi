@@ -46,10 +46,6 @@ export interface ExternalOpusFrameOutput {
   deadlineMonotonicNs: bigint
 }
 
-export interface ExternalPullConfigInput {
-  opusBitrateBps?: number
-}
-
 export interface HttpLiveSourceConfigInput {
   openTimeoutMs?: number
   idleTimeoutMs?: number
@@ -156,7 +152,6 @@ export interface RtpTransportConfigInput {
   rtcpPort?: number
   audioSsrc: number
   audioPt?: number
-  bitrate?: number
   rtcpMux?: boolean
   rtpKeepaliveIntervalMs?: number
   mtu?: number
@@ -175,7 +170,6 @@ export interface RtpTransportConfigOutput {
   ssrc: number
   mtu: number
   rtcpMux: boolean
-  opusBitrateBps?: number
   rtpKeepaliveIntervalMs?: number
   encryptionMode: string
 }
@@ -204,7 +198,12 @@ export interface SourceResolverConfigOutput {
 export interface StartExternalStreamInput {
   streamId: string
   current: TrackSourceInput
-  output?: ExternalPullConfigInput
+  /**
+   * Target bitrate for the shared Opus encoder.
+   *
+   * @defaultValue 128000
+   */
+  opusBitrateBps?: number
   source?: SourceResolverConfigInput
   buffer?: MediaBufferConfigInput
   volume?: number
@@ -216,6 +215,12 @@ export interface StartStreamInput {
   streamId: string
   current: TrackSourceInput
   transport: RtpTransportConfigInput
+  /**
+   * Target bitrate for the shared Opus encoder.
+   *
+   * @defaultValue 128000
+   */
+  opusBitrateBps?: number
   source?: SourceResolverConfigInput
   buffer?: MediaBufferConfigInput
   volume?: number

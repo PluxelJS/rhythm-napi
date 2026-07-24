@@ -76,12 +76,12 @@ try {
   await Promise.all(streamIds.map((streamId, index) => streamer.startStream({
     streamId,
     current: track(streamId, 0),
+    opusBitrateBps: 128_000,
     transport: {
       ip: '127.0.0.1',
       port: sinkPort,
       audioSsrc: 0x52000000 + index,
       rtcpMux: true,
-      bitrate: 128_000,
       mtu: 1_200,
     },
     buffer: {

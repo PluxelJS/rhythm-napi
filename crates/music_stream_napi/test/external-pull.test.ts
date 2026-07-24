@@ -26,7 +26,7 @@ test('external pull delivers paced Opus frames and commits progress with the nex
 	const started = await streamer.startExternalStream({
 		streamId,
 		current: { id: 'external', attemptId: 'attempt-external', kind: 'file', path: audioPath },
-		output: { opusBitrateBps: 128_000 },
+		opusBitrateBps: 128_000,
 		buffer: { prebufferMs: 20, encodedCapacityMs: 400, maxPlayoutLatenessMs: 40 },
 	})
 	expect(started.streamId).toBe(streamId)

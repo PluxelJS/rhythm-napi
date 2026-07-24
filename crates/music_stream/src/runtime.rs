@@ -50,38 +50,14 @@ const TEMPFILE_QUOTA_BYTES: u64 = 1024 * 1024;
 const MIN_BLOCKING_PRODUCERS: usize = 64;
 const MAX_BLOCKING_PRODUCERS: usize = 256;
 const EXTERNAL_OPUS_MAX_PACKET_BYTES: usize = 1_500;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExternalPullConfig {
-    pub opus_bitrate_bps: Option<u32>,
-}
-
-impl Default for ExternalPullConfig {
-    fn default() -> Self {
-        Self {
-            opus_bitrate_bps: Some(128_000),
-        }
-    }
-}
-
-impl ExternalPullConfig {
-    pub fn validate(&self) -> Result<()> {
-        if self
-            .opus_bitrate_bps
-            .is_some_and(|bitrate| !(500..=512_000).contains(&bitrate))
-        {
-            return Err(MusicStreamError::InvalidConfig(
-                "external Opus bitrate must be between 500 and 512000 bps".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-}
+const DEFAULT_OPUS_BITRATE_BPS: u32 = 128_000;
+const MIN_OPUS_BITRATE_BPS: u32 = 500;
+const MAX_OPUS_BITRATE_BPS: u32 = 512_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamOutputConfig {
     Rtp(RtpTransportConfig),
-    ExternalPull(ExternalPullConfig),
+    ExternalPull,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -210,6 +186,8 @@ impl RuntimeResources {
 #[derive(Clone)]
 pub struct StreamRuntimeConfig {
     pub output: StreamOutputConfig,
+    /// Target bitrate for the shared Opus producer, independent of output kind.
+    pub opus_bitrate_bps: u32,
     pub source: SourceResolverConfig,
     pub resources: Arc<RuntimeResources>,
     pub buffer: MediaBufferConfig,
@@ -224,6 +202,7 @@ impl std::fmt::Debug for StreamRuntimeConfig {
         formatter
             .debug_struct("StreamRuntimeConfig")
             .field("output", &self.output)
+            .field("opus_bitrate_bps", &self.opus_bitrate_bps)
             .field("source", &self.source)
             .field("buffer", &self.buffer)
             .field("rtcp_interval", &self.rtcp_interval)
@@ -237,6 +216,7 @@ impl StreamRuntimeConfig {
     pub fn new(transport: RtpTransportConfig, source: SourceResolverConfig) -> Self {
         Self {
             output: StreamOutputConfig::Rtp(transport),
+            opus_bitrate_bps: DEFAULT_OPUS_BITRATE_BPS,
             source,
             resources: Arc::new(RuntimeResources::default()),
             buffer: MediaBufferConfig {
@@ -250,9 +230,10 @@ impl StreamRuntimeConfig {
     }
 
     #[must_use]
-    pub fn new_external_pull(output: ExternalPullConfig, source: SourceResolverConfig) -> Self {
+    pub fn new_external_pull(source: SourceResolverConfig) -> Self {
         Self {
-            output: StreamOutputConfig::ExternalPull(output),
+            output: StreamOutputConfig::ExternalPull,
+            opus_bitrate_bps: DEFAULT_OPUS_BITRATE_BPS,
             source,
             resources: Arc::new(RuntimeResources::default()),
             buffer: MediaBufferConfig {
@@ -268,7 +249,12 @@ impl StreamRuntimeConfig {
     pub fn validate(&self) -> Result<()> {
         match &self.output {
             StreamOutputConfig::Rtp(transport) => transport.validate()?,
-            StreamOutputConfig::ExternalPull(output) => output.validate()?,
+            StreamOutputConfig::ExternalPull => {}
+        }
+        if !(MIN_OPUS_BITRATE_BPS..=MAX_OPUS_BITRATE_BPS).contains(&self.opus_bitrate_bps) {
+            return Err(MusicStreamError::InvalidConfig(
+                "Opus bitrate must be between 500 and 512000 bps".to_owned(),
+            ));
         }
         self.source.validate()?;
         self.buffer.validate()?;
@@ -491,7 +477,7 @@ impl StreamRuntime {
                 )
                 .await?,
             ),
-            StreamOutputConfig::ExternalPull(_) => {
+            StreamOutputConfig::ExternalPull => {
                 OutputHandle::ExternalPull(ExternalPullHandle::spawn(
                     config.buffer.prebuffer_ms,
                     config.buffer.max_playout_lateness_ms,
@@ -962,19 +948,13 @@ impl StreamRuntimeInner {
             },
             matches!(request.role, ProducerRole::Next),
         );
-        let (max_packet_bytes, bitrate_bps) = match &self.config.output {
-            StreamOutputConfig::Rtp(transport) => (
-                transport.mtu.saturating_sub(12),
-                transport.opus_bitrate_bps.map(|value| value as i32),
-            ),
-            StreamOutputConfig::ExternalPull(output) => (
-                EXTERNAL_OPUS_MAX_PACKET_BYTES,
-                output.opus_bitrate_bps.map(|value| value as i32),
-            ),
+        let max_packet_bytes = match &self.config.output {
+            StreamOutputConfig::Rtp(transport) => transport.mtu.saturating_sub(12),
+            StreamOutputConfig::ExternalPull => EXTERNAL_OPUS_MAX_PACKET_BYTES,
         };
         let opus = LibOpusEncoderConfig {
             max_packet_bytes,
-            bitrate_bps,
+            bitrate_bps: Some(self.config.opus_bitrate_bps as i32),
             ..LibOpusEncoderConfig::default()
         };
         Ok(producer::spawn(ProducerSpec {
@@ -1116,5 +1096,28 @@ mod tests {
     #[test]
     fn default_runtime_uses_twenty_millisecond_opus_frames() {
         assert_eq!(FRAME_SAMPLES * 1_000 / SAMPLE_RATE, 20);
+    }
+
+    #[test]
+    fn opus_bitrate_is_validated_independently_of_output_kind() {
+        let mut rtp = StreamRuntimeConfig::new(
+            RtpTransportConfig::new("127.0.0.1", 5_000, 42),
+            SourceResolverConfig::default(),
+        );
+        rtp.opus_bitrate_bps = 499;
+        assert_eq!(
+            rtp.validate().expect_err("low RTP bitrate").code(),
+            crate::error::ErrorCode::InvalidConfig
+        );
+
+        let mut external = StreamRuntimeConfig::new_external_pull(SourceResolverConfig::default());
+        external.opus_bitrate_bps = 512_001;
+        assert_eq!(
+            external
+                .validate()
+                .expect_err("high external bitrate")
+                .code(),
+            crate::error::ErrorCode::InvalidConfig
+        );
     }
 }

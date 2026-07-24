@@ -1,32 +1,27 @@
 use std::time::Duration;
 
 use music_stream::{
-    ExternalFrameAck, ExternalFrameOutcome, ExternalPullConfig, GainLevel, HttpLiveStreamConfig,
-    HttpSourceConfig, MediaBufferConfig, MusicStreamError, ReplayGainConfig, ReplayGainMetadata,
-    ReplayGainMode, ReplayGainRecommendation, ReplayGainSource, RtcpReceiverReportSnapshot,
-    RtpEncryptionConfig, RtpTransportConfig, RuntimeResourceLimits, SourceResolverConfig,
-    StreamRuntimeProgress, TrackSource,
+    ExternalFrameAck, ExternalFrameOutcome, GainLevel, HttpLiveStreamConfig, HttpSourceConfig,
+    MediaBufferConfig, MusicStreamError, ReplayGainConfig, ReplayGainMetadata, ReplayGainMode,
+    ReplayGainRecommendation, ReplayGainSource, RtcpReceiverReportSnapshot, RtpEncryptionConfig,
+    RtpTransportConfig, RuntimeResourceLimits, SourceResolverConfig, StreamRuntimeProgress,
+    TrackSource,
 };
 
 use crate::types::*;
 
-const DEFAULT_MUSIC_OPUS_BITRATE_BPS: u32 = 128_000;
-
-pub(crate) fn external_pull_config_from_input(
-    input: Option<ExternalPullConfigInput>,
-) -> std::result::Result<ExternalPullConfig, MusicStreamError> {
-    let bitrate = input.and_then(|input| input.opus_bitrate_bps);
-    let opus_bitrate_bps = match bitrate {
-        Some(value) => Some(u32::try_from(value).map_err(|_| {
-            MusicStreamError::InvalidConfig(
-                "external Opus bitrate must fit in a positive u32".to_owned(),
-            )
-        })?),
-        None => Some(DEFAULT_MUSIC_OPUS_BITRATE_BPS),
-    };
-    let config = ExternalPullConfig { opus_bitrate_bps };
-    config.validate()?;
-    Ok(config)
+pub(crate) fn opus_bitrate_from_input(
+    input: Option<i64>,
+) -> std::result::Result<Option<u32>, MusicStreamError> {
+    input
+        .map(|value| {
+            u32::try_from(value).map_err(|_| {
+                MusicStreamError::InvalidConfig(
+                    "Opus bitrate must fit in a positive u32".to_owned(),
+                )
+            })
+        })
+        .transpose()
 }
 
 impl TryFrom<ExternalOpusFrameAckInput> for ExternalFrameAck {
@@ -469,7 +464,6 @@ impl TryFrom<RtpTransportConfigInput> for RtpTransportConfig {
             ssrc: value.audio_ssrc,
             mtu: value.mtu.unwrap_or(1_200) as usize,
             rtcp_mux: value.rtcp_mux.unwrap_or(true),
-            opus_bitrate_bps: Some(value.bitrate.unwrap_or(DEFAULT_MUSIC_OPUS_BITRATE_BPS)),
             rtp_keepalive_interval: value
                 .rtp_keepalive_interval_ms
                 .map(|milliseconds| Duration::from_millis(u64::from(milliseconds))),
@@ -511,7 +505,6 @@ impl From<RtpTransportConfig> for RtpTransportConfigOutput {
             ssrc: value.ssrc,
             mtu: value.mtu as u32,
             rtcp_mux: value.rtcp_mux,
-            opus_bitrate_bps: value.opus_bitrate_bps,
             rtp_keepalive_interval_ms: value
                 .rtp_keepalive_interval
                 .map(|interval| interval.as_millis().try_into().unwrap_or(u32::MAX)),
@@ -661,7 +654,6 @@ mod tests {
             rtcp_port: None,
             audio_ssrc: 42,
             audio_pt: Some(96),
-            bitrate: Some(128_000),
             rtcp_mux: Some(true),
             rtp_keepalive_interval_ms: Some(5_000),
             mtu: None,

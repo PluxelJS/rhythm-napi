@@ -30,7 +30,7 @@ pub struct ExternalFrameAck {
     pub outcome: ExternalFrameOutcome,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ExternalOpusFrame {
     pub lease_id: u32,
     pub generation: u64,

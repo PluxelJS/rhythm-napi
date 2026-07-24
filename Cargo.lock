@@ -1631,6 +1631,7 @@ name = "rhythm_streamer"
 version = "0.1.0"
 dependencies = [
  "lru",
+ "metrics",
  "music_stream",
  "napi",
  "napi-build",

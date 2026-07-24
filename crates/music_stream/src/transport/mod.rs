@@ -9,8 +9,6 @@ const RTP_HEADER_BYTES: usize = 12;
 const DEFAULT_MTU: usize = 1_200;
 const MIN_RTP_MTU: usize = 64;
 const MAX_RTP_DATAGRAM_BYTES: usize = 65_507;
-const MIN_OPUS_BITRATE_BPS: u32 = 500;
-const MAX_OPUS_BITRATE_BPS: u32 = 512_000;
 const MIN_RTP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_RTP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 const NTP_UNIX_EPOCH_OFFSET_SECS: u64 = 2_208_988_800;
@@ -63,7 +61,6 @@ pub struct RtpTransportConfig {
     pub ssrc: u32,
     pub mtu: usize,
     pub rtcp_mux: bool,
-    pub opus_bitrate_bps: Option<u32>,
     pub rtp_keepalive_interval: Option<Duration>,
     pub encryption: RtpEncryptionConfig,
 }
@@ -81,7 +78,6 @@ impl RtpTransportConfig {
             ssrc,
             mtu: DEFAULT_MTU,
             rtcp_mux: true,
-            opus_bitrate_bps: None,
             rtp_keepalive_interval: None,
             encryption: RtpEncryptionConfig::None,
         }
@@ -96,9 +92,6 @@ impl RtpTransportConfig {
             || self.payload_type > 127
             || self.mtu < MIN_RTP_MTU
             || self.mtu > MAX_RTP_DATAGRAM_BYTES
-            || self.opus_bitrate_bps.is_some_and(|bitrate| {
-                !(MIN_OPUS_BITRATE_BPS..=MAX_OPUS_BITRATE_BPS).contains(&bitrate)
-            })
             || self.rtp_keepalive_interval.is_some_and(|interval| {
                 !(MIN_RTP_KEEPALIVE_INTERVAL..=MAX_RTP_KEEPALIVE_INTERVAL).contains(&interval)
             })

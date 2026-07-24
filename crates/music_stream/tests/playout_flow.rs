@@ -411,7 +411,7 @@ async fn non_mux_rtcp_uses_the_dedicated_remote_port() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn transport_bitrate_and_mtu_configure_the_opus_producer() {
+async fn stream_bitrate_and_rtp_mtu_configure_the_opus_producer() {
     let wav = tempfile::Builder::new()
         .suffix(".wav")
         .tempfile()
@@ -425,11 +425,12 @@ async fn transport_bitrate_and_mtu_configure_the_opus_producer() {
     );
     transport.local_ip = "127.0.0.1".to_owned();
     transport.mtu = 64;
-    transport.opus_bitrate_bps = Some(6_000);
+    let mut config = StreamRuntimeConfig::new(transport, SourceResolverConfig::default());
+    config.opus_bitrate_bps = 6_000;
     let runtime = StreamRuntime::start(
         "small-mtu".to_owned(),
         file_track("a", wav.path()),
-        StreamRuntimeConfig::new(transport, SourceResolverConfig::default()),
+        config,
         VolumeLevel::default(),
         Default::default(),
     )

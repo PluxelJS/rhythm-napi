@@ -188,7 +188,6 @@ pub struct RtpTransportConfigInput {
     pub rtcp_port: Option<u32>,
     pub audio_ssrc: u32,
     pub audio_pt: Option<u32>,
-    pub bitrate: Option<u32>,
     pub rtcp_mux: Option<bool>,
     pub rtp_keepalive_interval_ms: Option<u32>,
     pub mtu: Option<u32>,
@@ -219,7 +218,6 @@ impl std::fmt::Debug for RtpTransportConfigInput {
             .field("rtcp_port", &self.rtcp_port)
             .field("audio_ssrc", &self.audio_ssrc)
             .field("audio_pt", &self.audio_pt)
-            .field("bitrate", &self.bitrate)
             .field("rtcp_mux", &self.rtcp_mux)
             .field("rtp_keepalive_interval_ms", &self.rtp_keepalive_interval_ms)
             .field("mtu", &self.mtu)
@@ -296,16 +294,14 @@ pub struct MediaBufferConfigInput {
 
 #[derive(Debug)]
 #[napi(object)]
-pub struct ExternalPullConfigInput {
-    pub opus_bitrate_bps: Option<i64>,
-}
-
-#[derive(Debug)]
-#[napi(object)]
 pub struct StartStreamInput {
     pub stream_id: String,
     pub current: TrackSourceInput,
     pub transport: RtpTransportConfigInput,
+    /// Target bitrate for the shared Opus encoder.
+    ///
+    /// @defaultValue 128000
+    pub opus_bitrate_bps: Option<i64>,
     pub source: Option<SourceResolverConfigInput>,
     pub buffer: Option<MediaBufferConfigInput>,
     pub volume: Option<f64>,
@@ -318,7 +314,10 @@ pub struct StartStreamInput {
 pub struct StartExternalStreamInput {
     pub stream_id: String,
     pub current: TrackSourceInput,
-    pub output: Option<ExternalPullConfigInput>,
+    /// Target bitrate for the shared Opus encoder.
+    ///
+    /// @defaultValue 128000
+    pub opus_bitrate_bps: Option<i64>,
     pub source: Option<SourceResolverConfigInput>,
     pub buffer: Option<MediaBufferConfigInput>,
     pub volume: Option<f64>,
@@ -372,7 +371,6 @@ pub struct RtpTransportConfigOutput {
     pub ssrc: u32,
     pub mtu: u32,
     pub rtcp_mux: bool,
-    pub opus_bitrate_bps: Option<u32>,
     pub rtp_keepalive_interval_ms: Option<u32>,
     pub encryption_mode: String,
 }
