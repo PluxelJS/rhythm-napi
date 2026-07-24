@@ -50,6 +50,10 @@ pub enum WorkerEvent {
         code: ErrorCode,
         message: String,
     },
+    OutputFailed {
+        code: ErrorCode,
+        message: String,
+    },
     CurrentNetworkQualityChanged {
         generation: u64,
         quality: RtcpNetworkQualityLevel,
@@ -338,6 +342,9 @@ impl StreamActor {
                     self.handle_track_failure(code, message, &mut output);
                 }
             }
+            WorkerEvent::OutputFailed { code, message } => {
+                return self.handle_output_failure(code, message);
+            }
             WorkerEvent::CurrentNetworkQualityChanged {
                 generation,
                 quality,
@@ -382,6 +389,10 @@ impl StreamActor {
     /// receiver or producer may already have been replaced), so pretending the
     /// previous logical state is still operational would leave a stuck stream.
     pub fn handle_runtime_failure(&mut self, error: &MusicStreamError) -> ActorOutput {
+        self.handle_output_failure(error.code(), error.to_string())
+    }
+
+    pub fn handle_output_failure(&mut self, code: ErrorCode, message: String) -> ActorOutput {
         self.current = None;
         self.next = None;
         self.refreshable_current_key = None;
@@ -392,8 +403,8 @@ impl StreamActor {
             events: vec![
                 StreamEvent::Error {
                     stream_id: self.stream_id.clone(),
-                    code: error.code(),
-                    message: error.to_string(),
+                    code,
+                    message,
                 },
                 StreamEvent::StreamStopped {
                     stream_id: self.stream_id.clone(),
@@ -1167,8 +1178,9 @@ mod tests {
         let mut actor = actor("s1".to_owned(), Some(track("a")), Some(track("b")));
         actor.handle_command(StreamCommand::Play).expect("play");
 
-        let output = actor
-            .handle_runtime_failure(&MusicStreamError::RtpSendError("sender closed".to_owned()));
+        let output = actor.handle_runtime_failure(&MusicStreamError::RtpOutputError(
+            "sender closed".to_owned(),
+        ));
 
         assert_eq!(output.status.play_state, PlayState::Stopped);
         assert!(output.status.current.is_none());
@@ -1177,7 +1189,7 @@ mod tests {
         assert!(output.events.iter().any(|event| matches!(
             event,
             StreamEvent::Error {
-                code: ErrorCode::RtpSendError,
+                code: ErrorCode::OutputError,
                 ..
             }
         )));

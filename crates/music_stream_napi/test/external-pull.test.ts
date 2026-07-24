@@ -26,7 +26,7 @@ test('external pull delivers paced Opus frames and commits progress with the nex
 	const started = await streamer.startExternalStream({
 		streamId,
 		current: { id: 'external', attemptId: 'attempt-external', kind: 'file', path: audioPath },
-		output: { bitrate: 128_000 },
+		output: { opusBitrateBps: 128_000 },
 		buffer: { prebufferMs: 20, encodedCapacityMs: 400, maxPlayoutLatenessMs: 40 },
 	})
 	expect(started.streamId).toBe(streamId)
@@ -108,6 +108,167 @@ test('external pull bounds concurrent reads and cancellation wakes a pending rea
 	await expect(streamer.pullExternalFrame(streamId)).rejects.toThrow(/one external pull|pending/i)
 	await streamer.cancelExternalPull(streamId)
 	await expect(pending).resolves.toBeNull()
+})
+
+test('external pull accepts the retired lease after seek and continues on the new generation', async () => {
+	const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'music-external-seek-'))
+	const audioPath = path.join(directory, 'audio.wav')
+	await fs.promises.writeFile(audioPath, makeSineWave(2))
+	const streamer = new Streamer()
+	const streamId = `external-seek-${Date.now()}`
+	resources.push(async () => {
+		await stopStreamIfPresent(streamer, streamId)
+		await streamer.shutdown()
+		await fs.promises.rm(directory, { recursive: true, force: true })
+	})
+
+	await streamer.startExternalStream({
+		streamId,
+		current: {
+			id: 'external-seek',
+			attemptId: 'attempt-external-seek',
+			kind: 'file',
+			path: audioPath,
+			seekable: true,
+		},
+		buffer: { prebufferMs: 20, encodedCapacityMs: 400 },
+	})
+	const beforeSeek = await streamer.pullExternalFrame(streamId)
+	const seeked = await streamer.seekStream(streamId, 1)
+	await expect(streamer.pullExternalFrame(streamId)).rejects.toThrow(/previous.*outstanding/i)
+	const afterSeek = await streamer.pullExternalFrame(streamId, {
+		leaseId: beforeSeek!.leaseId,
+		generation: beforeSeek!.generation,
+		outcome: 'sent',
+	})
+
+	expect(afterSeek).not.toBeNull()
+	expect(afterSeek!.generation).toBe(seeked.generation)
+	expect(afterSeek!.generation).not.toBe(beforeSeek!.generation)
+	await streamer.finishExternalFrame(streamId, {
+		leaseId: afterSeek!.leaseId,
+		generation: afterSeek!.generation,
+		outcome: 'sent',
+	})
+	expect((await streamer.getStatus(streamId)).playoutDiagnostics?.packetsSent).toBe(2)
+})
+
+test('external pull stays parked while current is absent and resumes after a later plan', async () => {
+	const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'music-external-idle-'))
+	const firstPath = path.join(directory, 'first.wav')
+	const secondPath = path.join(directory, 'second.wav')
+	await Promise.all([
+		fs.promises.writeFile(firstPath, makeSineWave(1)),
+		fs.promises.writeFile(secondPath, makeSineWave(1)),
+	])
+	const streamer = new Streamer()
+	const streamId = `external-idle-${Date.now()}`
+	resources.push(async () => {
+		await stopStreamIfPresent(streamer, streamId)
+		await streamer.shutdown()
+		await fs.promises.rm(directory, { recursive: true, force: true })
+	})
+
+	await streamer.startExternalStream({
+		streamId,
+		current: { id: 'first', attemptId: 'attempt-first', kind: 'file', path: firstPath },
+		buffer: { prebufferMs: 20, encodedCapacityMs: 400 },
+	})
+	const first = await streamer.pullExternalFrame(streamId)
+	await streamer.reconcilePlan(streamId, { version: 1 })
+	const pending = streamer.pullExternalFrame(streamId, {
+		leaseId: first!.leaseId,
+		generation: first!.generation,
+		outcome: 'cancelled',
+	})
+	await delay(20)
+	await streamer.reconcilePlan(streamId, {
+		version: 2,
+		current: { id: 'second', attemptId: 'attempt-second', kind: 'file', path: secondPath },
+	})
+	const resumed = await pending
+
+	expect(resumed).not.toBeNull()
+	expect(resumed!.generation).not.toBe(first!.generation)
+	await streamer.finishExternalFrame(streamId, {
+		leaseId: resumed!.leaseId,
+		generation: resumed!.generation,
+		outcome: 'sent',
+	})
+})
+
+test('external output unavailability is a stream error, not a track attempt failure', async () => {
+	const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'music-external-failure-'))
+	const audioPath = path.join(directory, 'audio.wav')
+	await fs.promises.writeFile(audioPath, makeSineWave(1))
+	const streamer = new Streamer()
+	const streamId = `external-failure-${Date.now()}`
+	resources.push(async () => {
+		await stopStreamIfPresent(streamer, streamId)
+		await streamer.shutdown()
+		await fs.promises.rm(directory, { recursive: true, force: true })
+	})
+
+	await streamer.startExternalStream({
+		streamId,
+		current: { id: 'failure', attemptId: 'attempt-failure', kind: 'file', path: audioPath },
+		buffer: { prebufferMs: 20, encodedCapacityMs: 400 },
+	})
+	const frame = await streamer.pullExternalFrame(streamId)
+	await streamer.finishExternalFrame(streamId, {
+		leaseId: frame!.leaseId,
+		generation: frame!.generation,
+		outcome: 'outputUnavailable',
+	})
+	await waitForStatus(
+		() => streamer.getStatus(streamId),
+		(status) => status.playState === 'stopped',
+	)
+	const events = streamer.drainEvents(streamId)
+
+	expect(events).toContainEqual(
+		expect.objectContaining({ type: 'error', code: 'OUTPUT_ERROR' }),
+	)
+	expect(events.every((event) => event.type !== 'attemptFailed')).toBe(true)
+	expect(events.every((event) => event.type !== 'nextNeeded')).toBe(true)
+})
+
+test('an abandoned retired frame lease fails the output within a fixed deadline', async () => {
+	const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'music-external-timeout-'))
+	const audioPath = path.join(directory, 'audio.wav')
+	await fs.promises.writeFile(audioPath, makeSineWave(3))
+	const streamer = new Streamer()
+	const streamId = `external-timeout-${Date.now()}`
+	resources.push(async () => {
+		await stopStreamIfPresent(streamer, streamId)
+		await streamer.shutdown()
+		await fs.promises.rm(directory, { recursive: true, force: true })
+	})
+
+	await streamer.startExternalStream({
+		streamId,
+		current: {
+			id: 'timeout',
+			attemptId: 'attempt-timeout',
+			kind: 'file',
+			path: audioPath,
+			seekable: true,
+		},
+		buffer: { prebufferMs: 20, encodedCapacityMs: 400 },
+	})
+	await streamer.pullExternalFrame(streamId)
+	await streamer.seekStream(streamId, 1)
+	await waitForStatus(
+		() => streamer.getStatus(streamId),
+		(status) => status.playState === 'stopped',
+		3_000,
+	)
+	const events = streamer.drainEvents(streamId)
+
+	expect(events).toContainEqual(
+		expect.objectContaining({ type: 'error', code: 'OUTPUT_ERROR' }),
+	)
+	expect(events.every((event) => event.type !== 'attemptFailed')).toBe(true)
 })
 
 test('external pull keeps a pending read alive across repeated automatic promotion', async () => {

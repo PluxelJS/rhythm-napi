@@ -66,21 +66,21 @@ impl SenderHandle {
         let remote = config.remote_rtp_addr();
         let socket = UdpSocket::bind(local)
             .await
-            .map_err(|error| MusicStreamError::RtpSendError(error.to_string()))?;
+            .map_err(|error| MusicStreamError::RtpOutputError(error.to_string()))?;
         socket
             .connect(remote)
             .await
-            .map_err(|error| MusicStreamError::RtpSendError(error.to_string()))?;
+            .map_err(|error| MusicStreamError::RtpOutputError(error.to_string()))?;
         let rtcp_socket = if config.rtcp_mux {
             None
         } else {
             let socket = UdpSocket::bind(format!("{}:0", config.local_ip))
                 .await
-                .map_err(|error| MusicStreamError::RtpSendError(error.to_string()))?;
+                .map_err(|error| MusicStreamError::RtpOutputError(error.to_string()))?;
             socket
                 .connect(config.remote_rtcp_addr())
                 .await
-                .map_err(|error| MusicStreamError::RtpSendError(error.to_string()))?;
+                .map_err(|error| MusicStreamError::RtpOutputError(error.to_string()))?;
             Some(socket)
         };
         let (commands, command_rx) = mpsc::channel(32);
@@ -201,8 +201,8 @@ impl SenderHandle {
         })
         .await
         .map_err(|_| {
-            MusicStreamError::RtpSendError(
-                "RTP sender command exceeded the 2 second deadline".to_owned(),
+            MusicStreamError::RtpOutputError(
+                "output command exceeded the 2 second deadline".to_owned(),
             )
         })?
     }
@@ -224,8 +224,7 @@ fn supervise_sender(
             let generation = active_generation.load(Ordering::Acquire);
             if generation != 0 {
                 let _ = events
-                    .send(WorkerEvent::CurrentFailed {
-                        generation,
+                    .send(WorkerEvent::OutputFailed {
                         code: error.code(),
                         message: error.to_string(),
                     })
@@ -616,15 +615,15 @@ async fn run_sender(
                             });
                         }
                         Ok(Ok(sent)) => {
-                            send_failure = Some(MusicStreamError::RtpSendError(format!(
+                            send_failure = Some(MusicStreamError::RtpOutputError(format!(
                                 "partial UDP datagram send: {sent} bytes"
                             )));
                         }
                         Ok(Err(error)) => {
-                            send_failure = Some(MusicStreamError::RtpSendError(error.to_string()));
+                            send_failure = Some(MusicStreamError::RtpOutputError(error.to_string()));
                         }
                         Err(_) => {
-                            send_failure = Some(MusicStreamError::RtpSendError(
+                            send_failure = Some(MusicStreamError::RtpOutputError(
                                 "RTP datagram send exceeded the 1 second deadline".to_owned(),
                             ));
                         }
@@ -632,14 +631,12 @@ async fn run_sender(
                     Err(error) => send_failure = Some(error),
                 }
                 if let Some(error) = send_failure {
-                    let generation = media.generation;
                     active = None;
                     active_generation.store(0, Ordering::Release);
                     emit_worker_event(
                         &events,
                         &mut pending_events,
-                        WorkerEvent::CurrentFailed {
-                            generation,
+                        WorkerEvent::OutputFailed {
                             code: error.code(),
                             message: error.to_string(),
                         },
@@ -773,7 +770,9 @@ impl PendingWorkerEvents {
     fn store(&mut self, event: WorkerEvent) {
         match event {
             event @ WorkerEvent::CurrentPrebufferReady { .. } => self.prebuffer = Some(event),
-            event @ (WorkerEvent::CurrentEnded { .. } | WorkerEvent::CurrentFailed { .. }) => {
+            event @ (WorkerEvent::CurrentEnded { .. }
+            | WorkerEvent::CurrentFailed { .. }
+            | WorkerEvent::OutputFailed { .. }) => {
                 self.terminal = Some(event);
             }
             event @ WorkerEvent::CurrentNetworkQualityChanged { .. } => {
@@ -838,7 +837,7 @@ async fn recv_rtcp(rtp: &UdpSocket, rtcp: Option<&UdpSocket>) -> Result<Option<B
         .unwrap_or(rtp)
         .recv(&mut buffer)
         .await
-        .map_err(|error| MusicStreamError::RtpSendError(error.to_string()))?;
+        .map_err(|error| MusicStreamError::RtpOutputError(error.to_string()))?;
     Ok((len > 0).then(|| Bytes::copy_from_slice(&buffer[..len])))
 }
 
@@ -864,8 +863,7 @@ mod tests {
         let event = event_rx.recv().await.expect("sender failure event");
         assert!(matches!(
             event,
-            WorkerEvent::CurrentFailed {
-                generation: 42,
+            WorkerEvent::OutputFailed {
                 code: crate::ErrorCode::Internal,
                 ..
             }

@@ -80,7 +80,7 @@ pub struct StreamStatusBatchItemOutput {
     pub ok: bool,
     pub status: Option<StreamStatusOutput>,
     #[napi(
-        ts_type = "'INVALID_SOURCE' | 'SOURCE_TIMEOUT' | 'SOURCE_AUTH_EXPIRED' | 'NOT_SEEKABLE' | 'DECODE_ERROR' | 'RESAMPLE_ERROR' | 'ENCODE_ERROR' | 'RTP_SEND_ERROR' | 'STREAM_CLOSED' | 'BUSY' | 'INTERNAL' | 'STREAM_NOT_FOUND' | 'STREAM_ALREADY_EXISTS' | 'INVALID_CONFIG' | 'UNSUPPORTED'"
+        ts_type = "'INVALID_SOURCE' | 'SOURCE_TIMEOUT' | 'SOURCE_AUTH_EXPIRED' | 'NOT_SEEKABLE' | 'DECODE_ERROR' | 'RESAMPLE_ERROR' | 'ENCODE_ERROR' | 'OUTPUT_ERROR' | 'STREAM_CLOSED' | 'BUSY' | 'INTERNAL' | 'STREAM_NOT_FOUND' | 'STREAM_ALREADY_EXISTS' | 'INVALID_CONFIG' | 'UNSUPPORTED'"
     )]
     pub code: Option<String>,
     pub message: Option<String>,
@@ -122,7 +122,7 @@ pub struct StreamEventOutput {
     pub average_round_trip_time_ms: Option<f64>,
     pub max_round_trip_time_ms: Option<f64>,
     #[napi(
-        ts_type = "'INVALID_SOURCE' | 'SOURCE_TIMEOUT' | 'SOURCE_AUTH_EXPIRED' | 'NOT_SEEKABLE' | 'DECODE_ERROR' | 'RESAMPLE_ERROR' | 'ENCODE_ERROR' | 'RTP_SEND_ERROR' | 'STREAM_CLOSED' | 'BUSY' | 'INTERNAL' | 'STREAM_NOT_FOUND' | 'STREAM_ALREADY_EXISTS' | 'INVALID_CONFIG' | 'UNSUPPORTED'"
+        ts_type = "'INVALID_SOURCE' | 'SOURCE_TIMEOUT' | 'SOURCE_AUTH_EXPIRED' | 'NOT_SEEKABLE' | 'DECODE_ERROR' | 'RESAMPLE_ERROR' | 'ENCODE_ERROR' | 'OUTPUT_ERROR' | 'STREAM_CLOSED' | 'BUSY' | 'INTERNAL' | 'STREAM_NOT_FOUND' | 'STREAM_ALREADY_EXISTS' | 'INVALID_CONFIG' | 'UNSUPPORTED'"
     )]
     pub code: Option<String>,
     pub message: Option<String>,
@@ -297,7 +297,7 @@ pub struct MediaBufferConfigInput {
 #[derive(Debug)]
 #[napi(object)]
 pub struct ExternalPullConfigInput {
-    pub bitrate: Option<i64>,
+    pub opus_bitrate_bps: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -340,6 +340,7 @@ pub struct ExternalOpusFrameOutput {
     pub lease_id: u32,
     pub generation: i64,
     pub payload: Buffer,
+    #[napi(ts_type = "960")]
     pub samples_per_channel: u32,
     pub media_position_ms: i64,
     pub deadline_monotonic_ns: BigInt,

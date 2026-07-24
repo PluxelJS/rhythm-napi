@@ -655,6 +655,10 @@ fn spawn_worker_event_loop(
             };
             let _guard = inner.orchestration.lock().await;
             inner.observe_worker_event_deadline(&event);
+            if let WorkerEvent::OutputFailed { code, message } = event {
+                inner.fail_output(code, message).await;
+                continue;
+            }
             let (planned, output) = {
                 let actor = inner.actor.lock().await;
                 let mut planned = actor.clone();
@@ -709,6 +713,18 @@ impl StreamRuntimeInner {
     }
 
     async fn fail_runtime(&self, error: &MusicStreamError) {
+        self.shutdown_resources().await;
+        let output = self.actor.lock().await.handle_runtime_failure(error);
+        self.publish_output(output);
+    }
+
+    async fn fail_output(&self, code: crate::error::ErrorCode, message: String) {
+        self.shutdown_resources().await;
+        let output = self.actor.lock().await.handle_output_failure(code, message);
+        self.publish_output(output);
+    }
+
+    async fn shutdown_resources(&self) {
         self.cancel_all_startup_deadlines();
         let current = self.current.lock().await.take();
         let next = self.next.lock().await.take();
@@ -724,8 +740,6 @@ impl StreamRuntimeInner {
         {
             tracing::warn!(error = %cleanup_error, "runtime failure cleanup failed");
         }
-        let output = self.actor.lock().await.handle_runtime_failure(error);
-        self.publish_output(output);
     }
 
     async fn execute_action(
@@ -906,7 +920,8 @@ impl StreamRuntimeInner {
                     });
             }
             WorkerEvent::CurrentSourceClassified { .. }
-            | WorkerEvent::CurrentNetworkQualityChanged { .. } => {}
+            | WorkerEvent::CurrentNetworkQualityChanged { .. }
+            | WorkerEvent::OutputFailed { .. } => {}
         }
     }
 

@@ -41,13 +41,13 @@ export interface ExternalOpusFrameOutput {
   leaseId: number
   generation: number
   payload: Buffer
-  samplesPerChannel: number
+  samplesPerChannel: 960
   mediaPositionMs: number
   deadlineMonotonicNs: bigint
 }
 
 export interface ExternalPullConfigInput {
-  bitrate?: number
+  opusBitrateBps?: number
 }
 
 export interface HttpLiveSourceConfigInput {
@@ -240,7 +240,7 @@ export interface StreamEventOutput {
   maxJitterMs?: number
   averageRoundTripTimeMs?: number
   maxRoundTripTimeMs?: number
-  code?: 'INVALID_SOURCE' | 'SOURCE_TIMEOUT' | 'SOURCE_AUTH_EXPIRED' | 'NOT_SEEKABLE' | 'DECODE_ERROR' | 'RESAMPLE_ERROR' | 'ENCODE_ERROR' | 'RTP_SEND_ERROR' | 'STREAM_CLOSED' | 'BUSY' | 'INTERNAL' | 'STREAM_NOT_FOUND' | 'STREAM_ALREADY_EXISTS' | 'INVALID_CONFIG' | 'UNSUPPORTED'
+  code?: 'INVALID_SOURCE' | 'SOURCE_TIMEOUT' | 'SOURCE_AUTH_EXPIRED' | 'NOT_SEEKABLE' | 'DECODE_ERROR' | 'RESAMPLE_ERROR' | 'ENCODE_ERROR' | 'OUTPUT_ERROR' | 'STREAM_CLOSED' | 'BUSY' | 'INTERNAL' | 'STREAM_NOT_FOUND' | 'STREAM_ALREADY_EXISTS' | 'INVALID_CONFIG' | 'UNSUPPORTED'
   message?: string
   status?: StreamStatusOutput
 }
@@ -249,7 +249,7 @@ export interface StreamStatusBatchItemOutput {
   streamId: string
   ok: boolean
   status?: StreamStatusOutput
-  code?: 'INVALID_SOURCE' | 'SOURCE_TIMEOUT' | 'SOURCE_AUTH_EXPIRED' | 'NOT_SEEKABLE' | 'DECODE_ERROR' | 'RESAMPLE_ERROR' | 'ENCODE_ERROR' | 'RTP_SEND_ERROR' | 'STREAM_CLOSED' | 'BUSY' | 'INTERNAL' | 'STREAM_NOT_FOUND' | 'STREAM_ALREADY_EXISTS' | 'INVALID_CONFIG' | 'UNSUPPORTED'
+  code?: 'INVALID_SOURCE' | 'SOURCE_TIMEOUT' | 'SOURCE_AUTH_EXPIRED' | 'NOT_SEEKABLE' | 'DECODE_ERROR' | 'RESAMPLE_ERROR' | 'ENCODE_ERROR' | 'OUTPUT_ERROR' | 'STREAM_CLOSED' | 'BUSY' | 'INTERNAL' | 'STREAM_NOT_FOUND' | 'STREAM_ALREADY_EXISTS' | 'INVALID_CONFIG' | 'UNSUPPORTED'
   message?: string
 }
 

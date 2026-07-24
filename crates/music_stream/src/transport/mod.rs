@@ -192,7 +192,7 @@ impl RtpPacketizer {
         use util::marshal::{Marshal, MarshalSize};
 
         if frame.payload.is_empty() || frame.payload.len() > self.config.mtu - RTP_HEADER_BYTES {
-            return Err(MusicStreamError::RtpSendError(
+            return Err(MusicStreamError::RtpOutputError(
                 "Opus payload does not fit RTP packet".to_owned(),
             ));
         }
@@ -212,7 +212,7 @@ impl RtpPacketizer {
         scratch.resize(packet.marshal_size(), 0);
         let written = packet
             .marshal_to(&mut scratch[..])
-            .map_err(|error| MusicStreamError::RtpSendError(error.to_string()))?;
+            .map_err(|error| MusicStreamError::RtpOutputError(error.to_string()))?;
         scratch.truncate(written);
         Ok(())
     }
@@ -256,7 +256,7 @@ pub fn build_rtcp_sender_report(
         ..Default::default()
     };
     let bytes = rtcp::packet::marshal(&[Box::new(report)])
-        .map_err(|error| MusicStreamError::RtpSendError(error.to_string()))?;
+        .map_err(|error| MusicStreamError::RtpOutputError(error.to_string()))?;
     Ok(RtcpSenderReportPacket { bytes, ntp_time })
 }
 
@@ -266,7 +266,7 @@ pub fn parse_rtcp_receiver_reports(
     previous_reports_received: usize,
 ) -> Result<Option<RtcpReceiverReportSnapshot>> {
     let packets = rtcp::packet::unmarshal(&mut bytes)
-        .map_err(|error| MusicStreamError::RtpSendError(error.to_string()))?;
+        .map_err(|error| MusicStreamError::RtpOutputError(error.to_string()))?;
     let mut count = previous_reports_received;
     let mut latest = None;
     for packet in packets {

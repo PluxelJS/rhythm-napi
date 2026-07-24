@@ -11,7 +11,7 @@ pub enum ErrorCode {
     DecodeError,
     ResampleError,
     EncodeError,
-    RtpSendError,
+    OutputError,
     StreamClosed,
     Busy,
     Internal,
@@ -32,7 +32,7 @@ impl ErrorCode {
             Self::DecodeError => "DECODE_ERROR",
             Self::ResampleError => "RESAMPLE_ERROR",
             Self::EncodeError => "ENCODE_ERROR",
-            Self::RtpSendError => "RTP_SEND_ERROR",
+            Self::OutputError => "OUTPUT_ERROR",
             Self::StreamClosed => "STREAM_CLOSED",
             Self::Busy => "BUSY",
             Self::Internal => "INTERNAL",
@@ -97,8 +97,11 @@ pub enum MusicStreamError {
     #[error("encode error: {0}")]
     EncodeError(String),
 
-    #[error("rtp send error: {0}")]
-    RtpSendError(String),
+    #[error("RTP output error: {0}")]
+    RtpOutputError(String),
+
+    #[error("external pull output error: {0}")]
+    ExternalPullError(String),
 
     #[error("internal error: {0}")]
     Internal(String),
@@ -122,7 +125,7 @@ impl MusicStreamError {
             Self::DecodeError(_) => ErrorCode::DecodeError,
             Self::ResampleError(_) => ErrorCode::ResampleError,
             Self::EncodeError(_) => ErrorCode::EncodeError,
-            Self::RtpSendError(_) => ErrorCode::RtpSendError,
+            Self::RtpOutputError(_) | Self::ExternalPullError(_) => ErrorCode::OutputError,
             Self::Internal(_) => ErrorCode::Internal,
         }
     }
@@ -136,6 +139,15 @@ mod tests {
     fn error_code_strings_are_stable_for_bindings() {
         assert_eq!(ErrorCode::InvalidSource.as_str(), "INVALID_SOURCE");
         assert_eq!(ErrorCode::SourceAuthExpired.as_str(), "SOURCE_AUTH_EXPIRED");
+        assert_eq!(ErrorCode::OutputError.as_str(), "OUTPUT_ERROR");
+        assert_eq!(
+            MusicStreamError::RtpOutputError("socket".to_owned()).code(),
+            ErrorCode::OutputError
+        );
+        assert_eq!(
+            MusicStreamError::ExternalPullError("lease".to_owned()).code(),
+            ErrorCode::OutputError
+        );
         assert_eq!(ErrorCode::StreamNotFound.as_str(), "STREAM_NOT_FOUND");
         assert_eq!(ErrorCode::Unsupported.as_str(), "UNSUPPORTED");
     }

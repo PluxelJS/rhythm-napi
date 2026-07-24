@@ -81,60 +81,13 @@ impl Streamer {
         let attempt_start_timeout =
             attempt_start_timeout_from_input(options.attempt_start_timeout_ms)
                 .map_err(to_napi_error)?;
-
-        {
-            let mut runtimes = self.runtimes.write().await;
-            if runtimes.contains_key(&stream_id) {
-                return Err(to_napi_error(MusicStreamError::StreamAlreadyExists(
-                    stream_id,
-                )));
-            }
-            if runtimes.len() >= self.resources.limits().max_streams {
-                return Err(to_napi_error(MusicStreamError::Busy(format!(
-                    "stream limit {} is exhausted",
-                    self.resources.limits().max_streams
-                ))));
-            }
-            runtimes.insert(stream_id.clone(), RuntimeEntry::Starting);
-            self.inactive.write().await.pop(&stream_id);
-        }
-        let events = self.events.clone();
-        let callback = Arc::clone(&self.event_callback);
         let mut config = StreamRuntimeConfig::new(transport, source);
         config.buffer = buffer;
         if let Some(timeout) = attempt_start_timeout {
             config.attempt_start_timeout = timeout;
         }
-        config.resources = Arc::clone(&self.resources);
-        config.on_event = Some(Arc::new(move |event| events.publish(&callback, event)));
-        let runtime =
-            match StreamRuntime::start(stream_id.clone(), current, config, volume, gain).await {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    let mut runtimes = self.runtimes.write().await;
-                    if matches!(runtimes.get(&stream_id), Some(RuntimeEntry::Starting)) {
-                        runtimes.remove(&stream_id);
-                    }
-                    return Err(to_napi_error(error));
-                }
-            };
-        let snapshot = runtime.snapshot().await;
-        let committed = {
-            let mut runtimes = self.runtimes.write().await;
-            if matches!(runtimes.get(&stream_id), Some(RuntimeEntry::Starting)) {
-                runtimes.insert(stream_id.clone(), RuntimeEntry::Active(runtime.clone()));
-                true
-            } else {
-                false
-            }
-        };
-        if !committed {
-            let _ = runtime.shutdown().await;
-            return Err(to_napi_error(MusicStreamError::StreamClosed(format!(
-                "stream {stream_id} was removed while starting"
-            ))));
-        }
-        Ok(status_output(snapshot))
+        self.start_runtime(stream_id, current, config, volume, gain)
+            .await
     }
 
     #[napi]
@@ -157,60 +110,13 @@ impl Streamer {
         let attempt_start_timeout =
             attempt_start_timeout_from_input(options.attempt_start_timeout_ms)
                 .map_err(to_napi_error)?;
-
-        {
-            let mut runtimes = self.runtimes.write().await;
-            if runtimes.contains_key(&stream_id) {
-                return Err(to_napi_error(MusicStreamError::StreamAlreadyExists(
-                    stream_id,
-                )));
-            }
-            if runtimes.len() >= self.resources.limits().max_streams {
-                return Err(to_napi_error(MusicStreamError::Busy(format!(
-                    "stream limit {} is exhausted",
-                    self.resources.limits().max_streams
-                ))));
-            }
-            runtimes.insert(stream_id.clone(), RuntimeEntry::Starting);
-            self.inactive.write().await.pop(&stream_id);
-        }
-        let events = self.events.clone();
-        let callback = Arc::clone(&self.event_callback);
         let mut config = StreamRuntimeConfig::new_external_pull(output, source);
         config.buffer = buffer;
         if let Some(timeout) = attempt_start_timeout {
             config.attempt_start_timeout = timeout;
         }
-        config.resources = Arc::clone(&self.resources);
-        config.on_event = Some(Arc::new(move |event| events.publish(&callback, event)));
-        let runtime =
-            match StreamRuntime::start(stream_id.clone(), current, config, volume, gain).await {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    let mut runtimes = self.runtimes.write().await;
-                    if matches!(runtimes.get(&stream_id), Some(RuntimeEntry::Starting)) {
-                        runtimes.remove(&stream_id);
-                    }
-                    return Err(to_napi_error(error));
-                }
-            };
-        let snapshot = runtime.snapshot().await;
-        let committed = {
-            let mut runtimes = self.runtimes.write().await;
-            if matches!(runtimes.get(&stream_id), Some(RuntimeEntry::Starting)) {
-                runtimes.insert(stream_id.clone(), RuntimeEntry::Active(runtime.clone()));
-                true
-            } else {
-                false
-            }
-        };
-        if !committed {
-            let _ = runtime.shutdown().await;
-            return Err(to_napi_error(MusicStreamError::StreamClosed(format!(
-                "stream {stream_id} was removed while starting"
-            ))));
-        }
-        Ok(status_output(snapshot))
+        self.start_runtime(stream_id, current, config, volume, gain)
+            .await
     }
 
     #[napi]
@@ -561,6 +467,65 @@ impl Streamer {
 }
 
 impl Streamer {
+    async fn start_runtime(
+        &self,
+        stream_id: String,
+        current: TrackSource,
+        mut config: StreamRuntimeConfig,
+        volume: VolumeLevel,
+        gain: GainLevel,
+    ) -> Result<StreamStatusOutput> {
+        {
+            let mut runtimes = self.runtimes.write().await;
+            if runtimes.contains_key(&stream_id) {
+                return Err(to_napi_error(MusicStreamError::StreamAlreadyExists(
+                    stream_id,
+                )));
+            }
+            if runtimes.len() >= self.resources.limits().max_streams {
+                return Err(to_napi_error(MusicStreamError::Busy(format!(
+                    "stream limit {} is exhausted",
+                    self.resources.limits().max_streams
+                ))));
+            }
+            runtimes.insert(stream_id.clone(), RuntimeEntry::Starting);
+            self.inactive.write().await.pop(&stream_id);
+        }
+
+        let events = self.events.clone();
+        let callback = Arc::clone(&self.event_callback);
+        config.resources = Arc::clone(&self.resources);
+        config.on_event = Some(Arc::new(move |event| events.publish(&callback, event)));
+        let runtime =
+            match StreamRuntime::start(stream_id.clone(), current, config, volume, gain).await {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let mut runtimes = self.runtimes.write().await;
+                    if matches!(runtimes.get(&stream_id), Some(RuntimeEntry::Starting)) {
+                        runtimes.remove(&stream_id);
+                    }
+                    return Err(to_napi_error(error));
+                }
+            };
+        let snapshot = runtime.snapshot().await;
+        let committed = {
+            let mut runtimes = self.runtimes.write().await;
+            if matches!(runtimes.get(&stream_id), Some(RuntimeEntry::Starting)) {
+                runtimes.insert(stream_id.clone(), RuntimeEntry::Active(runtime.clone()));
+                true
+            } else {
+                false
+            }
+        };
+        if !committed {
+            let _ = runtime.shutdown().await;
+            return Err(to_napi_error(MusicStreamError::StreamClosed(format!(
+                "stream {stream_id} was removed while starting"
+            ))));
+        }
+        Ok(status_output(snapshot))
+    }
+
     fn ensure_open(&self) -> std::result::Result<(), MusicStreamError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(MusicStreamError::StreamClosed(
@@ -633,10 +598,14 @@ fn status_output(snapshot: StreamRuntimeSnapshot) -> StreamStatusOutput {
 
 fn external_frame_output(frame: ExternalOpusFrame) -> ExternalOpusFrameOutput {
     let remaining_ns = u64::try_from(frame.deadline_remaining().as_nanos()).unwrap_or(u64::MAX);
+    let payload = match frame.payload.try_into_mut() {
+        Ok(payload) => Vec::from(payload),
+        Err(shared) => shared.to_vec(),
+    };
     ExternalOpusFrameOutput {
         lease_id: frame.lease_id,
         generation: i64::try_from(frame.generation).unwrap_or(i64::MAX),
-        payload: frame.payload.to_vec().into(),
+        payload: payload.into(),
         samples_per_channel: frame.samples_per_channel,
         media_position_ms: i64::try_from(frame.media_position_ms).unwrap_or(i64::MAX),
         deadline_monotonic_ns: uv_hrtime().saturating_add(remaining_ns).into(),

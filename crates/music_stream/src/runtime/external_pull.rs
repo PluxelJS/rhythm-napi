@@ -88,14 +88,10 @@ impl ExternalPullHandle {
             Duration::from_millis(max_playout_lateness_ms),
             command_rx,
             progress_tx,
-            events,
+            events.clone(),
         ));
         let worker_abort = worker.abort_handle();
-        let supervisor = tokio::spawn(async move {
-            worker.await.map_err(|error| {
-                MusicStreamError::Internal(format!("external pull worker failed: {error}"))
-            })?
-        });
+        let supervisor = supervise_worker(worker, events);
         Self {
             commands,
             progress,
@@ -152,11 +148,11 @@ impl ExternalPullHandle {
             self.commands.send(Command::Pull { previous, reply }),
         )
         .await
-        .map_err(|_| MusicStreamError::StreamClosed("external pull command timed out".to_owned()))?
-        .map_err(|_| MusicStreamError::StreamClosed("external pull output closed".to_owned()))?;
+        .map_err(|_| MusicStreamError::ExternalPullError("command timed out".to_owned()))?
+        .map_err(|_| MusicStreamError::ExternalPullError("output closed".to_owned()))?;
         receiver.await.map_err(|_| {
-            MusicStreamError::StreamClosed(
-                "external pull output closed before delivering a frame".to_owned(),
+            MusicStreamError::ExternalPullError(
+                "output closed before delivering a frame".to_owned(),
             )
         })?
     }
@@ -190,8 +186,8 @@ impl ExternalPullHandle {
                         self.task.worker_abort.abort();
                         supervisor.abort();
                         let _ = supervisor.await;
-                        Err(MusicStreamError::Internal(
-                            "external pull output did not stop within 2 seconds".to_owned(),
+                        Err(MusicStreamError::ExternalPullError(
+                            "output did not stop within 2 seconds".to_owned(),
                         ))
                     }
                 }
@@ -211,18 +207,37 @@ impl ExternalPullHandle {
         let (reply, receiver) = oneshot::channel();
         tokio::time::timeout(COMMAND_TIMEOUT, self.commands.send(command(reply)))
             .await
-            .map_err(|_| {
-                MusicStreamError::StreamClosed("external pull command timed out".to_owned())
-            })?
-            .map_err(|_| {
-                MusicStreamError::StreamClosed("external pull output closed".to_owned())
-            })?;
+            .map_err(|_| MusicStreamError::ExternalPullError("command timed out".to_owned()))?
+            .map_err(|_| MusicStreamError::ExternalPullError("output closed".to_owned()))?;
         receiver.await.map_err(|_| {
-            MusicStreamError::StreamClosed(
-                "external pull output closed before command acknowledgement".to_owned(),
+            MusicStreamError::ExternalPullError(
+                "output closed before command acknowledgement".to_owned(),
             )
         })?
     }
+}
+
+fn supervise_worker(
+    worker: tokio::task::JoinHandle<Result<()>>,
+    events: mpsc::Sender<WorkerEvent>,
+) -> tokio::task::JoinHandle<Result<()>> {
+    tokio::spawn(async move {
+        let result = match worker.await {
+            Ok(result) => result,
+            Err(error) => Err(MusicStreamError::Internal(format!(
+                "external pull worker failed: {error}"
+            ))),
+        };
+        if let Err(error) = &result {
+            let _ = events
+                .send(WorkerEvent::OutputFailed {
+                    code: error.code(),
+                    message: error.to_string(),
+                })
+                .await;
+        }
+        result
+    })
 }
 
 #[derive(Debug)]
@@ -283,6 +298,39 @@ struct Lease {
     expires_at: Instant,
 }
 
+#[derive(Debug)]
+enum ConsumerLease {
+    Current(Lease),
+    Retired(Lease),
+}
+
+impl ConsumerLease {
+    fn expires_at(&self) -> Instant {
+        match self {
+            Self::Current(lease) => lease.expires_at,
+            Self::Retired(lease) => lease.expires_at,
+        }
+    }
+
+    fn retire(self) -> Self {
+        match self {
+            Self::Current(lease) => Self::Retired(lease),
+            retired @ Self::Retired(_) => retired,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PlayoutStats {
+    frames_delivered: u64,
+    bytes_delivered: u64,
+    dropped_frames: u64,
+    dropped_media_ms: u64,
+    latency_recoveries: u64,
+    underruns: u64,
+    max_lateness_ms: u64,
+}
+
 async fn run_worker(
     prebuffer_ms: u64,
     max_playout_lateness: Duration,
@@ -293,15 +341,9 @@ async fn run_worker(
     let mut active: Option<ActiveMedia> = None;
     let mut paused = false;
     let mut pending_pull: Option<oneshot::Sender<Result<Option<ExternalOpusFrame>>>> = None;
-    let mut lease: Option<Lease> = None;
+    let mut consumer_lease: Option<ConsumerLease> = None;
     let mut next_lease_id = 1_u32;
-    let mut frames_delivered = 0_u64;
-    let mut bytes_delivered = 0_u64;
-    let mut dropped_frames = 0_u64;
-    let mut dropped_media_ms = 0_u64;
-    let mut latency_recoveries = 0_u64;
-    let mut underruns = 0_u64;
-    let mut max_lateness_ms = 0_u64;
+    let mut stats = PlayoutStats::default();
     let mut pending_events = VecDeque::new();
 
     loop {
@@ -326,7 +368,7 @@ async fn run_worker(
                     media.prebuffer_reported = true;
                 }
             }
-            if media.receiver.is_drained() && lease.is_none() {
+            if media.receiver.is_drained() && consumer_lease.is_none() {
                 let generation = media.generation;
                 active = None;
                 // Keep an outstanding pull parked while the actor promotes `next` (or the host
@@ -346,15 +388,15 @@ async fn run_worker(
             .as_ref()
             .filter(|media| media.started && !paused)
             .and_then(|media| media.deadline)
-            .filter(|_| pending_pull.is_some() && lease.is_none());
-        let lease_deadline = lease.as_ref().map(|lease| lease.expires_at);
+            .filter(|_| pending_pull.is_some() && consumer_lease.is_none());
+        let lease_deadline = consumer_lease.as_ref().map(ConsumerLease::expires_at);
         let has_pending_events = !pending_events.is_empty();
 
         tokio::select! {
             command = commands.recv() => {
                 match command {
                     Some(Command::Activate { generation, start_position_ms, paused: initial_paused, receiver, reply }) => {
-                        lease = None;
+                        retire_lease(&mut consumer_lease);
                         active = Some(ActiveMedia {
                             generation,
                             start_position_ms,
@@ -370,10 +412,7 @@ async fn run_worker(
                     Some(Command::Deactivate { generation, reply }) => {
                         if active.as_ref().is_some_and(|media| media.generation == generation) {
                             active = None;
-                            lease = None;
-                            if let Some(waiter) = pending_pull.take() {
-                                let _ = waiter.send(Ok(None));
-                            }
+                            retire_lease(&mut consumer_lease);
                         }
                         let _ = reply.send(Ok(()));
                     }
@@ -402,46 +441,39 @@ async fn run_worker(
                             if let Err(error) = apply_ack(
                                 ack,
                                 &mut active,
-                                &mut lease,
-                                &mut dropped_frames,
-                                &mut dropped_media_ms,
-                                &mut frames_delivered,
-                                &mut bytes_delivered,
+                                &mut consumer_lease,
+                                &mut stats,
                             ) {
                                 let _ = reply.send(Err(error));
                                 continue;
                             }
                             if unavailable {
-                                emit_output_unavailable(&events, &mut pending_events, ack.generation);
+                                emit_output_unavailable(&events, &mut pending_events);
                                 let _ = reply.send(Ok(None));
                                 continue;
                             }
                         }
-                        if lease.is_some() {
+                        if consumer_lease.is_some() {
                             let _ = reply.send(Err(MusicStreamError::Busy(
                                 "the previous external Opus frame is still outstanding".to_owned(),
                             )));
                             continue;
                         }
-                        if active.is_none() {
-                            let _ = reply.send(Ok(None));
-                        } else {
-                            pending_pull = Some(reply);
-                        }
+                        // The output outlives individual media generations. Keep the read parked
+                        // while the actor is idle or replacing current; only explicit cancellation
+                        // or output shutdown returns the terminal sentinel.
+                        pending_pull = Some(reply);
                     }
                     Some(Command::Finish { ack, reply }) => {
                         let unavailable = ack.outcome == ExternalFrameOutcome::OutputUnavailable;
                         let result = apply_ack(
                             ack,
                             &mut active,
-                            &mut lease,
-                            &mut dropped_frames,
-                            &mut dropped_media_ms,
-                            &mut frames_delivered,
-                            &mut bytes_delivered,
+                            &mut consumer_lease,
+                            &mut stats,
                         );
                         if unavailable && result.is_ok() {
-                            emit_output_unavailable(&events, &mut pending_events, ack.generation);
+                            emit_output_unavailable(&events, &mut pending_events);
                         }
                         let _ = reply.send(result);
                     }
@@ -460,17 +492,7 @@ async fn run_worker(
                     }
                     None => return Ok(()),
                 }
-                publish_progress(
-                    &progress_tx,
-                    active.as_ref(),
-                    frames_delivered,
-                    bytes_delivered,
-                    dropped_frames,
-                    dropped_media_ms,
-                    latency_recoveries,
-                    underruns,
-                    max_lateness_ms,
-                );
+                publish_progress(&progress_tx, active.as_ref(), stats);
             }
             _ = async {
                 match active.as_mut() {
@@ -488,7 +510,7 @@ async fn run_worker(
                 let Some(reply) = pending_pull.take() else { continue; };
                 let mut scheduled_deadline = media.deadline.unwrap_or_else(Instant::now);
                 let observed_lateness = Instant::now().saturating_duration_since(scheduled_deadline);
-                max_lateness_ms = max_lateness_ms.max(
+                stats.max_lateness_ms = stats.max_lateness_ms.max(
                     u64::try_from(observed_lateness.as_millis()).unwrap_or(u64::MAX),
                 );
                 let mut recovered = false;
@@ -499,30 +521,20 @@ async fn run_worker(
                         break;
                     };
                     recovered = true;
-                    dropped_frames = dropped_frames.saturating_add(1);
-                    dropped_media_ms = dropped_media_ms.saturating_add(stale.duration_ms);
+                    stats.dropped_frames = stats.dropped_frames.saturating_add(1);
+                    stats.dropped_media_ms = stats.dropped_media_ms.saturating_add(stale.duration_ms);
                     media.media_sent_ms = media.media_sent_ms.saturating_add(stale.duration_ms);
                     scheduled_deadline += Duration::from_millis(stale.duration_ms.max(1));
                 }
                 if recovered {
-                    latency_recoveries = latency_recoveries.saturating_add(1);
+                    stats.latency_recoveries = stats.latency_recoveries.saturating_add(1);
                 }
                 let Some(frame) = media.receiver.try_recv() else {
-                    underruns = underruns.saturating_add(1);
+                    stats.underruns = stats.underruns.saturating_add(1);
                     media.started = false;
                     media.deadline = None;
                     pending_pull = Some(reply);
-                    publish_progress(
-                        &progress_tx,
-                        active.as_ref(),
-                        frames_delivered,
-                        bytes_delivered,
-                        dropped_frames,
-                        dropped_media_ms,
-                        latency_recoveries,
-                        underruns,
-                        max_lateness_ms,
-                    );
+                    publish_progress(&progress_tx, active.as_ref(), stats);
                     continue;
                 };
                 let lease_id = next_lease_id;
@@ -542,29 +554,19 @@ async fn run_worker(
                         .saturating_add(duration_ms),
                     deadline: send_deadline,
                 };
-                lease = Some(Lease {
+                consumer_lease = Some(ConsumerLease::Current(Lease {
                     id: lease_id,
                     generation: media.generation,
                     duration_ms,
                     payload_len,
                     delivered_at: now,
                     expires_at: now + LEASE_TIMEOUT,
-                });
+                }));
                 media.deadline = Some(scheduled_deadline);
                 if reply.send(Ok(Some(output))).is_err() {
-                    lease = None;
+                    consumer_lease = None;
                 }
-                publish_progress(
-                    &progress_tx,
-                    active.as_ref(),
-                    frames_delivered,
-                    bytes_delivered,
-                    dropped_frames,
-                    dropped_media_ms,
-                    latency_recoveries,
-                    underruns,
-                    max_lateness_ms,
-                );
+                publish_progress(&progress_tx, active.as_ref(), stats);
             }
             _ = async {
                 match lease_deadline {
@@ -572,20 +574,18 @@ async fn run_worker(
                     None => std::future::pending().await,
                 }
             } => {
-                let generation = lease.as_ref().map_or(0, |lease| lease.generation);
-                lease = None;
+                consumer_lease = None;
                 active = None;
                 if let Some(waiter) = pending_pull.take() {
-                    let _ = waiter.send(Err(MusicStreamError::StreamClosed(
-                        "external Opus frame lease timed out".to_owned(),
+                    let _ = waiter.send(Err(MusicStreamError::ExternalPullError(
+                        "frame lease timed out".to_owned(),
                     )));
                 }
                 emit_event(
                     &events,
                     &mut pending_events,
-                    WorkerEvent::CurrentFailed {
-                        generation,
-                        code: crate::error::ErrorCode::StreamClosed,
+                    WorkerEvent::OutputFailed {
+                        code: crate::error::ErrorCode::OutputError,
                         message: "external Opus frame lease timed out".to_owned(),
                     },
                 );
@@ -608,23 +608,33 @@ async fn run_worker(
 fn apply_ack(
     ack: ExternalFrameAck,
     active: &mut Option<ActiveMedia>,
-    lease: &mut Option<Lease>,
-    dropped_frames: &mut u64,
-    dropped_media_ms: &mut u64,
-    frames_delivered: &mut u64,
-    bytes_delivered: &mut u64,
+    consumer_lease: &mut Option<ConsumerLease>,
+    stats: &mut PlayoutStats,
 ) -> Result<()> {
-    let Some(current) = lease.as_ref() else {
+    let Some(lease) = consumer_lease.take() else {
         return Err(MusicStreamError::InvalidConfig(
             "external Opus frame ack has no outstanding lease".to_owned(),
         ));
     };
-    if current.id != ack.lease_id || current.generation != ack.generation {
-        return Err(MusicStreamError::InvalidConfig(
-            "external Opus frame ack does not match the outstanding lease".to_owned(),
-        ));
-    }
-    let current = lease.take().expect("outstanding lease was checked");
+    let current = match lease {
+        ConsumerLease::Current(current)
+            if current.id == ack.lease_id && current.generation == ack.generation =>
+        {
+            current
+        }
+        ConsumerLease::Retired(retired)
+            if retired.id == ack.lease_id && retired.generation == ack.generation =>
+        {
+            record_ack_stats(stats, &retired, ack.outcome);
+            return Ok(());
+        }
+        unmatched => {
+            *consumer_lease = Some(unmatched);
+            return Err(MusicStreamError::InvalidConfig(
+                "external Opus frame ack does not match the outstanding lease".to_owned(),
+            ));
+        }
+    };
     if ack.outcome == ExternalFrameOutcome::OutputUnavailable {
         active.take();
         return Ok(());
@@ -638,13 +648,7 @@ fn apply_ack(
     match ack.outcome {
         ExternalFrameOutcome::Sent | ExternalFrameOutcome::Late => {
             media.media_sent_ms = media.media_sent_ms.saturating_add(current.duration_ms);
-            if ack.outcome == ExternalFrameOutcome::Late {
-                *dropped_frames = dropped_frames.saturating_add(1);
-                *dropped_media_ms = dropped_media_ms.saturating_add(current.duration_ms);
-            } else {
-                *frames_delivered = frames_delivered.saturating_add(1);
-                *bytes_delivered = bytes_delivered.saturating_add(current.payload_len as u64);
-            }
+            record_ack_stats(stats, &current, ack.outcome);
             let duration = Duration::from_millis(current.duration_ms.max(1));
             let anchored = media.deadline.unwrap_or_else(Instant::now) + duration;
             let now = Instant::now();
@@ -667,33 +671,47 @@ fn apply_ack(
     Ok(())
 }
 
+fn record_ack_stats(stats: &mut PlayoutStats, lease: &Lease, outcome: ExternalFrameOutcome) {
+    match outcome {
+        ExternalFrameOutcome::Sent => {
+            stats.frames_delivered = stats.frames_delivered.saturating_add(1);
+            stats.bytes_delivered = stats
+                .bytes_delivered
+                .saturating_add(lease.payload_len as u64);
+        }
+        ExternalFrameOutcome::Late => {
+            stats.dropped_frames = stats.dropped_frames.saturating_add(1);
+            stats.dropped_media_ms = stats.dropped_media_ms.saturating_add(lease.duration_ms);
+        }
+        ExternalFrameOutcome::Cancelled | ExternalFrameOutcome::OutputUnavailable => {}
+    }
+}
+
 fn emit_output_unavailable(
     events: &mpsc::Sender<WorkerEvent>,
     pending: &mut VecDeque<WorkerEvent>,
-    generation: u64,
 ) {
     emit_event(
         events,
         pending,
-        WorkerEvent::CurrentFailed {
-            generation,
-            code: crate::error::ErrorCode::StreamClosed,
+        WorkerEvent::OutputFailed {
+            code: crate::error::ErrorCode::OutputError,
             message: "external Opus output is unavailable".to_owned(),
         },
     );
 }
 
-#[allow(clippy::too_many_arguments)]
+fn retire_lease(slot: &mut Option<ConsumerLease>) {
+    let Some(lease) = slot.take() else {
+        return;
+    };
+    *slot = Some(lease.retire());
+}
+
 fn publish_progress(
     progress: &watch::Sender<StreamRuntimeProgress>,
     active: Option<&ActiveMedia>,
-    frames_delivered: u64,
-    bytes_delivered: u64,
-    dropped_frames: u64,
-    dropped_media_ms: u64,
-    latency_recoveries: u64,
-    underruns: u64,
-    max_lateness_ms: u64,
+    stats: PlayoutStats,
 ) {
     let Some(media) = active else {
         return;
@@ -702,14 +720,14 @@ fn publish_progress(
         generation: media.generation,
         start_position_ms: media.start_position_ms,
         media_sent_ms: media.media_sent_ms,
-        packets_sent: frames_delivered,
-        bytes_sent: bytes_delivered,
-        dropped_frames,
-        dropped_media_ms,
-        latency_recoveries,
-        underruns,
+        packets_sent: stats.frames_delivered,
+        bytes_sent: stats.bytes_delivered,
+        dropped_frames: stats.dropped_frames,
+        dropped_media_ms: stats.dropped_media_ms,
+        latency_recoveries: stats.latency_recoveries,
+        underruns: stats.underruns,
         buffered_ms: media.receiver.buffered_ms(),
-        max_lateness_ms,
+        max_lateness_ms: stats.max_lateness_ms,
         sequence: 0,
         rtp_timestamp: 0,
         latest_receiver_report: None,
@@ -738,5 +756,31 @@ fn flush_events(sender: &mpsc::Sender<WorkerEvent>, pending: &mut VecDeque<Worke
             }
             Err(mpsc::error::TrySendError::Closed(_)) => return,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn worker_panic_is_published_as_an_output_failure() {
+        let (events, mut event_rx) = mpsc::channel(1);
+        let worker = tokio::spawn(async {
+            panic!("injected external pull panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        let supervisor = supervise_worker(worker, events);
+
+        let event = event_rx.recv().await.expect("output failure event");
+        assert!(matches!(
+            event,
+            WorkerEvent::OutputFailed {
+                code: crate::ErrorCode::Internal,
+                ..
+            }
+        ));
+        assert!(supervisor.await.expect("supervisor").is_err());
     }
 }

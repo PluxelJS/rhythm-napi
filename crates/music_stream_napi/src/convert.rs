@@ -15,11 +15,11 @@ const DEFAULT_MUSIC_OPUS_BITRATE_BPS: u32 = 128_000;
 pub(crate) fn external_pull_config_from_input(
     input: Option<ExternalPullConfigInput>,
 ) -> std::result::Result<ExternalPullConfig, MusicStreamError> {
-    let bitrate = input.and_then(|input| input.bitrate);
+    let bitrate = input.and_then(|input| input.opus_bitrate_bps);
     let opus_bitrate_bps = match bitrate {
         Some(value) => Some(u32::try_from(value).map_err(|_| {
             MusicStreamError::InvalidConfig(
-                "external output bitrate must fit in a positive u32".to_owned(),
+                "external Opus bitrate must fit in a positive u32".to_owned(),
             )
         })?),
         None => Some(DEFAULT_MUSIC_OPUS_BITRATE_BPS),
