@@ -1240,7 +1240,7 @@ mod tests {
             .await
             .expect("preload permit");
         let flight = crate::source::SharedUrlFlight::new();
-        let subscription = flight.subscribe(false, false);
+        let subscription = flight.subscribe(false, false).expect("subscription");
         let control = MediaControl::new(
             VolumeLevel::default(),
             GainLevel::default(),
@@ -1431,8 +1431,8 @@ mod tests {
     #[test]
     fn producer_controls_update_shared_download_pause_aggregation() {
         let flight = crate::source::SharedUrlFlight::new();
-        let first_subscription = flight.subscribe(false, true);
-        let second_subscription = flight.subscribe(false, true);
+        let first_subscription = flight.subscribe(false, true).expect("first subscription");
+        let second_subscription = flight.subscribe(false, true).expect("second subscription");
         let first_control = Arc::new(MediaControl::new(
             VolumeLevel::default(),
             GainLevel::default(),

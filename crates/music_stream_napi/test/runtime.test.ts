@@ -460,7 +460,7 @@ test('a pending promoted preload is bounded by its attempt startup deadline', as
 				type: 'attemptFailed',
 				attemptId: 'entry-b:attempt-2',
 				trackId: 'pending-next',
-				sourceRole: 'next',
+				sourceRole: 'current',
 				code: 'SOURCE_TIMEOUT',
 			}),
 		)
@@ -472,6 +472,79 @@ test('a pending promoted preload is bounded by its attempt startup deadline', as
 		expect(request).toBeDefined()
 		expect(state!.sequence).toBeLessThan(request!.sequence)
 	} finally {
+		await stopStreamIfPresent(streamer, streamId)
+		server.closeAllConnections()
+		await new Promise<void>((resolve) => server.close(() => resolve()))
+		await closeSocket(socket)
+		await fs.promises.rm(directory, { recursive: true, force: true })
+	}
+})
+
+test('a pending preload gains current priority as soon as the previous track ends', async () => {
+	const directory = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'music-next-promotion-'))
+	const currentPath = path.join(directory, 'current.wav')
+	const nextBody = makeSineWave(0.5)
+	await fs.promises.writeFile(currentPath, makeSineWave(0.04))
+	let releaseResponse!: () => void
+	const responseGate = new Promise<void>((resolve) => {
+		releaseResponse = resolve
+	})
+	const server = http.createServer(async (_request, response) => {
+		await responseGate
+		response.writeHead(200, {
+			'Content-Length': nextBody.length,
+			'Content-Type': 'audio/wav',
+		})
+		response.end(nextBody)
+	})
+	await new Promise<void>((resolve, reject) => {
+		server.once('error', reject)
+		server.listen(0, '127.0.0.1', resolve)
+	})
+	const address = server.address()
+	if (!address || typeof address === 'string') throw new Error('HTTP test server did not bind')
+	const socket = await createBoundUdpSocket()
+	const streamer = new Streamer()
+	const streamId = `next-promotion-${Date.now()}`
+
+	try {
+		await streamer.startStream({
+			streamId,
+			current: { id: 'current', attemptId: 'attempt-current', kind: 'file', path: currentPath },
+			transport: rtpTransport(socket, 0x33445569),
+			attemptStartTimeoutMs: 2_000,
+		})
+		await streamer.reconcilePlan(streamId, {
+			version: 1,
+			current: { id: 'current', attemptId: 'attempt-current', kind: 'file', path: currentPath },
+			next: {
+				id: 'pending-next',
+				attemptId: 'attempt-pending-next',
+				kind: 'url',
+				url: `http://127.0.0.1:${address.port}/next.wav`,
+				formatHint: 'wav',
+			},
+		})
+
+		const promoted = await waitForStatus(
+			() => streamer.getStatus(streamId),
+			(status) =>
+				status.playState === 'buffering' &&
+				status.current?.attemptId === 'attempt-pending-next' &&
+				status.next === undefined,
+		)
+		expect(promoted.current?.id).toBe('pending-next')
+
+		releaseResponse()
+		const playing = await waitForStatus(
+			() => streamer.getStatus(streamId),
+			(status) =>
+				status.playState === 'playing' &&
+				status.current?.attemptId === 'attempt-pending-next',
+		)
+		expect(playing.current?.id).toBe('pending-next')
+	} finally {
+		releaseResponse()
 		await stopStreamIfPresent(streamer, streamId)
 		server.closeAllConnections()
 		await new Promise<void>((resolve) => server.close(() => resolve()))

@@ -671,6 +671,186 @@ async fn progressive_url_sends_rtp_before_http_download_completes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn switching_away_from_an_incomplete_url_closes_the_old_response() {
+    let replacement_wav = tempfile::Builder::new()
+        .suffix(".wav")
+        .tempfile()
+        .expect("replacement wav");
+    write_wav(replacement_wav.path(), 0.4);
+    let source_wav = tempfile::Builder::new()
+        .suffix(".wav")
+        .tempfile()
+        .expect("source wav");
+    write_wav(source_wav.path(), 1.0);
+    let body = std::fs::read(source_wav.path()).expect("source body");
+    let split = (44 + 48_000 * 2).min(body.len() - 1);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("HTTP bind");
+    let address = listener.local_addr().expect("HTTP address");
+    let (prefix_tx, prefix_rx) = tokio::sync::oneshot::channel();
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut request = [0_u8; 2_048];
+        let _ = stream.read(&mut request).await;
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: audio/wav\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(header.as_bytes()).await.expect("header");
+        stream.write_all(&body[..split]).await.expect("prefix");
+        stream.flush().await.expect("flush");
+        let _ = prefix_tx.send(());
+        let mut probe = [0_u8; 1];
+        loop {
+            match stream.read(&mut probe).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        let _ = closed_tx.send(());
+    });
+
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("RTP bind");
+    let mut transport = RtpTransportConfig::new(
+        "127.0.0.1",
+        receiver.local_addr().expect("RTP address").port(),
+        206,
+    );
+    transport.local_ip = "127.0.0.1".to_owned();
+    let runtime = StreamRuntime::start(
+        "cancel-incomplete-current".to_owned(),
+        TrackSource {
+            attempt_id: "attempt-slow-current".to_owned(),
+            id: "slow-current".to_owned(),
+            kind: TrackKind::Url,
+            url: Some(format!("http://{address}/slow.wav")),
+            path: None,
+            format_hint: Some("wav".to_owned()),
+            seekable: Some(true),
+            headers: Default::default(),
+            network_policy: NetworkPolicy::Provider,
+        },
+        StreamRuntimeConfig::new(transport, SourceResolverConfig::default()),
+        VolumeLevel::default(),
+        Default::default(),
+    )
+    .await
+    .expect("runtime");
+
+    prefix_rx.await.expect("HTTP prefix");
+    runtime
+        .command(StreamCommand::ReconcilePlan {
+            version: 1,
+            current: Some(file_track("replacement", replacement_wav.path())),
+            next: None,
+        })
+        .await
+        .expect("switch");
+    tokio::time::timeout(Duration::from_secs(1), closed_rx)
+        .await
+        .expect("old response remained open")
+        .expect("close observation");
+
+    runtime.shutdown().await.expect("shutdown");
+    server.await.expect("server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paused_plan_replacement_closes_the_superseded_next_response() {
+    let current_wav = tempfile::Builder::new()
+        .suffix(".wav")
+        .tempfile()
+        .expect("current wav");
+    let replacement_wav = tempfile::Builder::new()
+        .suffix(".wav")
+        .tempfile()
+        .expect("replacement wav");
+    let old_next_wav = tempfile::Builder::new()
+        .suffix(".wav")
+        .tempfile()
+        .expect("old next wav");
+    write_wav(current_wav.path(), 1.0);
+    write_wav(replacement_wav.path(), 1.0);
+    write_wav(old_next_wav.path(), 1.0);
+    let body = std::fs::read(old_next_wav.path()).expect("old next body");
+    let split = (44 + 48_000 * 2).min(body.len() - 1);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("HTTP bind");
+    let address = listener.local_addr().expect("HTTP address");
+    let (prefix_tx, prefix_rx) = tokio::sync::oneshot::channel();
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        let mut request = [0_u8; 2_048];
+        let _ = stream.read(&mut request).await;
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: audio/wav\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(header.as_bytes()).await.expect("header");
+        stream.write_all(&body[..split]).await.expect("prefix");
+        stream.flush().await.expect("flush");
+        let _ = prefix_tx.send(());
+        let mut probe = [0_u8; 1];
+        loop {
+            match stream.read(&mut probe).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        let _ = closed_tx.send(());
+    });
+
+    let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("RTP bind");
+    let runtime = runtime_for(
+        "paused-replace",
+        file_track("current", current_wav.path()),
+        None,
+        &receiver,
+        207,
+    )
+    .await;
+    let mut current = file_track("current", current_wav.path());
+    current.attempt_id = "paused-replace:current".to_owned();
+    runtime
+        .command(StreamCommand::ReconcilePlan {
+            version: 1,
+            current: Some(current),
+            next: Some(TrackSource {
+                attempt_id: "attempt-old-next".to_owned(),
+                id: "old-next".to_owned(),
+                kind: TrackKind::Url,
+                url: Some(format!("http://{address}/old-next.wav")),
+                path: None,
+                format_hint: Some("wav".to_owned()),
+                seekable: Some(true),
+                headers: Default::default(),
+                network_policy: NetworkPolicy::Provider,
+            }),
+        })
+        .await
+        .expect("prepare old next");
+    prefix_rx.await.expect("HTTP prefix");
+    runtime.command(StreamCommand::Pause).await.expect("pause");
+
+    let replaced = runtime
+        .command(StreamCommand::ReconcilePlan {
+            version: 2,
+            current: Some(file_track("replacement", replacement_wav.path())),
+            next: Some(file_track("new-next", replacement_wav.path())),
+        })
+        .await
+        .expect("replace paused plan");
+    assert_eq!(replaced.status.play_state, music_stream::PlayState::Paused);
+    tokio::time::timeout(Duration::from_secs(1), closed_rx)
+        .await
+        .expect("superseded next response remained open")
+        .expect("close observation");
+
+    runtime.shutdown().await.expect("shutdown");
+    server.await.expect("server");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn next_url_added_while_paused_starts_no_download_until_resume() {
     let current_wav = tempfile::Builder::new()
         .suffix(".wav")

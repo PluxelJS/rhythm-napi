@@ -208,6 +208,7 @@ pub type SharedSourceDownloadRegistry = Arc<SourceDownloadRegistry>;
 #[derive(Debug, Default)]
 struct SubscriberState {
     subscribers: HashMap<u64, SubscriberEntry>,
+    closed: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -269,18 +270,24 @@ impl SharedUrlFlight {
         self: &Arc<Self>,
         paused: bool,
         current: bool,
-    ) -> SharedUrlSubscription {
+    ) -> Option<SharedUrlSubscription> {
         let subscriber_id = self.next_subscriber_id.fetch_add(1, Ordering::Relaxed);
-        self.subscribers
+        let mut subscribers = self
+            .subscribers
             .lock()
-            .expect("shared URL subscriber lock poisoned")
+            .expect("shared URL subscriber lock poisoned");
+        if subscribers.closed {
+            return None;
+        }
+        subscribers
             .subscribers
             .insert(subscriber_id, SubscriberEntry { paused, current });
+        drop(subscribers);
         self.apply_aggregate_state();
-        SharedUrlSubscription {
+        Some(SharedUrlSubscription {
             flight: Arc::clone(self),
             subscriber_id,
-        }
+        })
     }
 
     fn set_paused(&self, subscriber_id: u64, paused: bool) {
@@ -308,15 +315,20 @@ impl SharedUrlFlight {
     }
 
     fn unsubscribe(&self, subscriber_id: u64) {
-        let empty = {
+        let should_cancel = {
             let mut subscribers = self
                 .subscribers
                 .lock()
                 .expect("shared URL subscriber lock poisoned");
             subscribers.subscribers.remove(&subscriber_id);
-            subscribers.subscribers.is_empty()
+            if subscribers.subscribers.is_empty() {
+                subscribers.closed = true;
+                true
+            } else {
+                false
+            }
         };
-        if empty {
+        if should_cancel {
             self.cancellation.cancel();
         } else {
             self.apply_aggregate_state();
@@ -669,8 +681,7 @@ impl FileSourceResolver {
             return Ok(hit);
         }
         metrics::counter!("music_stream.source.cache_miss").increment(1);
-        let flight = self.shared_url_flight(source)?;
-        let subscription = flight.subscribe(gate.is_paused(), !self.preload);
+        let subscription = self.shared_url_subscription(source, gate.is_paused())?;
         wait_for_shared_artifact(&subscription, gate, cancellation).await
     }
 
@@ -692,35 +703,45 @@ impl FileSourceResolver {
             return Ok(UrlPlaybackSource::Cached(hit));
         }
         metrics::counter!("music_stream.source.cache_miss").increment(1);
-        let flight = self.shared_url_flight(source)?;
-        let subscription = flight.subscribe(gate.is_paused(), !self.preload);
+        let subscription = self.shared_url_subscription(source, gate.is_paused())?;
         match wait_for_shared_reader(&subscription, &gate, cancellation).await? {
             SharedReaderReady::Cached(artifact) => Ok(UrlPlaybackSource::Cached(artifact)),
             SharedReaderReady::Reader(reader) => {
+                let terminal = subscription.flight.terminal.subscribe();
                 Ok(UrlPlaybackSource::Progressive(ProgressiveUrlSource {
                     reader,
-                    terminal: flight.terminal.subscribe(),
+                    terminal,
                     subscription,
                 }))
             }
         }
     }
 
-    fn shared_url_flight(&self, source: &TrackSource) -> Result<Arc<SharedUrlFlight>> {
+    fn shared_url_subscription(
+        &self,
+        source: &TrackSource,
+        paused: bool,
+    ) -> Result<SharedUrlSubscription> {
         let key = download_flight_key(source, &self.config.http);
-        let (flight, created) = {
+        let (flight, subscription, created) = {
             let mut flights = self.resources.downloads.flights.lock().map_err(|_| {
                 MusicStreamError::Internal("source download registry poisoned".to_owned())
             })?;
             self.resources.downloads.prune_dead_if_due(&mut flights);
-            if let Some(flight) = flights.get(&key).and_then(Weak::upgrade) {
+            let existing = flights.get(&key).and_then(Weak::upgrade);
+            if let Some(flight) = existing
+                && let Some(subscription) = flight.subscribe(paused, !self.preload)
+            {
                 metrics::counter!("music_stream.source.shared_download_followers").increment(1);
-                (flight, false)
+                (flight, subscription, false)
             } else {
                 flights.remove(&key);
                 let flight = SharedUrlFlight::new();
+                let subscription = flight
+                    .subscribe(paused, !self.preload)
+                    .expect("new shared URL flight accepts its first subscriber");
                 flights.insert(key, Arc::downgrade(&flight));
-                (flight, true)
+                (flight, subscription, true)
             }
         };
         if created {
@@ -733,7 +754,7 @@ impl FileSourceResolver {
                 },
             );
         }
-        Ok(flight)
+        Ok(subscription)
     }
 }
 
@@ -2493,8 +2514,8 @@ mod tests {
     #[test]
     fn shared_transfer_pauses_only_when_every_subscriber_is_paused() {
         let flight = SharedUrlFlight::new();
-        let first = flight.subscribe(false, true);
-        let second = flight.subscribe(false, true);
+        let first = flight.subscribe(false, true).expect("first subscriber");
+        let second = flight.subscribe(false, true).expect("second subscriber");
         assert!(!flight.transfer_gate.is_paused());
 
         first.control().pause();
@@ -2509,6 +2530,17 @@ mod tests {
         assert!(!flight.cancellation.is_cancelled());
         drop(second);
         assert!(flight.cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn closed_shared_transfer_rejects_late_subscribers() {
+        let flight = SharedUrlFlight::new();
+        let subscriber = flight.subscribe(false, true).expect("subscriber");
+
+        drop(subscriber);
+
+        assert!(flight.cancellation.is_cancelled());
+        assert!(flight.subscribe(false, true).is_none());
     }
 
     #[tokio::test]

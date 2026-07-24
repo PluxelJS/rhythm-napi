@@ -365,7 +365,7 @@ impl StreamActor {
                 {
                     next.state = AttemptState::Ready;
                     if self.current.is_none() {
-                        self.promote_ready_next(&mut output);
+                        self.promote_active_next(&mut output);
                     }
                 }
             }
@@ -751,7 +751,7 @@ impl StreamActor {
     ) -> Result<()> {
         let preserve_pause = self.play_state == PlayState::Paused;
         let old_current_generation = self.current.take().map(|attempt| attempt.generation);
-        let old_next_generation = self.next.take().map(|attempt| attempt.generation);
+        let old_next = self.next.take();
 
         self.refreshable_current_key = None;
         self.generation += 1;
@@ -771,18 +771,30 @@ impl StreamActor {
         self.current = Some(current_attempt);
 
         if let Some(next_source) = next {
-            self.generation += 1;
-            let mut next_attempt = PlaybackAttempt::new(next_source.clone(), self.generation);
-            if !preserve_pause {
-                let watchdog_epoch = next_attempt.start();
-                output.actions.push(TaskAction::PrepareNext {
-                    generation: next_attempt.generation,
-                    watchdog_epoch,
-                    track: next_source,
-                });
+            if let Some(mut retained) = old_next
+                .as_ref()
+                .filter(|attempt| attempt.source.same_attempt_as(&next_source))
+                .cloned()
+            {
+                retained.source = next_source;
+                self.next = Some(retained);
+            } else {
+                let old_next_generation = old_next.as_ref().map(|attempt| attempt.generation);
+                self.generation += 1;
+                let mut next_attempt = PlaybackAttempt::new(next_source.clone(), self.generation);
+                if !preserve_pause {
+                    let watchdog_epoch = next_attempt.start();
+                    output.actions.push(TaskAction::PrepareNext {
+                        generation: next_attempt.generation,
+                        watchdog_epoch,
+                        track: next_source,
+                    });
+                } else if let Some(generation) = old_next_generation {
+                    output.actions.push(TaskAction::CancelNext { generation });
+                }
+                self.next = Some(next_attempt);
             }
-            self.next = Some(next_attempt);
-        } else if let Some(generation) = old_next_generation {
+        } else if let Some(generation) = old_next.map(|attempt| attempt.generation) {
             output.actions.push(TaskAction::CancelNext { generation });
         }
 
@@ -837,7 +849,11 @@ impl StreamActor {
 
     fn promote_next_or_wait(&mut self, output: &mut ActorEffects, request_next_when_empty: bool) {
         let preserve_pause = self.play_state == PlayState::Paused;
-        if self.promote_ready_next(output) {
+        // Once the old current is gone, the selected successor is no longer speculative work.
+        // Promote an in-flight attempt immediately so the runtime releases preload-only
+        // admission and gives its download/decoder current-playback priority. Audio output still
+        // waits for CurrentPrebufferReady, so this cannot make an unready source audible early.
+        if self.promote_active_next(output) {
             return;
         }
 
@@ -850,7 +866,11 @@ impl StreamActor {
                 PlayState::Buffering
             };
         } else {
-            self.play_state = PlayState::Idle;
+            self.play_state = if preserve_pause {
+                PlayState::Paused
+            } else {
+                PlayState::Idle
+            };
             if request_next_when_empty {
                 output.events.push(StreamEvent::NextNeeded {
                     stream_id: self.stream_id.clone(),
@@ -859,8 +879,8 @@ impl StreamActor {
         }
     }
 
-    fn promote_ready_next(&mut self, output: &mut ActorEffects) -> bool {
-        if !self.next.as_ref().is_some_and(PlaybackAttempt::is_ready) {
+    fn promote_active_next(&mut self, output: &mut ActorEffects) -> bool {
+        if !self.next.as_ref().is_some_and(PlaybackAttempt::is_active) {
             return false;
         }
 
@@ -1196,20 +1216,30 @@ mod tests {
     }
 
     #[test]
-    fn next_never_promotes_before_ready() {
+    fn pending_next_promotes_to_current_priority_at_the_track_boundary() {
         let mut actor = actor("s1".to_owned(), Some(track("a")), Some(track("b")));
+        actor.handle_command(StreamCommand::Play).expect("play");
         let current_generation = actor.current_generation();
+        let next_generation = actor.next.as_ref().expect("next").generation;
         let output = actor.handle_worker_event(WorkerEvent::CurrentEnded {
             generation: current_generation,
         });
 
         assert!(matches!(output.status.play_state, PlayState::Buffering));
-        assert!(actor.current.is_none());
-        assert_eq!(actor.next.as_ref().expect("next retained").source.id, "b");
+        assert_eq!(
+            actor.current.as_ref().expect("promoted current").source.id,
+            "b"
+        );
+        assert!(actor.next.is_none());
+        assert!(output.actions.contains(&TaskAction::StartCurrent {
+            generation: next_generation,
+            watchdog_epoch: 2,
+            track: track("b"),
+        }));
     }
 
     #[test]
-    fn pause_during_cross_track_gap_freezes_next_and_survives_promotion() {
+    fn pause_during_cross_track_gap_freezes_the_promoted_current() {
         let mut actor = actor("s1".to_owned(), Some(track("a")), Some(track("b")));
         actor.handle_command(StreamCommand::Play).expect("play");
         let current_generation = actor.current_generation();
@@ -1222,21 +1252,17 @@ mod tests {
         assert_eq!(paused.status.play_state, PlayState::Paused);
         assert_eq!(
             paused.actions,
-            vec![TaskAction::PauseNext {
+            vec![TaskAction::PauseCurrent {
                 generation: next_generation
             }]
         );
 
-        let promoted = actor.handle_worker_event(WorkerEvent::NextReady {
+        let stale_next_ready = actor.handle_worker_event(WorkerEvent::NextReady {
             generation: next_generation,
         });
-        assert_eq!(promoted.status.play_state, PlayState::Paused);
-        assert_eq!(promoted.status.current.expect("promoted").id, "b");
-        assert!(promoted.actions.contains(&TaskAction::StartCurrent {
-            generation: next_generation,
-            watchdog_epoch: 3,
-            track: track("b")
-        }));
+        assert_eq!(stale_next_ready.status.play_state, PlayState::Paused);
+        assert_eq!(stale_next_ready.status.current.expect("promoted").id, "b");
+        assert!(stale_next_ready.actions.is_empty());
 
         let resumed = actor.handle_command(StreamCommand::Play).expect("resume");
         assert_eq!(resumed.status.play_state, PlayState::Buffering);
@@ -1251,7 +1277,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_during_cross_track_gap_restarts_next_without_requesting_another_track() {
+    fn resume_during_cross_track_gap_restarts_the_promoted_current() {
         let mut actor = actor("s1".to_owned(), Some(track("a")), Some(track("b")));
         actor.handle_command(StreamCommand::Play).expect("play");
         let current_generation = actor.current_generation();
@@ -1267,13 +1293,13 @@ mod tests {
         assert_eq!(
             resumed.actions,
             vec![
-                TaskAction::ResumeNext {
+                TaskAction::ResumeCurrent {
                     generation: next_generation
                 },
                 TaskAction::ArmStartupDeadline {
-                    source_role: SourceRole::Next,
+                    source_role: SourceRole::Current,
                     generation: next_generation,
-                    watchdog_epoch: 3,
+                    watchdog_epoch: 4,
                 }
             ]
         );
@@ -1327,7 +1353,7 @@ mod tests {
     }
 
     #[test]
-    fn next_failure_after_current_end_exits_buffering_and_requests_replacement() {
+    fn promoted_next_failure_after_current_end_exits_buffering_and_requests_replacement() {
         let mut actor = actor("s1".to_owned(), Some(track("a")), Some(track("b")));
         actor.handle_command(StreamCommand::Play).expect("play");
         let current_generation = actor.current_generation();
@@ -1336,7 +1362,7 @@ mod tests {
             generation: current_generation,
         });
 
-        let output = actor.handle_worker_event(WorkerEvent::NextFailed {
+        let output = actor.handle_worker_event(WorkerEvent::CurrentFailed {
             generation: next_generation,
             code: ErrorCode::SourceTimeout,
             message: "preload timed out".to_owned(),
@@ -1368,15 +1394,18 @@ mod tests {
         let mut actor = actor("s1".to_owned(), Some(track("a")), Some(next));
         actor.handle_command(StreamCommand::Play).expect("play");
         let current_generation = actor.current_generation();
-        let next = actor.next.as_ref().expect("next");
-        let next_generation = next.generation;
-        let watchdog_epoch = next.watchdog_epoch;
+        let next_generation = actor.next.as_ref().expect("next").generation;
         actor.handle_worker_event(WorkerEvent::CurrentEnded {
             generation: current_generation,
         });
+        let watchdog_epoch = actor
+            .current
+            .as_ref()
+            .expect("promoted current")
+            .watchdog_epoch;
 
         let output = actor.handle_worker_event(WorkerEvent::StartupTimedOut {
-            source_role: SourceRole::Next,
+            source_role: SourceRole::Current,
             generation: next_generation,
             watchdog_epoch,
         });
@@ -1389,7 +1418,7 @@ mod tests {
             StreamEvent::AttemptFailed {
                 attempt_id,
                 track_id,
-                source_role: SourceRole::Next,
+                source_role: SourceRole::Current,
                 generation,
                 code: ErrorCode::SourceTimeout,
                 ..
@@ -1500,7 +1529,7 @@ mod tests {
     }
 
     #[test]
-    fn paused_next_failure_preserves_pause_while_requesting_replacement() {
+    fn paused_promoted_next_failure_preserves_pause_while_requesting_replacement() {
         let mut actor = actor("s1".to_owned(), Some(track("a")), Some(track("b")));
         actor.handle_command(StreamCommand::Play).expect("play");
         let current_generation = actor.current_generation();
@@ -1510,7 +1539,7 @@ mod tests {
         });
         actor.handle_command(StreamCommand::Pause).expect("pause");
 
-        let output = actor.handle_worker_event(WorkerEvent::NextFailed {
+        let output = actor.handle_worker_event(WorkerEvent::CurrentFailed {
             generation: next_generation,
             code: ErrorCode::SourceTimeout,
             message: "preload timed out".to_owned(),
@@ -1583,6 +1612,64 @@ mod tests {
         assert!(resumed.actions.iter().any(
             |action| matches!(action, TaskAction::StartCurrent { track, .. } if track.id == "b")
         ));
+    }
+
+    #[test]
+    fn paused_plan_replacement_cancels_superseded_current_and_next() {
+        let mut actor = actor("s1".to_owned(), Some(track("a")), Some(track("old-next")));
+        actor.handle_command(StreamCommand::Play).expect("play");
+        actor.handle_command(StreamCommand::Pause).expect("pause");
+        let old_current_generation = actor.current_generation();
+        let old_next_generation = actor.next.as_ref().expect("old next").generation;
+
+        let replaced = actor
+            .handle_command(StreamCommand::ReconcilePlan {
+                version: 1,
+                current: Some(track("b")),
+                next: Some(track("new-next")),
+            })
+            .expect("replace paused plan");
+
+        assert_eq!(replaced.status.play_state, PlayState::Paused);
+        assert!(replaced.actions.contains(&TaskAction::CancelCurrent {
+            generation: old_current_generation,
+        }));
+        assert!(replaced.actions.contains(&TaskAction::CancelNext {
+            generation: old_next_generation,
+        }));
+        assert!(!replaced.actions.iter().any(|action| matches!(
+            action,
+            TaskAction::StartCurrent { .. } | TaskAction::PrepareNext { .. }
+        )));
+    }
+
+    #[test]
+    fn replacing_current_retains_the_same_prepared_next_attempt() {
+        let mut actor = actor("s1".to_owned(), Some(track("a")), Some(track("next")));
+        actor.handle_command(StreamCommand::Play).expect("play");
+        let next_generation = actor.next.as_ref().expect("next").generation;
+
+        let replaced = actor
+            .handle_command(StreamCommand::ReconcilePlan {
+                version: 1,
+                current: Some(track("b")),
+                next: Some(track("next")),
+            })
+            .expect("replace current");
+
+        assert_eq!(
+            actor.next.as_ref().expect("retained next").generation,
+            next_generation
+        );
+        assert!(
+            !replaced
+                .actions
+                .iter()
+                .any(|action| matches!(action, TaskAction::PrepareNext { .. }))
+        );
+        assert!(!replaced.actions.contains(&TaskAction::CancelNext {
+            generation: next_generation,
+        }));
     }
 
     #[test]
