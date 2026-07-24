@@ -621,7 +621,7 @@ mod tests {
         let headers =
             HashMap::from([("referer".to_owned(), "https://www.example.test/".to_owned())]);
         let track = TrackSource::try_from(TrackSourceInput {
-            attempt_id: None,
+            attempt_id: "attempt-opaque".to_owned(),
             id: "opaque".to_owned(),
             kind: "url".to_owned(),
             url: Some("https://cdn.test/signed".to_owned()),
@@ -639,7 +639,7 @@ mod tests {
         );
 
         let error = TrackSource::try_from(TrackSourceInput {
-            attempt_id: None,
+            attempt_id: "attempt-invalid".to_owned(),
             id: "invalid".to_owned(),
             kind: "url".to_owned(),
             url: Some("https://cdn.test/signed".to_owned()),

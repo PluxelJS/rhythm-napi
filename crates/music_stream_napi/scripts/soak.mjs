@@ -46,7 +46,7 @@ const sinkPort = sink.address().port
 
 const streamer = new Streamer({ maxStreams: options.streams })
 const streamIds = Array.from({ length: options.streams }, (_, index) => `soak-${index}`)
-const nextTrackIndex = new Map(streamIds.map((streamId) => [streamId, 2]))
+const nextTrackIndex = new Map(streamIds.map((streamId) => [streamId, 1]))
 let maintenanceErrors = 0
 let runtimeErrors = 0
 let previousSinkPackets = 0
@@ -76,7 +76,6 @@ try {
   await Promise.all(streamIds.map((streamId, index) => streamer.startStream({
     streamId,
     current: track(streamId, 0),
-    next: track(streamId, 1),
     transport: {
       ip: '127.0.0.1',
       port: sinkPort,
@@ -145,19 +144,22 @@ try {
         const index = nextTrackIndex.get(item.streamId) ?? 2
         nextTrackIndex.set(item.streamId, index + 1)
         maintenance.push(
-          streamer.setNext(item.streamId, track(item.streamId, index)).catch(() => {
+          streamer.reconcilePlan(item.streamId, {
+            version: status.planVersion + 1,
+            current: sourceFromStatus(status.current),
+            next: track(item.streamId, index),
+          }).catch(() => {
             maintenanceErrors += 1
           }),
         )
       } else if (!status.current && !status.next && status.playState !== 'stopped') {
         const index = nextTrackIndex.get(item.streamId) ?? 2
-        nextTrackIndex.set(item.streamId, index + 2)
+        nextTrackIndex.set(item.streamId, index + 1)
         maintenance.push(
-          streamer.switchTrack(
-            item.streamId,
-            track(item.streamId, index),
-            track(item.streamId, index + 1),
-          ).catch(() => {
+          streamer.reconcilePlan(item.streamId, {
+            version: status.planVersion + 1,
+            current: track(item.streamId, index),
+          }).catch(() => {
             maintenanceErrors += 1
           }),
         )
@@ -299,11 +301,23 @@ if (runtimeErrors > 0) process.exitCode = 1
 
 function track(streamId, index) {
   return {
+    attemptId: `${streamId}:attempt:${index}`,
     id: `${streamId}:fixture:${index}`,
     kind: 'file',
     path: fixturePath,
     formatHint: 'wav',
     seekable: true,
+  }
+}
+
+function sourceFromStatus(source) {
+  return {
+    attemptId: source.attemptId,
+    id: source.id,
+    kind: source.kind,
+    path: fixturePath,
+    formatHint: source.formatHint ?? 'wav',
+    seekable: source.seekable ?? true,
   }
 }
 

@@ -22,7 +22,7 @@ pub struct TrackSource {
     /// Identity of this playback occurrence. It is deliberately separate from `id`: multiple
     /// queue entries may share one media/cache identity while still requiring independent
     /// lifecycle and failure accounting.
-    pub attempt_id: Option<String>,
+    pub attempt_id: String,
     pub id: String,
     pub kind: TrackKind,
     pub url: Option<String>,
@@ -38,11 +38,7 @@ pub struct TrackSource {
 
 impl TrackSource {
     pub fn validate(&self) -> crate::Result<()> {
-        if self
-            .attempt_id
-            .as_deref()
-            .is_some_and(|id| id.trim().is_empty() || id.len() > MAX_TRACK_ID_BYTES)
-        {
+        if self.attempt_id.trim().is_empty() || self.attempt_id.len() > MAX_TRACK_ID_BYTES {
             return Err(crate::MusicStreamError::InvalidSource(
                 "attempt id must contain 1 to 512 bytes".to_owned(),
             ));
@@ -104,13 +100,10 @@ impl TrackSource {
         self.attempt_key() == other.attempt_key()
     }
 
-    /// Stable lifecycle identity. Legacy callers that do not provide an occurrence id retain the
-    /// old source-id semantics.
+    /// Stable lifecycle identity of one concrete playback execution.
     #[must_use]
     pub fn attempt_key(&self) -> &str {
-        self.attempt_id
-            .as_deref()
-            .unwrap_or_else(|| self.stable_key())
+        &self.attempt_id
     }
 
     #[must_use]
@@ -482,7 +475,7 @@ mod tests {
 
     fn source(kind: TrackKind, seekable: Option<bool>) -> TrackSource {
         TrackSource {
-            attempt_id: None,
+            attempt_id: "attempt-track-a".to_owned(),
             id: "track-a".to_owned(),
             kind,
             url: Some("https://example.test/audio".to_owned()),

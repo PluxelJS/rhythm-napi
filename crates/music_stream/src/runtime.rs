@@ -463,19 +463,14 @@ impl StreamRuntime {
     pub async fn start(
         stream_id: String,
         current: TrackSource,
-        next: Option<TrackSource>,
         config: StreamRuntimeConfig,
         volume: VolumeLevel,
         gain: GainLevel,
     ) -> Result<Self> {
         let current = current.with_normalized_capabilities();
-        let next = next.map(TrackSource::with_normalized_capabilities);
         Self::validate_stream_id(&stream_id)?;
         config.validate()?;
         current.validate()?;
-        if let Some(next) = &next {
-            validate_next_source(next)?;
-        }
         let stream_permit = Arc::clone(&config.resources.streams)
             .try_acquire_owned()
             .map_err(|_| {
@@ -506,7 +501,7 @@ impl StreamRuntime {
         };
         let inner = Arc::new(StreamRuntimeInner {
             stream_permit: Mutex::new(Some(stream_permit)),
-            actor: Mutex::new(StreamActor::new(stream_id, Some(current), next)),
+            actor: Mutex::new(StreamActor::new(stream_id, Some(current))),
             orchestration: Mutex::new(()),
             output,
             current: Mutex::new(None),
@@ -591,13 +586,6 @@ impl StreamRuntime {
 
 fn normalize_command_sources(command: &mut StreamCommand) {
     match command {
-        StreamCommand::SetNext(next) => {
-            *next = next.take().map(TrackSource::with_normalized_capabilities);
-        }
-        StreamCommand::SwitchTrack { current, next } => {
-            *current = current.clone().with_normalized_capabilities();
-            *next = next.take().map(TrackSource::with_normalized_capabilities);
-        }
         StreamCommand::RefreshCurrentSource { current } => {
             *current = current.clone().with_normalized_capabilities();
         }
@@ -618,14 +606,6 @@ fn normalize_command_sources(command: &mut StreamCommand) {
 
 fn validate_command_sources(command: &StreamCommand) -> Result<()> {
     match command {
-        StreamCommand::SetNext(Some(next)) => validate_next_source(next),
-        StreamCommand::SwitchTrack { current, next } => {
-            current.validate()?;
-            if let Some(next) = next {
-                validate_next_source(next)?;
-            }
-            Ok(())
-        }
         StreamCommand::RefreshCurrentSource { current } => current.validate(),
         StreamCommand::ReconcilePlan {
             version,
@@ -638,11 +618,9 @@ fn validate_command_sources(command: &StreamCommand) -> Result<()> {
                 ));
             }
             if let Some(current) = current {
-                validate_planned_source(current)?;
                 current.validate()?;
             }
             if let Some(next) = next {
-                validate_planned_source(next)?;
                 validate_next_source(next)?;
             }
             Ok(())
@@ -651,19 +629,9 @@ fn validate_command_sources(command: &StreamCommand) -> Result<()> {
         | StreamCommand::Pause
         | StreamCommand::Stop
         | StreamCommand::Seek { .. }
-        | StreamCommand::SetNext(None)
         | StreamCommand::SetVolume { .. }
         | StreamCommand::SetGain { .. } => Ok(()),
     }
-}
-
-fn validate_planned_source(source: &TrackSource) -> Result<()> {
-    if source.attempt_id.is_none() {
-        return Err(MusicStreamError::InvalidSource(
-            "desired playback plan sources require an attempt id".to_owned(),
-        ));
-    }
-    Ok(())
 }
 
 fn validate_next_source(next: &TrackSource) -> Result<()> {

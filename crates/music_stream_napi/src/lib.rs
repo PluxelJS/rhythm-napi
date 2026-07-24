@@ -71,11 +71,6 @@ impl Streamer {
         let stream_id = options.stream_id;
         StreamRuntime::validate_stream_id(&stream_id).map_err(to_napi_error)?;
         let current = TrackSource::try_from(options.current).map_err(to_napi_error)?;
-        let next = options
-            .next
-            .map(TrackSource::try_from)
-            .transpose()
-            .map_err(to_napi_error)?;
         let transport = RtpTransportConfig::try_from(options.transport).map_err(to_napi_error)?;
         let source = source_config_from_input(options.source).map_err(to_napi_error)?;
         let buffer = media_buffer_config_from_input(options.buffer).map_err(to_napi_error)?;
@@ -112,25 +107,17 @@ impl Streamer {
         }
         config.resources = Arc::clone(&self.resources);
         config.on_event = Some(Arc::new(move |event| events.publish(&callback, event)));
-        let runtime = match StreamRuntime::start(
-            stream_id.clone(),
-            current,
-            next,
-            config,
-            volume,
-            gain,
-        )
-        .await
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                let mut runtimes = self.runtimes.write().await;
-                if matches!(runtimes.get(&stream_id), Some(RuntimeEntry::Starting)) {
-                    runtimes.remove(&stream_id);
+        let runtime =
+            match StreamRuntime::start(stream_id.clone(), current, config, volume, gain).await {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let mut runtimes = self.runtimes.write().await;
+                    if matches!(runtimes.get(&stream_id), Some(RuntimeEntry::Starting)) {
+                        runtimes.remove(&stream_id);
+                    }
+                    return Err(to_napi_error(error));
                 }
-                return Err(to_napi_error(error));
-            }
-        };
+            };
         let snapshot = runtime.snapshot().await;
         let committed = {
             let mut runtimes = self.runtimes.write().await;
@@ -160,11 +147,6 @@ impl Streamer {
         let stream_id = options.stream_id;
         StreamRuntime::validate_stream_id(&stream_id).map_err(to_napi_error)?;
         let current = TrackSource::try_from(options.current).map_err(to_napi_error)?;
-        let next = options
-            .next
-            .map(TrackSource::try_from)
-            .transpose()
-            .map_err(to_napi_error)?;
         let output = external_pull_config_from_input(options.output).map_err(to_napi_error)?;
         let source = source_config_from_input(options.source).map_err(to_napi_error)?;
         let buffer = media_buffer_config_from_input(options.buffer).map_err(to_napi_error)?;
@@ -201,25 +183,17 @@ impl Streamer {
         }
         config.resources = Arc::clone(&self.resources);
         config.on_event = Some(Arc::new(move |event| events.publish(&callback, event)));
-        let runtime = match StreamRuntime::start(
-            stream_id.clone(),
-            current,
-            next,
-            config,
-            volume,
-            gain,
-        )
-        .await
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                let mut runtimes = self.runtimes.write().await;
-                if matches!(runtimes.get(&stream_id), Some(RuntimeEntry::Starting)) {
-                    runtimes.remove(&stream_id);
+        let runtime =
+            match StreamRuntime::start(stream_id.clone(), current, config, volume, gain).await {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let mut runtimes = self.runtimes.write().await;
+                    if matches!(runtimes.get(&stream_id), Some(RuntimeEntry::Starting)) {
+                        runtimes.remove(&stream_id);
+                    }
+                    return Err(to_napi_error(error));
                 }
-                return Err(to_napi_error(error));
-            }
-        };
+            };
         let snapshot = runtime.snapshot().await;
         let committed = {
             let mut runtimes = self.runtimes.write().await;
@@ -350,19 +324,6 @@ impl Streamer {
     }
 
     #[napi]
-    pub async fn set_next(
-        &self,
-        stream_id: String,
-        next: Option<TrackSourceInput>,
-    ) -> Result<StreamStatusOutput> {
-        let next = next
-            .map(TrackSource::try_from)
-            .transpose()
-            .map_err(to_napi_error)?;
-        self.command(&stream_id, StreamCommand::SetNext(next)).await
-    }
-
-    #[napi]
     pub async fn reconcile_plan(
         &self,
         stream_id: String,
@@ -395,22 +356,6 @@ impl Streamer {
             },
         )
         .await
-    }
-
-    #[napi]
-    pub async fn switch_track(
-        &self,
-        stream_id: String,
-        current: TrackSourceInput,
-        next: Option<TrackSourceInput>,
-    ) -> Result<StreamStatusOutput> {
-        let current = TrackSource::try_from(current).map_err(to_napi_error)?;
-        let next = next
-            .map(TrackSource::try_from)
-            .transpose()
-            .map_err(to_napi_error)?;
-        self.command(&stream_id, StreamCommand::SwitchTrack { current, next })
-            .await
     }
 
     #[napi]

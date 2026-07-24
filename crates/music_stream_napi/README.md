@@ -8,9 +8,10 @@ Rust N-API media runtime for decoding file, bounded HTTP, live HTTP, and audio H
 48 kHz stereo Opus frames, and sending paced RTP/RTCP.
 
 Create one long-lived `Streamer` per media process. A `streamId` owns one persistent RTP session;
-seek, switch, and next promotion replace media generations without resetting SSRC, RTP sequence, or
-timestamp. Playlist policy, provider authentication, URL refresh, and gateway negotiation remain in
-the Node host.
+seek, versioned desired-plan replacement, and next promotion replace media generations without
+resetting SSRC, RTP sequence, or timestamp. `reconcilePlan` is the only current/next mutation API;
+stream start accepts only current. Playlist policy, provider authentication, URL refresh, and gateway
+negotiation remain in the Node host.
 
 Bounded HTTP sources can start playback before the response completes. Give signed URLs without an
 extension an accurate `formatHint`. Per-source `headers` support authenticated HTTP media without

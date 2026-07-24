@@ -41,7 +41,7 @@ fn write_wav(path: &Path, seconds: f32) {
 
 fn file_track(id: &str, path: &Path) -> TrackSource {
     TrackSource {
-        attempt_id: None,
+        attempt_id: format!("attempt-{id}"),
         id: id.to_owned(),
         kind: TrackKind::File,
         url: None,
@@ -65,16 +65,30 @@ async fn runtime_for(
     transport.local_ip = "127.0.0.1".to_owned();
     transport.payload_type = 111;
     let config = StreamRuntimeConfig::new(transport, SourceResolverConfig::default());
-    StreamRuntime::start(
+    let mut current = current;
+    current.attempt_id = format!("{stream_id}:current");
+    let current_plan = current.clone();
+    let runtime = StreamRuntime::start(
         stream_id.to_owned(),
         current,
-        next,
         config,
         VolumeLevel::default(),
         Default::default(),
     )
     .await
-    .expect("runtime")
+    .expect("runtime");
+    if let Some(mut next) = next {
+        next.attempt_id = format!("{stream_id}:next");
+        runtime
+            .command(StreamCommand::ReconcilePlan {
+                version: 1,
+                current: Some(current_plan),
+                next: Some(next),
+            })
+            .await
+            .expect("initial desired plan");
+    }
+    runtime
 }
 
 async fn recv_rtp(socket: &UdpSocket) -> Vec<u8> {
@@ -147,9 +161,12 @@ async fn switch_keeps_one_monotonic_rtp_session() {
     .await;
 
     let before = recv_rtp(&receiver).await;
+    let mut switched = file_track("b", second_wav.path());
+    switched.attempt_id = "switch:b".to_owned();
     runtime
-        .command(StreamCommand::SwitchTrack {
-            current: file_track("b", second_wav.path()),
+        .command(StreamCommand::ReconcilePlan {
+            version: 1,
+            current: Some(switched),
             next: None,
         })
         .await
@@ -264,7 +281,7 @@ async fn preloaded_progressive_url_promotes_and_reaches_playing() {
         "url-promotion",
         file_track("a", first_wav.path()),
         Some(TrackSource {
-            attempt_id: None,
+            attempt_id: "attempt-b".to_owned(),
             id: "b".to_owned(),
             kind: TrackKind::Url,
             url: Some(format!("http://{address}/next.wav")),
@@ -328,7 +345,7 @@ async fn stalled_live_decode_never_blocks_rtp_deadlines() {
 
     let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("RTP bind");
     let live = TrackSource {
-        attempt_id: None,
+        attempt_id: "attempt-stalled-live".to_owned(),
         id: "stalled-live".to_owned(),
         kind: TrackKind::Live,
         url: Some(format!("http://{address}/live.wav")),
@@ -374,7 +391,6 @@ async fn non_mux_rtcp_uses_the_dedicated_remote_port() {
     let runtime = StreamRuntime::start(
         "rtcp-non-mux".to_owned(),
         file_track("a", wav.path()),
-        None,
         config,
         VolumeLevel::default(),
         Default::default(),
@@ -413,7 +429,6 @@ async fn transport_bitrate_and_mtu_configure_the_opus_producer() {
     let runtime = StreamRuntime::start(
         "small-mtu".to_owned(),
         file_track("a", wav.path()),
-        None,
         StreamRuntimeConfig::new(transport, SourceResolverConfig::default()),
         VolumeLevel::default(),
         Default::default(),
@@ -539,7 +554,7 @@ async fn pause_during_url_download_excludes_paused_time_from_io_timeout() {
     let runtime = StreamRuntime::start(
         "paused-download".to_owned(),
         TrackSource {
-            attempt_id: None,
+            attempt_id: "attempt-paused-url".to_owned(),
             id: "paused-url".to_owned(),
             kind: TrackKind::Url,
             url: Some(format!("http://{address}/opaque")),
@@ -549,7 +564,6 @@ async fn pause_during_url_download_excludes_paused_time_from_io_timeout() {
             headers: Default::default(),
             network_policy: NetworkPolicy::Provider,
         },
-        None,
         StreamRuntimeConfig::new(transport, source_config),
         VolumeLevel::default(),
         Default::default(),
@@ -625,7 +639,7 @@ async fn progressive_url_sends_rtp_before_http_download_completes() {
     let runtime = StreamRuntime::start(
         "progressive-url".to_owned(),
         TrackSource {
-            attempt_id: None,
+            attempt_id: "attempt-progressive-url".to_owned(),
             id: "progressive-url".to_owned(),
             kind: TrackKind::Url,
             url: Some(format!("http://{address}/opaque")),
@@ -635,7 +649,6 @@ async fn progressive_url_sends_rtp_before_http_download_completes() {
             headers: Default::default(),
             network_policy: NetworkPolicy::Provider,
         },
-        None,
         StreamRuntimeConfig::new(transport, SourceResolverConfig::default()),
         VolumeLevel::default(),
         Default::default(),
@@ -682,18 +695,24 @@ async fn next_url_added_while_paused_starts_no_download_until_resume() {
     .await;
     let _ = recv_rtp(&receiver).await;
     runtime.command(StreamCommand::Pause).await.expect("pause");
+    let mut current = file_track("current", current_wav.path());
+    current.attempt_id = "paused-next:current".to_owned();
     runtime
-        .command(StreamCommand::SetNext(Some(TrackSource {
-            attempt_id: None,
-            id: "next-url".to_owned(),
-            kind: TrackKind::Url,
-            url: Some(format!("http://{address}/next.wav")),
-            path: None,
-            format_hint: None,
-            seekable: Some(true),
-            headers: Default::default(),
-            network_policy: NetworkPolicy::Provider,
-        })))
+        .command(StreamCommand::ReconcilePlan {
+            version: 1,
+            current: Some(current),
+            next: Some(TrackSource {
+                attempt_id: "paused-next:next".to_owned(),
+                id: "next-url".to_owned(),
+                kind: TrackKind::Url,
+                url: Some(format!("http://{address}/next.wav")),
+                path: None,
+                format_hint: None,
+                seekable: Some(true),
+                headers: Default::default(),
+                network_policy: NetworkPolicy::Provider,
+            }),
+        })
         .await
         .expect("set next");
 
@@ -749,9 +768,10 @@ async fn switching_to_url_while_paused_preserves_pause_and_defers_download() {
     runtime.command(StreamCommand::Pause).await.expect("pause");
 
     let switched = runtime
-        .command(StreamCommand::SwitchTrack {
-            current: TrackSource {
-                attempt_id: None,
+        .command(StreamCommand::ReconcilePlan {
+            version: 1,
+            current: Some(TrackSource {
+                attempt_id: "paused-switch:replacement".to_owned(),
                 id: "switched-url".to_owned(),
                 kind: TrackKind::Url,
                 url: Some(format!("http://{address}/switched.wav")),
@@ -760,7 +780,7 @@ async fn switching_to_url_while_paused_preserves_pause_and_defers_download() {
                 seekable: Some(true),
                 headers: Default::default(),
                 network_policy: NetworkPolicy::Provider,
-            },
+            }),
             next: None,
         })
         .await
@@ -820,7 +840,6 @@ async fn event_callback_panic_cannot_skip_runtime_actions() {
     let runtime = StreamRuntime::start(
         "callback-panic".to_owned(),
         file_track("callback", wav.path()),
-        None,
         config,
         VolumeLevel::default(),
         Default::default(),

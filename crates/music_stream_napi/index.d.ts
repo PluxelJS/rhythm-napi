@@ -9,9 +9,7 @@ export declare class Streamer {
   cancelExternalPull(streamId: string): Promise<void>
   getStatus(streamId: string): Promise<StreamStatusOutput>
   getStatuses(streamIds: Array<string>): Promise<Array<StreamStatusBatchItemOutput>>
-  setNext(streamId: string, next?: TrackSourceInput | undefined | null): Promise<StreamStatusOutput>
   reconcilePlan(streamId: string, plan: DesiredPlaybackPlanInput): Promise<StreamStatusOutput>
-  switchTrack(streamId: string, current: TrackSourceInput, next?: TrackSourceInput | undefined | null): Promise<StreamStatusOutput>
   refreshCurrentSource(streamId: string, current: TrackSourceInput): Promise<StreamStatusOutput>
   seekStream(streamId: string, seconds: number): Promise<StreamStatusOutput>
   setVolume(streamId: string, volume: number): Promise<StreamStatusOutput>
@@ -206,7 +204,6 @@ export interface SourceResolverConfigOutput {
 export interface StartExternalStreamInput {
   streamId: string
   current: TrackSourceInput
-  next?: TrackSourceInput
   output?: ExternalPullConfigInput
   source?: SourceResolverConfigInput
   buffer?: MediaBufferConfigInput
@@ -218,7 +215,6 @@ export interface StartExternalStreamInput {
 export interface StartStreamInput {
   streamId: string
   current: TrackSourceInput
-  next?: TrackSourceInput
   transport: RtpTransportConfigInput
   source?: SourceResolverConfigInput
   buffer?: MediaBufferConfigInput
@@ -272,7 +268,7 @@ export interface StreamStatusOutput {
 }
 
 export interface TrackSourceInput {
-  attemptId?: string
+  attemptId: string
   id: string
   kind: 'file' | 'url' | 'live'
   url?: string
@@ -284,7 +280,7 @@ export interface TrackSourceInput {
 }
 
 export interface TrackSourceOutput {
-  attemptId?: string
+  attemptId: string
   id: string
   kind: 'file' | 'url' | 'live'
   formatHint?: string

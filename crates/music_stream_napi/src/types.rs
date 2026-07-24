@@ -18,7 +18,7 @@ pub struct RuntimeResourceLimitsInput {
 #[derive(Debug)]
 #[napi(object)]
 pub struct TrackSourceInput {
-    pub attempt_id: Option<String>,
+    pub attempt_id: String,
     pub id: String,
     #[napi(ts_type = "'file' | 'url' | 'live'")]
     pub kind: String,
@@ -89,7 +89,7 @@ pub struct StreamStatusBatchItemOutput {
 #[derive(Clone, Debug)]
 #[napi(object)]
 pub struct TrackSourceOutput {
-    pub attempt_id: Option<String>,
+    pub attempt_id: String,
     pub id: String,
     #[napi(ts_type = "'file' | 'url' | 'live'")]
     pub kind: String,
@@ -305,7 +305,6 @@ pub struct ExternalPullConfigInput {
 pub struct StartStreamInput {
     pub stream_id: String,
     pub current: TrackSourceInput,
-    pub next: Option<TrackSourceInput>,
     pub transport: RtpTransportConfigInput,
     pub source: Option<SourceResolverConfigInput>,
     pub buffer: Option<MediaBufferConfigInput>,
@@ -319,7 +318,6 @@ pub struct StartStreamInput {
 pub struct StartExternalStreamInput {
     pub stream_id: String,
     pub current: TrackSourceInput,
-    pub next: Option<TrackSourceInput>,
     pub output: Option<ExternalPullConfigInput>,
     pub source: Option<SourceResolverConfigInput>,
     pub buffer: Option<MediaBufferConfigInput>,

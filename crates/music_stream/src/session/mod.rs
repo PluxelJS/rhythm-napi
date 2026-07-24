@@ -16,11 +16,6 @@ pub enum StreamCommand {
     Seek {
         seconds: u64,
     },
-    SetNext(Option<TrackSource>),
-    SwitchTrack {
-        current: TrackSource,
-        next: Option<TrackSource>,
-    },
     RefreshCurrentSource {
         current: TrackSource,
     },
@@ -237,13 +232,9 @@ pub struct StreamActor {
 
 impl StreamActor {
     #[must_use]
-    pub fn new(stream_id: String, current: Option<TrackSource>, next: Option<TrackSource>) -> Self {
+    pub fn new(stream_id: String, current: Option<TrackSource>) -> Self {
         let mut generation = 0;
         let current = current.map(|source| {
-            generation += 1;
-            PlaybackAttempt::new(source, generation)
-        });
-        let next = next.map(|source| {
             generation += 1;
             PlaybackAttempt::new(source, generation)
         });
@@ -251,7 +242,7 @@ impl StreamActor {
         Self {
             stream_id,
             current,
-            next,
+            next: None,
             refreshable_current_key: None,
             play_state: PlayState::Idle,
             generation,
@@ -292,10 +283,6 @@ impl StreamActor {
             StreamCommand::Pause => self.pause(&mut output)?,
             StreamCommand::Stop => self.stop(&mut output),
             StreamCommand::Seek { seconds } => self.seek(seconds, &mut output)?,
-            StreamCommand::SetNext(next) => self.set_next(next, &mut output)?,
-            StreamCommand::SwitchTrack { current, next } => {
-                self.switch_track(current, next, &mut output)?;
-            }
             StreamCommand::RefreshCurrentSource { current } => {
                 self.refresh_current_source(current, &mut output)?;
             }
@@ -572,7 +559,11 @@ impl StreamActor {
         Ok(())
     }
 
-    fn set_next(&mut self, next: Option<TrackSource>, output: &mut ActorEffects) -> Result<()> {
+    fn reconcile_next_attempt(
+        &mut self,
+        next: Option<TrackSource>,
+        output: &mut ActorEffects,
+    ) -> Result<()> {
         if next.as_ref().is_some_and(TrackSource::is_live) {
             return Err(MusicStreamError::Unsupported(
                 "live sources cannot be preloaded as next without a timeshift model".to_owned(),
@@ -608,63 +599,6 @@ impl StreamActor {
                 self.next = Some(slot);
             }
         }
-        Ok(())
-    }
-
-    fn switch_track(
-        &mut self,
-        current: TrackSource,
-        next: Option<TrackSource>,
-        output: &mut ActorEffects,
-    ) -> Result<()> {
-        if next.as_ref().is_some_and(TrackSource::is_live) {
-            return Err(MusicStreamError::Unsupported(
-                "live sources cannot be preloaded as next without a timeshift model".to_owned(),
-            ));
-        }
-        let preserve_pause = self.play_state == PlayState::Paused;
-        let old_current_generation = self.current.take().map(|slot| slot.generation);
-        let old_next_generation = self.next.take().map(|slot| slot.generation);
-
-        self.refreshable_current_key = None;
-        self.generation += 1;
-        let mut current_slot = PlaybackAttempt::new(current.clone(), self.generation);
-        if !preserve_pause {
-            let watchdog_epoch = current_slot.start();
-            output.actions.push(TaskAction::StartCurrent {
-                generation: current_slot.generation,
-                watchdog_epoch,
-                track: current,
-            });
-        } else if let Some(generation) = old_current_generation {
-            output
-                .actions
-                .push(TaskAction::CancelCurrent { generation });
-        }
-        self.current = Some(current_slot);
-
-        if let Some(next_source) = next {
-            self.generation += 1;
-            let mut next_slot = PlaybackAttempt::new(next_source.clone(), self.generation);
-            if !preserve_pause {
-                let watchdog_epoch = next_slot.start();
-                output.actions.push(TaskAction::PrepareNext {
-                    generation: next_slot.generation,
-                    watchdog_epoch,
-                    track: next_source,
-                });
-            }
-            self.next = Some(next_slot);
-        } else if let Some(generation) = old_next_generation {
-            output.actions.push(TaskAction::CancelNext { generation });
-        }
-
-        self.time_played_ms = 0;
-        self.play_state = if preserve_pause {
-            PlayState::Paused
-        } else {
-            PlayState::Buffering
-        };
         Ok(())
     }
 
@@ -759,7 +693,7 @@ impl StreamActor {
             if let Some(active) = self.current.as_mut() {
                 active.source = current;
             }
-            self.set_next(next, output)?;
+            self.reconcile_next_attempt(next, output)?;
             self.plan_version = version;
             return Ok(());
         }
@@ -788,13 +722,65 @@ impl StreamActor {
                 watchdog_epoch,
                 track,
             });
-            self.set_next(next, output)?;
+            self.reconcile_next_attempt(next, output)?;
             self.plan_version = version;
             return Ok(());
         }
 
-        self.switch_track(current, next, output)?;
+        self.replace_current(current, next, output)?;
         self.plan_version = version;
+        Ok(())
+    }
+
+    fn replace_current(
+        &mut self,
+        current: TrackSource,
+        next: Option<TrackSource>,
+        output: &mut ActorEffects,
+    ) -> Result<()> {
+        let preserve_pause = self.play_state == PlayState::Paused;
+        let old_current_generation = self.current.take().map(|attempt| attempt.generation);
+        let old_next_generation = self.next.take().map(|attempt| attempt.generation);
+
+        self.refreshable_current_key = None;
+        self.generation += 1;
+        let mut current_attempt = PlaybackAttempt::new(current.clone(), self.generation);
+        if !preserve_pause {
+            let watchdog_epoch = current_attempt.start();
+            output.actions.push(TaskAction::StartCurrent {
+                generation: current_attempt.generation,
+                watchdog_epoch,
+                track: current,
+            });
+        } else if let Some(generation) = old_current_generation {
+            output
+                .actions
+                .push(TaskAction::CancelCurrent { generation });
+        }
+        self.current = Some(current_attempt);
+
+        if let Some(next_source) = next {
+            self.generation += 1;
+            let mut next_attempt = PlaybackAttempt::new(next_source.clone(), self.generation);
+            if !preserve_pause {
+                let watchdog_epoch = next_attempt.start();
+                output.actions.push(TaskAction::PrepareNext {
+                    generation: next_attempt.generation,
+                    watchdog_epoch,
+                    track: next_source,
+                });
+            }
+            self.next = Some(next_attempt);
+        } else if let Some(generation) = old_next_generation {
+            output.actions.push(TaskAction::CancelNext { generation });
+        }
+
+        self.time_played_ms = 0;
+        self.play_state = if preserve_pause {
+            PlayState::Paused
+        } else {
+            PlayState::Buffering
+        };
         Ok(())
     }
 
@@ -1072,7 +1058,7 @@ mod tests {
 
     fn track(id: &str) -> TrackSource {
         TrackSource {
-            attempt_id: None,
+            attempt_id: format!("attempt-{id}"),
             id: id.to_owned(),
             kind: TrackKind::File,
             url: None,
@@ -1086,7 +1072,7 @@ mod tests {
 
     fn url_track(id: &str) -> TrackSource {
         TrackSource {
-            attempt_id: None,
+            attempt_id: format!("attempt-{id}"),
             id: id.to_owned(),
             kind: TrackKind::Url,
             url: Some(format!("https://example.test/{id}.mp3")),
@@ -1100,7 +1086,7 @@ mod tests {
 
     fn live_track(id: &str, url: &str) -> TrackSource {
         TrackSource {
-            attempt_id: None,
+            attempt_id: format!("attempt-{id}"),
             id: id.to_owned(),
             kind: TrackKind::Live,
             url: Some(url.to_owned()),
@@ -1114,7 +1100,7 @@ mod tests {
 
     fn malformed_seekable_live_track(id: &str, url: &str) -> TrackSource {
         TrackSource {
-            attempt_id: None,
+            attempt_id: format!("attempt-{id}"),
             id: id.to_owned(),
             kind: TrackKind::Live,
             url: Some(url.to_owned()),
@@ -1126,14 +1112,28 @@ mod tests {
         }
     }
 
+    fn actor(
+        stream_id: String,
+        current: Option<TrackSource>,
+        next: Option<TrackSource>,
+    ) -> StreamActor {
+        let mut actor = StreamActor::new(stream_id, current);
+        if let Some(next) = next {
+            actor.generation += 1;
+            actor.next = Some(PlaybackAttempt::new(next, actor.generation));
+        }
+        actor
+    }
+
     #[test]
-    fn switch_track_increments_generation_and_drops_stale_worker_events() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(track("a")), None);
+    fn desired_plan_replacement_increments_generation_and_drops_stale_worker_events() {
+        let mut actor = actor("s1".to_owned(), Some(track("a")), None);
         let old_generation = actor.current_generation();
 
         let output = actor
-            .handle_command(StreamCommand::SwitchTrack {
-                current: track("b"),
+            .handle_command(StreamCommand::ReconcilePlan {
+                version: 1,
+                current: Some(track("b")),
                 next: None,
             })
             .expect("switch should succeed");
@@ -1164,7 +1164,7 @@ mod tests {
 
     #[test]
     fn runtime_action_failure_forces_a_clean_terminal_state() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(track("a")), Some(track("b")));
+        let mut actor = actor("s1".to_owned(), Some(track("a")), Some(track("b")));
         actor.handle_command(StreamCommand::Play).expect("play");
 
         let output = actor
@@ -1185,7 +1185,7 @@ mod tests {
 
     #[test]
     fn next_never_promotes_before_ready() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(track("a")), Some(track("b")));
+        let mut actor = actor("s1".to_owned(), Some(track("a")), Some(track("b")));
         let current_generation = actor.current_generation();
         let output = actor.handle_worker_event(WorkerEvent::CurrentEnded {
             generation: current_generation,
@@ -1198,7 +1198,7 @@ mod tests {
 
     #[test]
     fn pause_during_cross_track_gap_freezes_next_and_survives_promotion() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(track("a")), Some(track("b")));
+        let mut actor = actor("s1".to_owned(), Some(track("a")), Some(track("b")));
         actor.handle_command(StreamCommand::Play).expect("play");
         let current_generation = actor.current_generation();
         let next_generation = actor.next.as_ref().expect("next").generation;
@@ -1240,7 +1240,7 @@ mod tests {
 
     #[test]
     fn resume_during_cross_track_gap_restarts_next_without_requesting_another_track() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(track("a")), Some(track("b")));
+        let mut actor = actor("s1".to_owned(), Some(track("a")), Some(track("b")));
         actor.handle_command(StreamCommand::Play).expect("play");
         let current_generation = actor.current_generation();
         let next_generation = actor.next.as_ref().expect("next").generation;
@@ -1275,7 +1275,7 @@ mod tests {
 
     #[test]
     fn live_track_seek_is_rejected_even_when_input_marks_seekable() {
-        let mut actor = StreamActor::new(
+        let mut actor = actor(
             "s1".to_owned(),
             Some(malformed_seekable_live_track(
                 "live-a",
@@ -1294,7 +1294,7 @@ mod tests {
 
     #[test]
     fn ready_next_promotes_on_current_end() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(track("a")), Some(track("b")));
+        let mut actor = actor("s1".to_owned(), Some(track("a")), Some(track("b")));
         actor.handle_command(StreamCommand::Play).expect("play");
         let current_generation = actor.current_generation();
         let next_generation = actor.next.as_ref().expect("next").generation;
@@ -1316,7 +1316,7 @@ mod tests {
 
     #[test]
     fn next_failure_after_current_end_exits_buffering_and_requests_replacement() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(track("a")), Some(track("b")));
+        let mut actor = actor("s1".to_owned(), Some(track("a")), Some(track("b")));
         actor.handle_command(StreamCommand::Play).expect("play");
         let current_generation = actor.current_generation();
         let next_generation = actor.next.as_ref().expect("next").generation;
@@ -1352,8 +1352,8 @@ mod tests {
     #[test]
     fn next_startup_timeout_exits_buffering_with_exact_attempt_identity() {
         let mut next = track("media-b");
-        next.attempt_id = Some("queue-entry-b".to_owned());
-        let mut actor = StreamActor::new("s1".to_owned(), Some(track("a")), Some(next));
+        next.attempt_id = "queue-entry-b".to_owned();
+        let mut actor = actor("s1".to_owned(), Some(track("a")), Some(next));
         actor.handle_command(StreamCommand::Play).expect("play");
         let current_generation = actor.current_generation();
         let next = actor.next.as_ref().expect("next");
@@ -1400,7 +1400,7 @@ mod tests {
 
     #[test]
     fn paused_and_superseded_startup_deadlines_cannot_fail_a_resumed_attempt() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(track("a")), None);
+        let mut actor = actor("s1".to_owned(), Some(track("a")), None);
         let started = actor.handle_command(StreamCommand::Play).expect("play");
         let generation = actor.current_generation();
         let first_epoch = actor.current.as_ref().expect("current").watchdog_epoch;
@@ -1438,10 +1438,10 @@ mod tests {
     #[test]
     fn desired_plan_is_versioned_and_promotes_the_existing_attempt() {
         let mut current = track("media-a");
-        current.attempt_id = Some("entry-a".to_owned());
+        current.attempt_id = "entry-a".to_owned();
         let mut next = track("media-b");
-        next.attempt_id = Some("entry-b".to_owned());
-        let mut actor = StreamActor::new("s1".to_owned(), Some(current), Some(next.clone()));
+        next.attempt_id = "entry-b".to_owned();
+        let mut actor = actor("s1".to_owned(), Some(current), Some(next.clone()));
         actor.handle_command(StreamCommand::Play).expect("play");
         let next_generation = actor.next.as_ref().expect("next").generation;
 
@@ -1458,7 +1458,7 @@ mod tests {
                 .status
                 .current
                 .as_ref()
-                .and_then(|track| track.attempt_id.as_deref()),
+                .map(|track| track.attempt_id.as_str()),
             Some("entry-b")
         );
         assert_eq!(output.status.generation, next_generation);
@@ -1473,7 +1473,7 @@ mod tests {
                 version: 1,
                 current: Some({
                     let mut stale = track("stale");
-                    stale.attempt_id = Some("stale-entry".to_owned());
+                    stale.attempt_id = "stale-entry".to_owned();
                     stale
                 }),
                 next: None,
@@ -1489,7 +1489,7 @@ mod tests {
 
     #[test]
     fn paused_next_failure_preserves_pause_while_requesting_replacement() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(track("a")), Some(track("b")));
+        let mut actor = actor("s1".to_owned(), Some(track("a")), Some(track("b")));
         actor.handle_command(StreamCommand::Play).expect("play");
         let current_generation = actor.current_generation();
         let next_generation = actor.next.as_ref().expect("next").generation;
@@ -1512,7 +1512,7 @@ mod tests {
 
     #[test]
     fn seek_requires_seekable_current_and_creates_generation() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(track("a")), None);
+        let mut actor = actor("s1".to_owned(), Some(track("a")), None);
         let old_generation = actor.current_generation();
         let output = actor
             .handle_command(StreamCommand::Seek { seconds: 42 })
@@ -1524,7 +1524,7 @@ mod tests {
 
     #[test]
     fn generation_replacements_preserve_explicit_pause() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(track("a")), None);
+        let mut actor = actor("s1".to_owned(), Some(track("a")), None);
         actor.handle_command(StreamCommand::Play).expect("play");
         actor.handle_command(StreamCommand::Pause).expect("pause");
 
@@ -1540,8 +1540,9 @@ mod tests {
         );
 
         let switched = actor
-            .handle_command(StreamCommand::SwitchTrack {
-                current: track("b"),
+            .handle_command(StreamCommand::ReconcilePlan {
+                version: 1,
+                current: Some(track("b")),
                 next: None,
             })
             .expect("switch");
@@ -1574,7 +1575,7 @@ mod tests {
 
     #[test]
     fn bounded_url_tracks_are_seekable_by_default() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(url_track("url-a")), None);
+        let mut actor = actor("s1".to_owned(), Some(url_track("url-a")), None);
         actor.handle_command(StreamCommand::Play).expect("play");
 
         let output = actor
@@ -1590,7 +1591,7 @@ mod tests {
 
     #[test]
     fn live_pause_is_rejected_without_timeshift_storage() {
-        let mut actor = StreamActor::new(
+        let mut actor = actor(
             "s1".to_owned(),
             Some(live_track("live", "https://example.test/live")),
             None,
@@ -1606,10 +1607,14 @@ mod tests {
     #[test]
     fn live_next_is_rejected_without_a_timeshift_model() {
         let live = live_track("live-next", "https://example.test/live");
-        let mut actor = StreamActor::new("s1".to_owned(), Some(track("current")), None);
+        let mut actor = actor("s1".to_owned(), Some(track("current")), None);
         actor.handle_command(StreamCommand::Play).expect("play");
         let error = actor
-            .handle_command(StreamCommand::SetNext(Some(live)))
+            .handle_command(StreamCommand::ReconcilePlan {
+                version: 1,
+                current: Some(track("current")),
+                next: Some(live),
+            })
             .expect_err("live next must be rejected");
         assert_eq!(error.code(), ErrorCode::Unsupported);
         assert!(actor.next.is_none());
@@ -1618,7 +1623,7 @@ mod tests {
     #[test]
     fn playing_with_only_a_pending_next_starts_its_preload() {
         let next = track("next");
-        let mut actor = StreamActor::new("s1".to_owned(), None, Some(next.clone()));
+        let mut actor = actor("s1".to_owned(), None, Some(next.clone()));
         let next_generation = actor.next.as_ref().expect("next").generation;
 
         let output = actor.handle_command(StreamCommand::Play).expect("play");
@@ -1636,7 +1641,7 @@ mod tests {
 
     #[test]
     fn set_volume_updates_status_and_current_slot_without_restarting_tasks() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(track("a")), Some(track("b")));
+        let mut actor = actor("s1".to_owned(), Some(track("a")), Some(track("b")));
         let generation = actor.current_generation();
         let next_generation = actor.next.as_ref().expect("next").generation;
         actor.handle_command(StreamCommand::Play).expect("play");
@@ -1665,7 +1670,7 @@ mod tests {
 
     #[test]
     fn set_volume_before_play_updates_status_without_runtime_action() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(track("a")), None);
+        let mut actor = actor("s1".to_owned(), Some(track("a")), None);
         let volume = VolumeLevel::from_unit(0.25).expect("volume");
 
         let output = actor
@@ -1678,7 +1683,7 @@ mod tests {
 
     #[test]
     fn set_gain_updates_status_and_current_slot_without_restarting_tasks() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(track("a")), None);
+        let mut actor = actor("s1".to_owned(), Some(track("a")), None);
         actor.handle_command(StreamCommand::Play).expect("play");
         let generation = actor.current_generation();
 
@@ -1700,7 +1705,7 @@ mod tests {
 
     #[test]
     fn prebuffer_ready_while_paused_is_remembered_for_resume() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(track("a")), None);
+        let mut actor = actor("s1".to_owned(), Some(track("a")), None);
         let generation = actor.current_generation();
         actor.handle_command(StreamCommand::Play).expect("play");
         let paused = actor.handle_command(StreamCommand::Pause).expect("pause");
@@ -1730,7 +1735,7 @@ mod tests {
 
     #[test]
     fn current_network_quality_change_is_generation_filtered() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(track("a")), None);
+        let mut actor = actor("s1".to_owned(), Some(track("a")), None);
         let generation = actor.current_generation();
 
         let stale = actor.handle_worker_event(WorkerEvent::CurrentNetworkQualityChanged {
@@ -1775,7 +1780,7 @@ mod tests {
 
     #[test]
     fn current_auth_expiry_requests_source_refresh_with_stable_error_code() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(url_track("current")), None);
+        let mut actor = actor("s1".to_owned(), Some(url_track("current")), None);
         let generation = actor.current_generation();
 
         let output = actor.handle_worker_event(WorkerEvent::CurrentFailed {
@@ -1821,7 +1826,7 @@ mod tests {
 
     #[test]
     fn current_source_failure_without_next_reports_error_and_next_needed() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(url_track("current")), None);
+        let mut actor = actor("s1".to_owned(), Some(url_track("current")), None);
         let generation = actor.current_generation();
 
         let output = actor.handle_worker_event(WorkerEvent::CurrentFailed {
@@ -1852,7 +1857,7 @@ mod tests {
 
     #[test]
     fn refresh_current_source_rejects_track_id_change_after_current_was_cleared() {
-        let mut actor = StreamActor::new("s1".to_owned(), Some(url_track("current")), None);
+        let mut actor = actor("s1".to_owned(), Some(url_track("current")), None);
         let generation = actor.current_generation();
         actor.handle_worker_event(WorkerEvent::CurrentFailed {
             generation,
@@ -1872,7 +1877,7 @@ mod tests {
 
     #[test]
     fn refresh_current_source_requires_active_or_recent_current_identity() {
-        let mut actor = StreamActor::new("s1".to_owned(), None, None);
+        let mut actor = actor("s1".to_owned(), None, None);
 
         let error = actor
             .handle_command(StreamCommand::RefreshCurrentSource {
@@ -1886,7 +1891,7 @@ mod tests {
 
     #[test]
     fn next_auth_expiry_requests_source_refresh_for_next_track() {
-        let mut actor = StreamActor::new(
+        let mut actor = actor(
             "s1".to_owned(),
             Some(track("current")),
             Some(url_track("next")),
@@ -1914,7 +1919,7 @@ mod tests {
 
     #[test]
     fn refresh_current_source_restarts_idle_stream_and_preserves_next() {
-        let mut actor = StreamActor::new(
+        let mut actor = actor(
             "s1".to_owned(),
             Some(live_track("current", "https://old.example.test/live.wav")),
             Some(track("next")),
@@ -1946,7 +1951,7 @@ mod tests {
 
     #[test]
     fn refresh_current_source_can_restart_same_track_after_current_end() {
-        let mut actor = StreamActor::new(
+        let mut actor = actor(
             "s1".to_owned(),
             Some(live_track("current", "https://old.example.test/live.wav")),
             None,
@@ -1975,7 +1980,7 @@ mod tests {
 
     #[test]
     fn refresh_current_source_rejects_track_id_change_while_current_is_active() {
-        let mut actor = StreamActor::new(
+        let mut actor = actor(
             "s1".to_owned(),
             Some(live_track("current", "https://old.example.test/live.wav")),
             None,
