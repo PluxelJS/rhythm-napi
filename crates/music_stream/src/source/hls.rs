@@ -1480,9 +1480,8 @@ mod tests {
         };
 
         for url in [
-            "http://example.com/segment.ts",
+            "http://127.0.0.1:8000/segment.ts",
             "https://127.0.0.1/segment.ts",
-            "https://example.com:8443/key.bin",
             "file:///etc/passwd",
         ] {
             let error = http

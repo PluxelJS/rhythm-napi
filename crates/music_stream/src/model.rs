@@ -173,14 +173,9 @@ pub(crate) fn validate_network_url(
     if *policy == NetworkPolicy::Provider {
         return Ok(());
     }
-    if url.scheme() != "https"
-        || url.username() != ""
-        || url.password().is_some()
-        || url.port().is_some()
-    {
+    if url.username() != "" || url.password().is_some() {
         return Err(crate::MusicStreamError::InvalidSource(
-            "public-only sources require an HTTPS URL on the default port without credentials"
-                .to_owned(),
+            "public-only sources cannot contain URL credentials".to_owned(),
         ));
     }
     if let Some(host) = url.host_str()
@@ -488,19 +483,28 @@ mod tests {
     }
 
     #[test]
-    fn public_only_sources_reject_non_https_and_non_global_literal_addresses() {
+    fn public_only_sources_accept_radio_ports_and_reject_non_global_literal_addresses() {
         let mut public = source(TrackKind::Live, Some(false));
         public.network_policy = NetworkPolicy::PublicOnly;
         public.url = Some("https://1.1.1.1/live".to_owned());
         assert!(public.validate().is_ok());
 
+        public.url = Some("http://1.1.1.1/live".to_owned());
+        assert!(public.validate().is_ok());
+
+        public.url = Some("http://1.1.1.1:8000/live".to_owned());
+        assert!(public.validate().is_ok());
+
+        public.url = Some("https://example.com:8443/live".to_owned());
+        assert!(public.validate().is_ok());
+
         for url in [
-            "http://example.com/live",
             "https://127.0.0.1/live",
+            "http://10.0.0.1:8000/live",
             "https://10.0.0.1/live",
             "https://169.254.169.254/latest/meta-data",
             "https://[::1]/live",
-            "https://example.com:8443/live",
+            "ftp://example.com/live",
         ] {
             public.url = Some(url.to_owned());
             assert!(

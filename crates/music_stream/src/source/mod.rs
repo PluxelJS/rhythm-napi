@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
@@ -16,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::control::PauseGate;
 use crate::error::{MusicStreamError, Result};
-use crate::model::{NetworkPolicy, TrackKind, TrackSource, is_public_ip};
+use crate::model::{NetworkPolicy, TrackKind, TrackSource, is_public_ip, validate_network_url};
 
 mod hls;
 mod live;
@@ -1205,7 +1204,9 @@ fn public_http_client() -> reqwest::Client {
                 .redirect(reqwest::redirect::Policy::custom(|attempt| {
                     if attempt.previous().len() >= 10 {
                         attempt.error("too many public media redirects")
-                    } else if is_public_https_url(attempt.url()) {
+                    } else if validate_network_url(&NetworkPolicy::PublicOnly, attempt.url())
+                        .is_ok()
+                    {
                         attempt.follow()
                     } else {
                         attempt.error("public media redirect target is not allowed")
@@ -1242,23 +1243,6 @@ fn boxed_dns_error(
     error: impl std::error::Error + Send + Sync + 'static,
 ) -> Box<dyn std::error::Error + Send + Sync> {
     Box::new(error)
-}
-
-fn is_public_https_url(url: &reqwest::Url) -> bool {
-    if url.scheme() != "https"
-        || url.username() != ""
-        || url.password().is_some()
-        || url.port().is_some()
-    {
-        return false;
-    }
-    match url
-        .host_str()
-        .and_then(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().ok())
-    {
-        Some(address) => is_public_ip(address),
-        None => url.host_str().is_some(),
-    }
 }
 
 pub async fn resolve_local_file(source: &TrackSource) -> Result<SourceArtifact> {
@@ -1817,22 +1801,6 @@ mod tests {
         let name = "localhost".parse::<reqwest::dns::Name>().expect("DNS name");
         let result = reqwest::dns::Resolve::resolve(&PublicDnsResolver, name).await;
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn public_redirect_policy_accepts_only_default_port_https_targets() {
-        assert!(is_public_https_url(
-            &reqwest::Url::parse("https://media.example/live").expect("public URL")
-        ));
-        for value in [
-            "http://media.example/live",
-            "https://127.0.0.1/live",
-            "https://media.example:8443/live",
-        ] {
-            assert!(!is_public_https_url(
-                &reqwest::Url::parse(value).expect("test URL")
-            ));
-        }
     }
 
     #[test]

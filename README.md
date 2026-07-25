@@ -32,7 +32,7 @@ file / URL / live / HLS ───> decode → resample → DSP → Opus ──�
   artifact。faststart M4A/MP4在有界布局检测确认 `moov` 位于 `mdat` 之前，才发布 reader；无扩展名
   签名 URL可通过显式 `formatHint`进入渐进路径。相同内容身份的并发请求共享一次传输；需要鉴权的
   provider 来源可携带受限的每源 HTTP headers，不会投影到状态；用户直链的 `public-only` 策略禁止
-  自定义 header，并对 HLS 的每个派生请求重复执行 HTTPS、公网 DNS、redirect 和端口约束。
+  自定义 header，并对 HLS 的每个派生请求重复执行 HTTP(S)、公网 DNS 和 redirect 约束。
 - current 在 CPU、blocking worker、HTTP 和 tempfile admission 上优先于 next；live/HLS 只能
   作为 current，所有连接与媒体资源都有明确上限。
 - pause、cancel、错误、generation 替换和 shutdown 都必须唤醒等待者并确定性收敛资源。

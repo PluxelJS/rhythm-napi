@@ -133,7 +133,7 @@ header，再把 permit 连同 ADTS AAC 或 MPEG audio 字节移交给 live bridg
 
 HLS 的 master variant、media playlist、init map、segment 和 AES key 都是独立网络请求。provider
 策略把它们视为受信 provider 的同一媒体图，可传播 provider header；`public-only` 用于用户直链，
-禁止自定义 header，并在每次派生请求前重新验证默认端口 HTTPS 与公网目标。不能只验证入口 playlist，
+禁止自定义 header，并在每次派生请求前重新验证 HTTP(S) 与公网目标。不能只验证入口 playlist，
 否则绝对子资源 URL 会绕过直链策略。
 
 fMP4/CMAF 先获取一次有界 `EXT-X-MAP`，校验 `ftyp`/`moov` 后与 `moof`/`mdat` fragment 原样串入

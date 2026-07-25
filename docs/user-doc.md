@@ -121,7 +121,7 @@ header 只用于服务端请求，不会出现在 status/event；最多 16 项�
 Content-Length、Connection 等 transport framing 字段。不要把 header 或签名 URL 写进 `id`。
 这些 header 属于受信 provider 能力，HLS 获取会把它们用于 variant、segment、init map 和 key请求；
 provider 必须只返回自己信任的媒体图。`networkPolicy: 'public-only'` 面向用户直链，禁止自定义 header，
-且入口及所有 HLS 派生 URL 都必须是默认端口 HTTPS 并解析到公网地址。
+且入口及所有 HLS 派生 URL 都必须使用 HTTP(S) 并解析到公网地址；电台常用的自定义端口受支持。
 
 ## 建立一条 stream
 
