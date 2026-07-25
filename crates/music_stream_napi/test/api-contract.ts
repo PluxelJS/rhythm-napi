@@ -1,5 +1,6 @@
 import type {
 	ReplayGainInput,
+	RuntimeResourceDiagnosticsOutput,
 	StreamEventOutput,
 	StreamStatusBatchItemOutput,
 	StreamStatusOutput,
@@ -18,6 +19,9 @@ type _AttemptIdentityContract = Assert<Equal<TrackSourceInput['attemptId'], stri
 type _AttemptOutputIdentityContract = Assert<Equal<TrackSourceOutput['attemptId'], string>>
 type _PlayStateContract = Assert<
 	Equal<StreamStatusOutput['playState'], 'idle' | 'buffering' | 'playing' | 'paused' | 'stopped'>
+>
+type _ResourceDiagnosticsContract = Assert<
+	Equal<RuntimeResourceDiagnosticsOutput['tempfilePreloadUnitsAvailable'], number>
 >
 type _PlayoutDiagnosticsContract = Assert<
 	Equal<

@@ -4,8 +4,8 @@ use music_stream::{
     ExternalFrameAck, ExternalFrameOutcome, GainLevel, HttpLiveStreamConfig, HttpSourceConfig,
     MediaBufferConfig, MusicStreamError, ReplayGainConfig, ReplayGainMetadata, ReplayGainMode,
     ReplayGainRecommendation, ReplayGainSource, RtcpReceiverReportSnapshot, RtpEncryptionConfig,
-    RtpTransportConfig, RuntimeResourceLimits, SourceResolverConfig, StreamRuntimeProgress,
-    TrackSource,
+    RtpTransportConfig, RuntimeResourceLimits, RuntimeResourceSnapshot, SourceResolverConfig,
+    StreamRuntimeProgress, TrackSource,
 };
 
 use crate::types::*;
@@ -163,6 +163,49 @@ impl StreamStatusOutput {
 
 fn saturating_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+impl From<RuntimeResourceSnapshot> for RuntimeResourceDiagnosticsOutput {
+    fn from(value: RuntimeResourceSnapshot) -> Self {
+        Self {
+            streams_available: value.streams_available.try_into().unwrap_or(i64::MAX),
+            http_downloads_available: value
+                .http_downloads_available
+                .try_into()
+                .unwrap_or(i64::MAX),
+            http_preloads_available: value.http_preloads_available.try_into().unwrap_or(i64::MAX),
+            live_streams_available: value.live_streams_available.try_into().unwrap_or(i64::MAX),
+            live_bytes_available: value.live_bytes_available.try_into().unwrap_or(i64::MAX),
+            tempfile_quota_units_available: value
+                .tempfile_quota_units_available
+                .try_into()
+                .unwrap_or(i64::MAX),
+            tempfile_preload_units_available: value
+                .tempfile_preload_units_available
+                .try_into()
+                .unwrap_or(i64::MAX),
+            blocking_producers_available: value
+                .blocking_producers_available
+                .try_into()
+                .unwrap_or(i64::MAX),
+            blocking_preloads_available: value
+                .blocking_preloads_available
+                .try_into()
+                .unwrap_or(i64::MAX),
+            cpu_active: value.cpu_active.try_into().unwrap_or(i64::MAX),
+            cpu_current_waiters: value.cpu_current_waiters.try_into().unwrap_or(i64::MAX),
+            artifact_cache_entries: value.artifact_cache_entries.try_into().unwrap_or(i64::MAX),
+            artifact_cache_retained_quota_bytes: value
+                .artifact_cache_retained_quota_bytes
+                .try_into()
+                .unwrap_or(i64::MAX),
+            download_registry_entries: value
+                .download_registry_entries
+                .try_into()
+                .unwrap_or(i64::MAX),
+            live_download_flights: value.live_download_flights.try_into().unwrap_or(i64::MAX),
+        }
+    }
 }
 
 pub(crate) fn default_napi_source_config() -> SourceResolverConfig {

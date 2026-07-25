@@ -50,6 +50,10 @@ impl LiveByteBudget {
         self.capacity
     }
 
+    pub(crate) fn available_bytes(&self) -> usize {
+        self.semaphore.available_permits()
+    }
+
     pub(super) async fn acquire(&self, bytes: usize) -> Result<OwnedSemaphorePermit> {
         let permits = u32::try_from(bytes).map_err(|_| {
             MusicStreamError::InvalidSource("live HTTP chunk is too large".to_owned())

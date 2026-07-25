@@ -110,6 +110,27 @@ pub struct RuntimeResources {
     blocking_preloads: Arc<Semaphore>,
 }
 
+/// On-demand resource accounting for diagnosing admission stalls. Reading this snapshot does not
+/// touch sender/producer hot loops and does not reveal source URLs or headers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeResourceSnapshot {
+    pub streams_available: usize,
+    pub http_downloads_available: usize,
+    pub http_preloads_available: usize,
+    pub live_streams_available: usize,
+    pub live_bytes_available: usize,
+    pub tempfile_quota_units_available: usize,
+    pub tempfile_preload_units_available: usize,
+    pub blocking_producers_available: usize,
+    pub blocking_preloads_available: usize,
+    pub cpu_active: usize,
+    pub cpu_current_waiters: usize,
+    pub artifact_cache_entries: usize,
+    pub artifact_cache_retained_quota_bytes: u64,
+    pub download_registry_entries: usize,
+    pub live_download_flights: usize,
+}
+
 impl Default for RuntimeResources {
     fn default() -> Self {
         Self::new(RuntimeResourceLimits::default())
@@ -180,6 +201,34 @@ impl RuntimeResources {
 
     pub async fn flush_source_cleanup(&self) -> Result<()> {
         flush_temp_cleanup().await
+    }
+
+    pub fn snapshot(&self) -> Result<RuntimeResourceSnapshot> {
+        let (artifact_cache_entries, artifact_cache_retained_quota_bytes) = self
+            .source_cache
+            .lock()
+            .map_err(|_| MusicStreamError::Internal("source cache poisoned".to_owned()))?
+            .diagnostics();
+        let (download_registry_entries, live_download_flights) =
+            self.source_downloads.diagnostics()?;
+        let (cpu_active, cpu_current_waiters) = self.cpu_scheduler.diagnostics();
+        Ok(RuntimeResourceSnapshot {
+            streams_available: self.streams.available_permits(),
+            http_downloads_available: self.http_downloads.available_permits(),
+            http_preloads_available: self.http_preloads.available_permits(),
+            live_streams_available: self.live_streams.available_permits(),
+            live_bytes_available: self.live_byte_budget.available_bytes(),
+            tempfile_quota_units_available: self.tempfile_budget.available_permits(),
+            tempfile_preload_units_available: self.tempfile_preloads.available_permits(),
+            blocking_producers_available: self.blocking_producers.available_permits(),
+            blocking_preloads_available: self.blocking_preloads.available_permits(),
+            cpu_active,
+            cpu_current_waiters,
+            artifact_cache_entries,
+            artifact_cache_retained_quota_bytes,
+            download_registry_entries,
+            live_download_flights,
+        })
     }
 }
 

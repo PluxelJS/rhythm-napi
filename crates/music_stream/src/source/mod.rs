@@ -158,6 +158,10 @@ impl SourceArtifactCache {
             entries: std::mem::replace(&mut self.entries, LruCache::unbounded()),
         }
     }
+
+    pub(crate) fn diagnostics(&self) -> (usize, u64) {
+        (self.entries.len(), self.retained_quota_bytes)
+    }
 }
 
 fn artifact_tempfile_quota_bytes(bytes: u64) -> u64 {
@@ -181,6 +185,17 @@ impl SourceDownloadRegistry {
         {
             flights.retain(|_, flight| flight.strong_count() > 0);
         }
+    }
+
+    pub(crate) fn diagnostics(&self) -> Result<(usize, usize)> {
+        let flights = self.flights.lock().map_err(|_| {
+            MusicStreamError::Internal("source download registry poisoned".to_owned())
+        })?;
+        let live = flights
+            .values()
+            .filter(|flight| flight.strong_count() > 0)
+            .count();
+        Ok((flights.len(), live))
     }
 }
 
@@ -466,33 +481,37 @@ pub(crate) struct ProgressiveUrlSource {
 #[derive(Debug)]
 struct TempArtifactCleanup {
     path: Option<tempfile::TempPath>,
-    quota: Mutex<Option<TempfileQuota>>,
+    quota: Mutex<Option<TempfileReservation>>,
 }
 
 impl TempArtifactCleanup {
     fn new(path: tempfile::TempPath, quota: TempfileQuota) -> Self {
         Self {
             path: Some(path),
-            quota: Mutex::new(Some(quota)),
+            quota: Mutex::new(Some(TempfileReservation::InFlight(quota))),
         }
     }
 
     fn shrink_quota_to(&self, bytes: u64) {
-        let retained = tempfile_quota_units(bytes);
         let mut quota = self.quota.lock().expect("tempfile quota lock poisoned");
-        let Some(permit) = quota.as_mut() else {
+        let Some(reservation) = quota.as_mut() else {
             return;
         };
-        let excess = permit
-            .global
-            .num_permits()
-            .saturating_sub(retained as usize);
-        if excess > 0 {
-            drop(permit.global.split(excess));
-            if let Some(preload) = permit.preload.as_mut() {
-                drop(preload.split(excess.min(preload.num_permits())));
-            }
-        }
+        reservation.shrink_to(bytes);
+    }
+
+    /// Finalizes a successfully downloaded artifact.
+    ///
+    /// The global permit follows the file until asynchronous deletion, but the preload-only
+    /// permit bounds in-flight speculative transfer work and must never enter the artifact cache.
+    /// Keeping even one preload quota unit in a completed cache entry can block the next source,
+    /// because a new transfer reserves its full worst-case size before response headers arrive.
+    fn complete(&self, bytes: u64) {
+        let mut quota = self.quota.lock().expect("tempfile quota lock poisoned");
+        let Some(reservation) = quota.take() else {
+            return;
+        };
+        *quota = Some(reservation.complete(bytes));
     }
 }
 
@@ -513,7 +532,7 @@ impl Drop for TempArtifactCleanup {
 #[derive(Debug)]
 struct TempCleanupJob {
     path: tempfile::TempPath,
-    _quota: Option<TempfileQuota>,
+    _quota: Option<TempfileReservation>,
 }
 
 enum TempCleanupCommand {
@@ -551,7 +570,7 @@ fn temp_cleanup_sender() -> Option<&'static mpsc::Sender<TempCleanupCommand>> {
         .as_ref()
 }
 
-fn enqueue_temp_cleanup(path: tempfile::TempPath, quota: Option<TempfileQuota>) {
+fn enqueue_temp_cleanup(path: tempfile::TempPath, quota: Option<TempfileReservation>) {
     let job = TempCleanupJob {
         path,
         _quota: quota,
@@ -1278,6 +1297,69 @@ struct TempfileQuota {
     preload: Option<PromotablePreloadPermit>,
 }
 
+#[derive(Debug)]
+enum TempfileReservation {
+    /// The response is still open. Global quota follows the physical tempfile and preload quota
+    /// follows speculative transfer priority.
+    InFlight(TempfileQuota),
+    /// The response completed successfully. A retained artifact/cache entry owns only global
+    /// physical storage quota; role-specific preload admission has already been returned.
+    Retained { global: OwnedSemaphorePermit },
+}
+
+impl TempfileQuota {
+    fn shrink_to(&mut self, bytes: u64) {
+        let retained = tempfile_quota_units(bytes) as usize;
+        let excess = self.global.num_permits().saturating_sub(retained);
+        if excess == 0 {
+            return;
+        }
+        drop(self.global.split(excess));
+        if let Some(preload) = self.preload.as_mut() {
+            drop(preload.split(excess.min(preload.num_permits())));
+        }
+    }
+}
+
+impl TempfileReservation {
+    fn shrink_to(&mut self, bytes: u64) {
+        let retained = tempfile_quota_units(bytes) as usize;
+        match self {
+            Self::InFlight(quota) => quota.shrink_to(bytes),
+            Self::Retained { global } => {
+                let excess = global.num_permits().saturating_sub(retained);
+                if excess > 0 {
+                    drop(global.split(excess));
+                }
+            }
+        }
+    }
+
+    fn complete(self, bytes: u64) -> Self {
+        match self {
+            Self::InFlight(mut quota) => {
+                quota.shrink_to(bytes);
+                let released_preload_units = quota
+                    .preload
+                    .as_ref()
+                    .map_or(0, PromotablePreloadPermit::num_permits);
+                drop(quota.preload.take());
+                if released_preload_units > 0 {
+                    metrics::counter!(
+                        "music_stream.source.tempfile_preload_units_released",
+                        "reason" => "transfer_complete"
+                    )
+                    .increment(released_preload_units as u64);
+                }
+                Self::Retained {
+                    global: quota.global,
+                }
+            }
+            retained @ Self::Retained { .. } => retained,
+        }
+    }
+}
+
 enum ArtifactFileWriter {
     File(tokio::fs::File),
     Growing(GrowingSpoolWriter),
@@ -1652,7 +1734,7 @@ async fn download_http_artifact_once(
             "HTTP source is empty".to_owned(),
         )));
     }
-    cleanup.shrink_quota_to(length);
+    cleanup.complete(length);
     Ok(SourceArtifact {
         stable_key: source.stable_key().to_owned(),
         path,
@@ -2231,6 +2313,38 @@ mod tests {
         drop(cleanup);
         flush_temp_cleanup().await.expect("cleanup");
         assert_eq!(budget.available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn completed_artifact_keeps_global_quota_but_releases_preload_quota() {
+        let global = Arc::new(Semaphore::new(1));
+        let preloads = Arc::new(Semaphore::new(1));
+        let global_permit = Arc::clone(&global)
+            .acquire_owned()
+            .await
+            .expect("global quota");
+        let preload_permit = Arc::clone(&preloads)
+            .acquire_owned()
+            .await
+            .expect("preload quota");
+        let (_priority_tx, priority) = watch::channel(false);
+        let quota = TempfileQuota {
+            global: global_permit,
+            preload: PromotablePreloadPermit::new(preload_permit, priority),
+        };
+        let named = tempfile::NamedTempFile::new().expect("tempfile");
+        let (_file, path) = named.into_parts();
+        let cleanup = TempArtifactCleanup::new(path, quota);
+
+        assert_eq!(global.available_permits(), 0);
+        assert_eq!(preloads.available_permits(), 0);
+        cleanup.complete(1);
+        assert_eq!(global.available_permits(), 0);
+        assert_eq!(preloads.available_permits(), 1);
+
+        drop(cleanup);
+        flush_temp_cleanup().await.expect("cleanup");
+        assert_eq!(global.available_permits(), 1);
     }
 
     #[tokio::test]

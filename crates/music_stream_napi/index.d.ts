@@ -3,6 +3,7 @@
 export declare class Streamer {
   constructor(options?: RuntimeResourceLimitsInput | undefined | null)
   startStream(options: StartStreamInput): Promise<StreamStatusOutput>
+  getResourceDiagnostics(): RuntimeResourceDiagnosticsOutput
   startExternalStream(options: StartExternalStreamInput): Promise<StreamStatusOutput>
   pullExternalFrame(streamId: string, previous?: ExternalOpusFrameAckInput | undefined | null): Promise<ExternalOpusFrameOutput | null>
   finishExternalFrame(streamId: string, ack: ExternalOpusFrameAckInput): Promise<void>
@@ -172,6 +173,28 @@ export interface RtpTransportConfigOutput {
   rtcpMux: boolean
   rtpKeepaliveIntervalMs?: number
   encryptionMode: string
+}
+
+/**
+ * Cheap on-demand accounting snapshot. All `available` fields use the same permit units as
+ * admission; tempfile quota units are 1 MiB each.
+ */
+export interface RuntimeResourceDiagnosticsOutput {
+  streamsAvailable: number
+  httpDownloadsAvailable: number
+  httpPreloadsAvailable: number
+  liveStreamsAvailable: number
+  liveBytesAvailable: number
+  tempfileQuotaUnitsAvailable: number
+  tempfilePreloadUnitsAvailable: number
+  blockingProducersAvailable: number
+  blockingPreloadsAvailable: number
+  cpuActive: number
+  cpuCurrentWaiters: number
+  artifactCacheEntries: number
+  artifactCacheRetainedQuotaBytes: number
+  downloadRegistryEntries: number
+  liveDownloadFlights: number
 }
 
 export interface RuntimeResourceLimitsInput {

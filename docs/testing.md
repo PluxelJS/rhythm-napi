@@ -59,6 +59,8 @@ npm test
 - HTTP retry 使用全新 artifact，partial body 不拼接；
 - live open/idle timeout、chunk split 和全局 byte budget；
 - tempfile 删除完成后才释放 quota，shutdown barrier 等待真实清理。
+- extensionless、无 `formatHint` 的 complete-artifact preload 在进入 cache 前释放角色 quota；最小子额度下
+  连续 `A → B → C → D`，每次 playing 后 `getResourceDiagnostics` 必须回到 preload 基线。
 
 涉及 race 的短测试应在本地或 CI 中重复运行，尤其是 source terminal、pause/cancel 和 task panic
 路径。重复通过不能证明没有 race，但能暴露依赖不安全轮询或错误事件顺序的实现。
@@ -182,3 +184,7 @@ decoder冷启动和promotion频率；allocator稳定性至少需要30至120分�
 代码库内测试保护语义，部署前还需要真实 corpus、规模和故障注入：多格式/VBR/损坏媒体、慢
 DNS/TLS、无 Content-Length、磁盘满、UDP stall、多路 current/preload 竞争和多小时 soak。结果应
 用于设置资源默认值，而不是在单元测试中硬编码某台机器的容量结论。
+
+provider 生产形态必须纳入 corpus：有/无 URL 扩展名、有/无显式 `formatHint`、可信/缺失
+`Content-Length`、redirect 后格式变化和 MP4 faststart fallback。显式 `wav` hint 的 localhost 测试不能代替
+signed extensionless URL，因为两者走不同的 source/ownership 路径。

@@ -60,6 +60,19 @@ body 写入使用 Tokio file。每次成功写入后，spool 更新 `available_b
 writer 未正常 finish 就 drop 会把 spool 标记为失败。partial spool 由 cleanup owner 删除，永远不会
 进入 artifact cache。
 
+`TempArtifactCleanup` 内部不是一个含糊的 permit bag，而是显式 reservation 状态：
+
+```text
+InFlight(TempfileQuota { global, preload })
+  → complete(actual_bytes)
+Retained { global }
+```
+
+`complete` 只在 response EOF、writer finish 和非空检查全部成功后调用；它再次按实际长度收缩 global，
+幂等撤销剩余 preload permit，再允许 artifact 进入 cache。失败路径保持 `InFlight` 并随 partial file 删除释放
+全部额度。promotion watcher 可以在下载期间先释放 preload；与 `complete` 并发时两者通过同一个 permit owner
+最多归还一次。retained variant 的类型形状不包含 preload 字段，后续 cache/cleanup 代码无法重新取得角色额度。
+
 M4A/MP4 是条件渐进候选：下载路径用 O(1) 额外内存顺序扫描顶层 BMFF box，只有在前 4 MiB 内确认
 完整 `ftyp` 和位于首个 `mdat` 前的完整 `moov` 后才发布同一个 growing spool。`mdat` 在前、box
 损坏、metadata超限或布局仍不明确时不发布 reader，subscriber在下载完成后直接得到 seekable
@@ -82,6 +95,10 @@ current 使传输永久提升为 current admission；最后一个 subscriber 离
 
 artifact resolver 和 progressive reader 都订阅同一 flight。完成后先形成只读 artifact，再尝试
 放入 LRU；cache 拒绝并不改变当前 subscriber 使用完整 artifact 的能力。
+
+subscription/current-priority 负责“尚未完成 transfer”的 promotion；transfer 成功出口负责“完整 artifact”
+的终态转换。不能只依赖 subscription control，因为无 `formatHint`/URL 后缀的 artifact resolver 不把
+progressive subscription 暴露给 producer。
 
 ### HTTP retry
 
@@ -245,6 +262,11 @@ N-API 宿主不需要安装 Rust recorder才能做容量巡检：查询 status �
 `playoutDiagnostics`，包含最新 encoded queue深度和 persistent sender累计的 packet/byte、underrun、
 lateness recovery、drop、max lateness及RTP clock。状态事件来自actor提交点，可能不带这份sender
 快照；监控应使用`getStatus`/`getStatuses`，按相邻样本差值计算区间事件率。
+
+`getResourceDiagnostics` 是另一条按需控制面快照：报告 stream、HTTP、tempfile、blocking、live byte 的
+available permits，CPU active/current waiters，以及 artifact cache 和 shared-flight registry 计数。它只在
+显式调用时取得短锁，禁止由 sender 或每帧 producer 自动调用。`tempfile_preload_units_released{reason="transfer_complete"}`
+记录完整传输终态转换实际归还的 unit 数。
 
 优化结论必须同时看首包、实时 deadline、资源等待和 event-loop delay，不能只看离线吞吐。
 

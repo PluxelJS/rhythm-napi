@@ -156,6 +156,15 @@ tempfile worst-case quota
 artifact cache 最多保留一半 tempfile 预算，并按与 semaphore 相同的 1 MiB quota unit 计算占用；
 不能按裸文件字节淘汰，否则许多小文件会让 cache 看似未满、实际却耗尽全部 tempfile permit。
 
+tempfile 的 global 与 preload reservation 不能共享终态。下载进行中可以同时持有两者；响应完成后，
+source 成功出口同步归还 preload permit，只有 global permit 随完整 artifact、cache 引用和异步删除继续存活。
+这条规则不依赖 progressive reader 或 promotion control 是否存在，因此无扩展名 URL、MP4 artifact fallback
+和普通 growing spool 使用相同的 terminal accounting。
+
+Node 可按需调用 `getResourceDiagnostics()` 读取各 semaphore available permits、cache retained quota、flight
+和 CPU waiter 快照。该方法不进入逐帧热循环，也不回显 URL/header；最小额度回归用它断言每次 promotion 后
+tempfile/blocking/HTTP preload 子额回到基线。
+
 ## 背压
 
 背压沿着真实数据路径传播：

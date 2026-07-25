@@ -88,6 +88,11 @@ impl CpuScheduler {
             state = next;
         }
     }
+
+    pub(super) fn diagnostics(&self) -> (usize, usize) {
+        let state = self.state.lock().expect("CPU scheduler lock poisoned");
+        (state.active, state.current_waiters)
+    }
 }
 
 #[derive(Debug)]

@@ -129,6 +129,10 @@ shared flight。传输策略不同时必须隔离，避免一个 stream 绕过�
 pause/cancel 状态；完整响应才提升为 cache artifact，partial 文件永远不进入 cache。非零 seek
 在完整 artifact 上执行，避免把顺序 spool 伪装成任意可寻址文件。
 
+tempfile reservation 在 transfer 期间是 `InFlight { global, preload? }`；响应完整、writer flush 且
+非空校验通过后必须转换为 `Retained { global }`。因此 cache 和 active artifact 只保留代表真实文件的
+global quota，preload-only quota 不会因无扩展名 URL 或 artifact-only fallback 进入长期 owner。
+
 渐进路径的格式门槛、首包关键路径和退化条件见 [latency.md](latency.md)。
 
 ### Live
@@ -149,6 +153,7 @@ HLS 作为 current，也没有 seek、next preload 或隐式 timeshift。HLS VOD
 
 - live bridge 按保留的字节限流；HLS 整个响应及其保留 allocation 也计入同一共享预算；
 - growing URL 按最坏文件大小预留 tempfile quota；
+- 完整 artifact 在进入 cache 前归还 transfer 的 preload 子额度，global quota 继续跟随文件；
 - producer 和 sender 之间只有一个按媒体毫秒计量的 Opus queue；
 - next 达到 prime 窗口后停止提前编码；promotion 会把同一 producer 一次性提升为
   current，释放 preload worker 准入并切换 CPU/source 优先级；

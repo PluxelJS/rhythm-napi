@@ -15,6 +15,28 @@ pub struct RuntimeResourceLimitsInput {
     pub max_tempfile_bytes: Option<i64>,
 }
 
+/// Cheap on-demand accounting snapshot. All `available` fields use the same permit units as
+/// admission; tempfile quota units are 1 MiB each.
+#[derive(Debug)]
+#[napi(object)]
+pub struct RuntimeResourceDiagnosticsOutput {
+    pub streams_available: i64,
+    pub http_downloads_available: i64,
+    pub http_preloads_available: i64,
+    pub live_streams_available: i64,
+    pub live_bytes_available: i64,
+    pub tempfile_quota_units_available: i64,
+    pub tempfile_preload_units_available: i64,
+    pub blocking_producers_available: i64,
+    pub blocking_preloads_available: i64,
+    pub cpu_active: i64,
+    pub cpu_current_waiters: i64,
+    pub artifact_cache_entries: i64,
+    pub artifact_cache_retained_quota_bytes: i64,
+    pub download_registry_entries: i64,
+    pub live_download_flights: i64,
+}
+
 #[derive(Debug)]
 #[napi(object)]
 pub struct TrackSourceInput {

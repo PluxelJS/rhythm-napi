@@ -95,6 +95,15 @@ impl Streamer {
     }
 
     #[napi]
+    pub fn get_resource_diagnostics(&self) -> Result<RuntimeResourceDiagnosticsOutput> {
+        self.ensure_open().map_err(to_napi_error)?;
+        self.resources
+            .snapshot()
+            .map(Into::into)
+            .map_err(to_napi_error)
+    }
+
+    #[napi]
     pub async fn start_external_stream(
         &self,
         options: StartExternalStreamInput,

@@ -338,6 +338,10 @@ sender lateness 和 Node event-loop delay，再调整最接近瓶颈的一层。
 `getStatuses`批量采样并计算相邻差值，不要把status轮询当播放时钟。actor产生的`stateChanged`事件
 可能不含sender快照；需要诊断时主动查询。
 
+共享 admission 或 cache 疑似卡住时，按需调用 `getResourceDiagnostics()`。其中 tempfile 字段以 1 MiB
+quota unit 表示；完整 artifact 可以继续占用 global units，但没有 active next transfer 时
+`tempfilePreloadUnitsAvailable` 应回到配置基线。该快照不包含签名 URL/header，也不应作为高频时钟轮询。
+
 stop 后保留最近的轻量 stopped status，因此重复 stop/status 可以用于收敛。该历史是容量等于
 `maxStreams` 的 LRU，旧 ID 会被淘汰，不是持久存储。新的 start 可以复用已停止的 `streamId`；
 active 或 starting 的同名 stream会拒绝重复 start。
