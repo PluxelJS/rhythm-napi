@@ -1,5 +1,5 @@
 use crate::audio::decode::{DecodePoll, DecoderBackend};
-use crate::audio::dsp::VolumeConfig;
+use crate::audio::dsp::{ReplayGainConfig, VolumeConfig, recommend_replay_gain};
 use crate::audio::frame::{FrameAssembler, OpusFrame};
 use crate::audio::opus::OpusEncoderBackend;
 use crate::error::{MusicStreamError, Result};
@@ -64,6 +64,8 @@ pub struct PlayoutPipeline<D, E> {
     config: PipelineConfig,
     assembler: FrameAssembler,
     volume: VolumeConfig,
+    source_gain_db: f32,
+    source_gain_checked: bool,
     source_ended: bool,
 }
 
@@ -80,6 +82,8 @@ where
             assembler: FrameAssembler::new(config.channels, config.frame_samples_per_channel)?,
             config,
             volume: VolumeConfig::default(),
+            source_gain_db: 0.0,
+            source_gain_checked: false,
             source_ended: false,
         })
     }
@@ -115,9 +119,10 @@ where
             match self.decoder.poll_decode()? {
                 DecodePoll::Chunk(mut chunk) => {
                     self.validate_chunk(&chunk)?;
+                    self.freeze_source_gain();
                     decoded_ms = decoded_ms.saturating_add(chunk.duration_ms());
                     report.decoded_chunks += 1;
-                    let volume = self.volume;
+                    let volume = self.effective_volume();
                     let encoder = &mut self.encoder;
                     self.assembler.process_interleaved(
                         self.config.generation,
@@ -139,7 +144,7 @@ where
                     break;
                 }
                 DecodePoll::End => {
-                    let volume = self.volume;
+                    let volume = self.effective_volume();
                     let encoder = &mut self.encoder;
                     if self.assembler.flush_padded(
                         self.config.generation,
@@ -172,11 +177,35 @@ where
         }
         Ok(())
     }
+
+    fn freeze_source_gain(&mut self) {
+        if self.source_gain_checked {
+            return;
+        }
+        self.source_gain_checked = true;
+        let Some(metadata) = self.decoder.replay_gain_metadata() else {
+            return;
+        };
+        let Ok(recommendation) = recommend_replay_gain(metadata, ReplayGainConfig::default())
+        else {
+            return;
+        };
+        self.source_gain_db = recommendation.gain.as_db();
+        metrics::counter!("music_stream.audio.replay_gain_applied").increment(1);
+    }
+
+    fn effective_volume(&self) -> VolumeConfig {
+        VolumeConfig {
+            extra_gain_db: (self.volume.extra_gain_db + self.source_gain_db).clamp(-60.0, 12.0),
+            ..self.volume
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
 
     use bytes::Bytes;
 
@@ -187,11 +216,16 @@ mod tests {
     #[derive(Debug)]
     struct FakeDecoder {
         polls: VecDeque<DecodePoll>,
+        replay_gain: Option<crate::audio::dsp::ReplayGainMetadata>,
     }
 
     impl DecoderBackend for FakeDecoder {
         fn poll_decode(&mut self) -> Result<DecodePoll> {
             Ok(self.polls.pop_front().unwrap_or(DecodePoll::End))
+        }
+
+        fn replay_gain_metadata(&self) -> Option<crate::audio::dsp::ReplayGainMetadata> {
+            self.replay_gain
         }
     }
 
@@ -208,6 +242,21 @@ mod tests {
                 marker: frame.track_position_samples == 0,
                 track_position_samples: frame.track_position_samples,
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct CapturingEncoder {
+        first_samples: Arc<Mutex<Vec<f32>>>,
+    }
+
+    impl OpusEncoderBackend for CapturingEncoder {
+        fn encode(&mut self, frame: &PcmFrame<'_>) -> Result<OpusFrame> {
+            self.first_samples
+                .lock()
+                .expect("sample capture lock poisoned")
+                .push(frame.samples[0]);
+            FakeEncoder.encode(frame)
         }
     }
 
@@ -248,6 +297,7 @@ mod tests {
     fn need_more_returns_without_spinning() {
         let decoder = FakeDecoder {
             polls: VecDeque::from([DecodePoll::NeedMore]),
+            replay_gain: None,
         };
         let mut pipeline = PlayoutPipeline::new(decoder, FakeEncoder, config()).expect("pipeline");
         let report = pipeline.process_turn(|_| Ok(())).expect("turn");
@@ -284,5 +334,28 @@ mod tests {
         assert!(report.source_ended);
         assert_eq!(report.opus_frames, 1);
         assert_eq!(output.len(), 1);
+    }
+
+    #[test]
+    fn applies_trusted_replay_gain_before_the_first_encoded_frame() {
+        let decoder = FakeDecoder {
+            polls: VecDeque::from([DecodePoll::Chunk(chunk(1)), DecodePoll::End]),
+            replay_gain: Some(crate::audio::dsp::ReplayGainMetadata {
+                track_gain: Some(crate::model::GainLevel::from_db(-6.0).expect("track gain")),
+                track_peak: Some(1.0),
+                ..crate::audio::dsp::ReplayGainMetadata::default()
+            }),
+        };
+        let first_samples = Arc::new(Mutex::new(Vec::new()));
+        let encoder = CapturingEncoder {
+            first_samples: Arc::clone(&first_samples),
+        };
+        let mut pipeline = PlayoutPipeline::new(decoder, encoder, config()).expect("pipeline");
+
+        pipeline.process_turn(|_| Ok(())).expect("turn");
+
+        let samples = first_samples.lock().expect("sample capture lock poisoned");
+        assert_eq!(samples.len(), 1);
+        assert!((samples[0] - 0.125_296_82).abs() < 0.000_01);
     }
 }

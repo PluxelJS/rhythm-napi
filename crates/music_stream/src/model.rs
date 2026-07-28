@@ -427,7 +427,7 @@ impl Default for MediaBufferConfig {
     fn default() -> Self {
         Self {
             decode_batch_ms: 80,
-            encoded_capacity_ms: 400,
+            encoded_capacity_ms: 800,
             prebuffer_ms: 100,
             next_prime_ms: 200,
             max_playout_lateness_ms: 100,

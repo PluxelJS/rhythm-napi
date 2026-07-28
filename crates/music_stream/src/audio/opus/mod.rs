@@ -90,6 +90,9 @@ impl LibOpusEncoder {
         inner
             .set_vbr_constraint(config.constrained_vbr)
             .map_err(|error| MusicStreamError::EncodeError(error.to_string()))?;
+        inner
+            .set_signal(opus::Signal::Music)
+            .map_err(|error| MusicStreamError::EncodeError(error.to_string()))?;
         if let Some(bitrate_bps) = config.bitrate_bps {
             inner
                 .set_bitrate(opus::Bitrate::Bits(bitrate_bps))

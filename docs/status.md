@@ -60,8 +60,9 @@
 
 ### Loudness 分析
 
-当前支持宿主提供 ReplayGain metadata 后计算安全建议，不进行 EBU R128 离线扫描。是否加入扫描
-取决于 metadata 来源、预载成本和产品一致性要求。
+当前会在首个 PCM frame 前读取容器中标准化的 ReplayGain track/album gain 与 peak 标签，冻结一次安全
+建议并用于整首播放；标签缺失或无效时保持 0 dB。N-API 也保留宿主显式计算建议的入口。系统不进行 EBU
+R128 离线扫描；是否加入扫描取决于 metadata 来源、预载成本和产品一致性要求。
 
 ### 可选 Range seek
 

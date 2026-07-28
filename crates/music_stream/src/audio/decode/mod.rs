@@ -6,7 +6,9 @@ use std::io::Read;
 use std::path::Path;
 
 use crate::Result;
+use crate::audio::dsp::ReplayGainMetadata;
 use crate::error::MusicStreamError;
+use crate::model::GainLevel;
 
 const MAX_CONSECUTIVE_DECODE_ERRORS: usize = 32;
 const MAX_RECYCLED_PCM_SAMPLES: usize = 48_000 * 2;
@@ -48,6 +50,14 @@ pub enum DecodePoll {
 pub trait DecoderBackend {
     fn poll_decode(&mut self) -> Result<DecodePoll>;
 
+    /// Returns trusted container ReplayGain metadata discovered before the first PCM chunk.
+    ///
+    /// Backends without standardized metadata keep the default `None` behavior. Callers freeze
+    /// the first value they observe so late metadata never changes loudness mid-track.
+    fn replay_gain_metadata(&self) -> Option<ReplayGainMetadata> {
+        None
+    }
+
     /// Returns an owned PCM chunk after the caller has finished processing it.
     ///
     /// Stateful decoders may retain the allocation for the next decoded packet. Backends that do
@@ -85,6 +95,7 @@ pub struct SymphoniaFileDecoder {
     format: SymphoniaFormatReader,
     decoder: PacketAudioDecoder,
     track_id: u32,
+    replay_gain: Option<ReplayGainMetadata>,
     decode_errors: DecodeErrorBudget,
     recycled_samples: Vec<f32>,
 }
@@ -100,6 +111,7 @@ pub struct SymphoniaStreamDecoder {
     format: SymphoniaFormatReader,
     decoder: PacketAudioDecoder,
     track_id: u32,
+    replay_gain: Option<ReplayGainMetadata>,
     decode_errors: DecodeErrorBudget,
     recycled_samples: Vec<f32>,
 }
@@ -128,11 +140,12 @@ impl SymphoniaFileDecoder {
             hint.with_extension(extension);
         }
 
-        let (format, decoder, track_id) = open_symphonia_decoder(mss, &hint)?;
+        let (format, decoder, track_id, replay_gain) = open_symphonia_decoder(mss, &hint)?;
         Ok(Self {
             format,
             decoder,
             track_id,
+            replay_gain,
             decode_errors: DecodeErrorBudget::default(),
             recycled_samples: Vec::new(),
         })
@@ -172,6 +185,7 @@ impl DecoderBackend for SymphoniaFileDecoder {
             &mut self.format,
             &mut self.decoder,
             self.track_id,
+            &mut self.replay_gain,
             &mut self.decode_errors,
             &mut self.recycled_samples,
         )
@@ -179,6 +193,10 @@ impl DecoderBackend for SymphoniaFileDecoder {
 
     fn recycle(&mut self, chunk: DecodedChunk) {
         recycle_symphonia_chunk(&mut self.recycled_samples, chunk);
+    }
+
+    fn replay_gain_metadata(&self) -> Option<ReplayGainMetadata> {
+        self.replay_gain
     }
 }
 impl SymphoniaStreamDecoder {
@@ -194,11 +212,12 @@ impl SymphoniaStreamDecoder {
             hint.with_extension(extension);
         }
         let mss = MediaSourceStream::new(Box::new(ReadOnlySource::new(reader)), Default::default());
-        let (format, decoder, track_id) = open_symphonia_decoder(mss, &hint)?;
+        let (format, decoder, track_id, replay_gain) = open_symphonia_decoder(mss, &hint)?;
         Ok(Self {
             format,
             decoder,
             track_id,
+            replay_gain,
             decode_errors: DecodeErrorBudget::default(),
             recycled_samples: Vec::new(),
         })
@@ -210,6 +229,7 @@ impl DecoderBackend for SymphoniaStreamDecoder {
             &mut self.format,
             &mut self.decoder,
             self.track_id,
+            &mut self.replay_gain,
             &mut self.decode_errors,
             &mut self.recycled_samples,
         )
@@ -217,6 +237,10 @@ impl DecoderBackend for SymphoniaStreamDecoder {
 
     fn recycle(&mut self, chunk: DecodedChunk) {
         recycle_symphonia_chunk(&mut self.recycled_samples, chunk);
+    }
+
+    fn replay_gain_metadata(&self) -> Option<ReplayGainMetadata> {
+        self.replay_gain
     }
 }
 fn open_symphonia_decoder(
@@ -227,7 +251,7 @@ fn open_symphonia_decoder(
     use symphonia::core::formats::{FormatOptions, TrackType};
     use symphonia::core::meta::MetadataOptions;
 
-    let format = symphonia::default::get_probe()
+    let mut format = symphonia::default::get_probe()
         .probe(
             hint,
             mss,
@@ -260,12 +284,14 @@ fn open_symphonia_decoder(
         )
     };
 
-    Ok((format, decoder, track_id))
+    let replay_gain = replay_gain_from_format(&mut *format, track_id);
+    Ok((format, decoder, track_id, replay_gain))
 }
 fn poll_symphonia_decode(
     format: &mut SymphoniaFormatReader,
     decoder: &mut PacketAudioDecoder,
     track_id: u32,
+    replay_gain: &mut Option<ReplayGainMetadata>,
     decode_errors: &mut DecodeErrorBudget,
     recycled_samples: &mut Vec<f32>,
 ) -> Result<DecodePoll> {
@@ -284,6 +310,9 @@ fn poll_symphonia_decode(
 
         while !format.metadata().is_latest() {
             format.metadata().pop();
+        }
+        if replay_gain.is_none() {
+            *replay_gain = replay_gain_from_format(&mut **format, track_id);
         }
 
         if packet.track_id != track_id {
@@ -483,7 +512,85 @@ impl DecodeErrorBudget {
 }
 type SymphoniaFormatReader = Box<dyn symphonia::core::formats::FormatReader>;
 type SymphoniaAudioDecoder = Box<dyn symphonia::core::codecs::audio::AudioDecoder>;
-type SymphoniaDecoderParts = (SymphoniaFormatReader, PacketAudioDecoder, u32);
+type SymphoniaDecoderParts = (
+    SymphoniaFormatReader,
+    PacketAudioDecoder,
+    u32,
+    Option<ReplayGainMetadata>,
+);
+
+fn replay_gain_from_format(
+    format: &mut dyn symphonia::core::formats::FormatReader,
+    track_id: u32,
+) -> Option<ReplayGainMetadata> {
+    let metadata = format.metadata();
+    let revision = metadata.current()?;
+    let mut replay_gain = ReplayGainMetadata::default();
+    update_replay_gain(&mut replay_gain, &revision.media.tags);
+    if let Some(track) = revision
+        .per_track
+        .iter()
+        .find(|track| track.track_id == u64::from(track_id))
+    {
+        update_replay_gain(&mut replay_gain, &track.metadata.tags);
+    }
+    (replay_gain.track_gain.is_some() || replay_gain.album_gain.is_some()).then_some(replay_gain)
+}
+
+fn update_replay_gain(replay_gain: &mut ReplayGainMetadata, tags: &[symphonia::core::meta::Tag]) {
+    use symphonia::core::meta::StandardTag;
+
+    for tag in tags {
+        match tag.std.as_ref() {
+            Some(StandardTag::ReplayGainTrackGain(value)) => {
+                if let Some(gain) = parse_replay_gain_db(value) {
+                    replay_gain.track_gain = Some(gain);
+                }
+            }
+            Some(StandardTag::ReplayGainAlbumGain(value)) => {
+                if let Some(gain) = parse_replay_gain_db(value) {
+                    replay_gain.album_gain = Some(gain);
+                }
+            }
+            Some(StandardTag::ReplayGainTrackPeak(value)) => {
+                if let Some(peak) = parse_replay_gain_peak(value) {
+                    replay_gain.track_peak = Some(peak);
+                }
+            }
+            Some(StandardTag::ReplayGainAlbumPeak(value)) => {
+                if let Some(peak) = parse_replay_gain_peak(value) {
+                    replay_gain.album_peak = Some(peak);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn parse_replay_gain_db(value: &str) -> Option<GainLevel> {
+    let value = value.trim();
+    let value = value
+        .get(..value.len().saturating_sub(2))
+        .filter(|_| {
+            value
+                .get(value.len().saturating_sub(2)..)
+                .is_some_and(|unit| unit.eq_ignore_ascii_case("db"))
+        })
+        .unwrap_or(value)
+        .trim();
+    value
+        .parse::<f32>()
+        .ok()
+        .and_then(|gain| GainLevel::from_db(gain).ok())
+}
+
+fn parse_replay_gain_peak(value: &str) -> Option<f32> {
+    value
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|peak| peak.is_finite() && *peak > 0.0)
+}
 fn map_symphonia_error(error: symphonia::core::errors::Error) -> MusicStreamError {
     use symphonia::core::errors::Error as SymphoniaError;
 
@@ -502,7 +609,39 @@ fn map_symphonia_error(error: symphonia::core::errors::Error) -> MusicStreamErro
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+
+    #[test]
+    fn standardized_replay_gain_tags_are_parsed_strictly() {
+        use symphonia::core::meta::{RawTag, StandardTag, Tag};
+
+        let tags = [
+            Tag::new_std(
+                RawTag::new("REPLAYGAIN_TRACK_GAIN", "-7.25 dB"),
+                StandardTag::ReplayGainTrackGain(Arc::new("-7.25 dB".to_owned())),
+            ),
+            Tag::new_std(
+                RawTag::new("REPLAYGAIN_TRACK_PEAK", "0.95"),
+                StandardTag::ReplayGainTrackPeak(Arc::new("0.95".to_owned())),
+            ),
+        ];
+        let mut metadata = ReplayGainMetadata::default();
+
+        update_replay_gain(&mut metadata, &tags);
+
+        assert_eq!(metadata.track_gain.map(GainLevel::as_db), Some(-7.25));
+        assert_eq!(metadata.track_peak, Some(0.95));
+    }
+
+    #[test]
+    fn malformed_replay_gain_tags_are_ignored() {
+        assert!(parse_replay_gain_db("untrusted").is_none());
+        assert!(parse_replay_gain_db("99 dB").is_none());
+        assert!(parse_replay_gain_peak("-1").is_none());
+        assert!(parse_replay_gain_peak("NaN").is_none());
+    }
 
     #[test]
     fn consecutive_decode_error_budget_is_bounded() {
@@ -726,7 +865,13 @@ mod tests {
 
     #[tokio::test]
     async fn symphonia_stream_decoder_reads_ogg_opus_with_libopus() {
-        let bytes = make_test_ogg_opus(2);
+        let bytes = make_test_ogg_opus_with_comments(
+            2,
+            &[
+                "REPLAYGAIN_TRACK_GAIN=-6.00 dB",
+                "REPLAYGAIN_TRACK_PEAK=0.95",
+            ],
+        );
         let (writer, reader) =
             crate::source::StreamingByteReader::new(bytes.len() + 1024).expect("byte pipe");
         writer
@@ -756,6 +901,9 @@ mod tests {
                 }
             }
             assert_eq!(decoded_samples, 1_920);
+            let replay_gain = decoder.replay_gain_metadata().expect("ReplayGain tags");
+            assert_eq!(replay_gain.track_gain.map(GainLevel::as_db), Some(-6.0));
+            assert_eq!(replay_gain.track_peak, Some(0.95));
         })
         .await
         .expect("decode task");
@@ -852,7 +1000,7 @@ mod tests {
         }
     }
 
-    fn make_test_ogg_opus(channels: u8) -> Vec<u8> {
+    fn make_test_ogg_opus_with_comments(channels: u8, comments: &[&str]) -> Vec<u8> {
         use ogg::writing::{PacketWriteEndInfo, PacketWriter};
 
         let opus_channels = match channels {
@@ -877,10 +1025,23 @@ mod tests {
             .write_packet(head, serial, PacketWriteEndInfo::EndPage, 0)
             .expect("OpusHead");
 
-        let mut tags = Vec::with_capacity(16);
+        let mut tags =
+            Vec::with_capacity(16 + comments.iter().map(|comment| comment.len()).sum::<usize>());
         tags.extend_from_slice(b"OpusTags");
         tags.extend_from_slice(&0_u32.to_le_bytes());
-        tags.extend_from_slice(&0_u32.to_le_bytes());
+        tags.extend_from_slice(
+            &u32::try_from(comments.len())
+                .expect("test comment count")
+                .to_le_bytes(),
+        );
+        for comment in comments {
+            tags.extend_from_slice(
+                &u32::try_from(comment.len())
+                    .expect("test comment length")
+                    .to_le_bytes(),
+            );
+            tags.extend_from_slice(comment.as_bytes());
+        }
         writer
             .write_packet(tags, serial, PacketWriteEndInfo::EndPage, 0)
             .expect("OpusTags");

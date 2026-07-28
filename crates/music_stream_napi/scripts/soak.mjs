@@ -86,7 +86,7 @@ try {
     },
     buffer: {
       decodeBatchMs: 80,
-      encodedCapacityMs: 400,
+      encodedCapacityMs: 800,
       prebufferMs: 100,
       nextPrimeMs: 200,
       maxPlayoutLatenessMs: 100,

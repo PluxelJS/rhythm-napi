@@ -195,8 +195,9 @@ FrameAssembler 从 decoder chunk 组装 960 samples/channel 的 20 ms frame。�
 slice，只保存跨 chunk 的短尾部；source end 的最后一个 partial frame 补零后编码，防止尾音或极短
 音频被静默丢弃。
 
-volume 使用感知曲线，gain 使用显式 dB；正增益经过 soft limiter。ReplayGain 只根据宿主提供的
-metadata 计算建议值，不自动扫描音频，也不隐式改变当前 gain。
+volume 使用感知曲线，gain 使用显式 dB；正增益经过 soft limiter。首个 PCM frame 前若 decoder 已取得
+标准化 ReplayGain track/album gain 与 peak 标签，pipeline 会冻结一次安全建议并与显式 gain 叠加；标签
+缺失或无效时保持 0 dB。系统不自动扫描音频，也不在歌曲中途改变 ReplayGain。
 unity gain 对已经位于合法 float PCM 范围的输入不执行写回；异常超范围输入仍保持 clamp 语义。
 
 ### Opus

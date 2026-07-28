@@ -175,7 +175,7 @@ const status = await streamer.startStream({
   },
   buffer: {
     decodeBatchMs: 80,
-    encodedCapacityMs: 400,
+    encodedCapacityMs: 800,
     prebufferMs: 100,
     nextPrimeMs: 200,
     maxPlayoutLatenessMs: 100,
@@ -282,8 +282,9 @@ switch。401/403 不在 Rust 内无限重试，宿主收到 refresh 请求后决
 volume 是 0..1 的用户控制并使用感知曲线；gain 是 -60..+12 dB 的媒体校正。二者都在 Opus 前
 生效且不重启 generation。正 gain 有 limiter，但 limiter 不是修复错误 loudness metadata 的理由。
 
-ReplayGain helper 只根据宿主传入的 track/album gain 与 peak 计算建议。宿主应在开始播放前得到
-metadata并显式应用建议；当前 runtime 不扫描 EBU R128，也不会自动改变 gain。
+runtime 会在首个 PCM frame 前读取容器中标准化的 ReplayGain track/album gain 与 peak 标签，冻结一次
+安全建议并在整首播放中与显式 gain 叠加；缺失或无效标签保持 0 dB。ReplayGain helper 仍可供宿主对外部
+metadata 单独计算建议。runtime 不扫描 EBU R128，也不会在歌曲中途改变 ReplayGain。
 
 ## 错误恢复
 

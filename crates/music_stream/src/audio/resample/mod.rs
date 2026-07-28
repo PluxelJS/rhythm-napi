@@ -11,7 +11,7 @@ mod rubato_backend {
 
     use crate::audio::AudioFormat;
     use crate::audio::decode::{DecodePoll, DecodedChunk, DecoderBackend};
-    use crate::audio::dsp::to_stereo_interleaved;
+    use crate::audio::dsp::{ReplayGainMetadata, to_stereo_interleaved};
     use crate::error::{MusicStreamError, Result};
 
     const DEFAULT_CHUNK_FRAMES: usize = 1024;
@@ -178,6 +178,10 @@ mod rubato_backend {
             } else {
                 self.inner.recycle(chunk);
             }
+        }
+
+        fn replay_gain_metadata(&self) -> Option<ReplayGainMetadata> {
+            self.inner.replay_gain_metadata()
         }
     }
 
