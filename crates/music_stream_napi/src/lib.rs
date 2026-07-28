@@ -12,8 +12,8 @@ mod events;
 mod types;
 
 use convert::{
-    apply_opus_bitrate_limit, attempt_start_timeout_from_input, media_buffer_config_from_input,
-    replay_gain_from_input, runtime_resource_limits_from_input, source_config_from_input,
+    apply_opus_bitrate_limit, attempt_start_timeout_from_input, replay_gain_from_input,
+    runtime_resource_limits_from_input, source_config_from_input,
 };
 use events::{EventCallback, EventQueue, event_output};
 use types::*;
@@ -69,10 +69,14 @@ impl Streamer {
         self.ensure_open().map_err(to_napi_error)?;
         let stream_id = options.stream_id;
         StreamRuntime::validate_stream_id(&stream_id).map_err(to_napi_error)?;
+        if options.buffer.is_some() {
+            return Err(to_napi_error(MusicStreamError::Unsupported(
+                "media buffer policy is owned by the native runtime".to_owned(),
+            )));
+        }
         let current = TrackSource::try_from(options.current).map_err(to_napi_error)?;
         let transport = RtpTransportConfig::try_from(options.transport).map_err(to_napi_error)?;
         let source = source_config_from_input(options.source).map_err(to_napi_error)?;
-        let buffer = media_buffer_config_from_input(options.buffer).map_err(to_napi_error)?;
         let volume =
             VolumeLevel::from_unit(options.volume.unwrap_or(1.0) as f32).map_err(to_napi_error)?;
         let gain =
@@ -84,7 +88,6 @@ impl Streamer {
         config.opus_bitrate_bps =
             apply_opus_bitrate_limit(config.opus_bitrate_bps, options.opus_bitrate_limit_bps)
                 .map_err(to_napi_error)?;
-        config.buffer = buffer;
         if let Some(timeout) = attempt_start_timeout {
             config.attempt_start_timeout = timeout;
         }
@@ -110,9 +113,13 @@ impl Streamer {
         self.ensure_open().map_err(to_napi_error)?;
         let stream_id = options.stream_id;
         StreamRuntime::validate_stream_id(&stream_id).map_err(to_napi_error)?;
+        if options.buffer.is_some() {
+            return Err(to_napi_error(MusicStreamError::Unsupported(
+                "media buffer policy is owned by the native runtime".to_owned(),
+            )));
+        }
         let current = TrackSource::try_from(options.current).map_err(to_napi_error)?;
         let source = source_config_from_input(options.source).map_err(to_napi_error)?;
-        let buffer = media_buffer_config_from_input(options.buffer).map_err(to_napi_error)?;
         let volume =
             VolumeLevel::from_unit(options.volume.unwrap_or(1.0) as f32).map_err(to_napi_error)?;
         let gain =
@@ -124,7 +131,6 @@ impl Streamer {
         config.opus_bitrate_bps =
             apply_opus_bitrate_limit(config.opus_bitrate_bps, options.opus_bitrate_limit_bps)
                 .map_err(to_napi_error)?;
-        config.buffer = buffer;
         if let Some(timeout) = attempt_start_timeout {
             config.attempt_start_timeout = timeout;
         }

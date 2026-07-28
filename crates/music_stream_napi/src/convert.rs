@@ -2,10 +2,10 @@ use std::time::Duration;
 
 use music_stream::{
     ExternalFrameAck, ExternalFrameOutcome, GainLevel, HttpLiveStreamConfig, HttpSourceConfig,
-    MediaBufferConfig, MusicStreamError, ReplayGainConfig, ReplayGainMetadata, ReplayGainMode,
-    ReplayGainRecommendation, ReplayGainSource, RtcpReceiverReportSnapshot, RtpEncryptionConfig,
-    RtpTransportConfig, RuntimeResourceLimits, RuntimeResourceSnapshot, SourceResolverConfig,
-    StreamRuntimeProgress, TrackSource,
+    MusicStreamError, ReplayGainConfig, ReplayGainMetadata, ReplayGainMode,
+    ReplayGainRecommendation, ReplayGainSource, RtcpReceiverReportSnapshot, RtpTransportConfig,
+    RuntimeResourceLimits, RuntimeResourceSnapshot, SourceResolverConfig, StreamRuntimeProgress,
+    TrackSource,
 };
 
 use crate::types::*;
@@ -54,32 +54,6 @@ impl TryFrom<ExternalOpusFrameAckInput> for ExternalFrameAck {
     }
 }
 
-pub(crate) fn media_buffer_config_from_input(
-    input: Option<MediaBufferConfigInput>,
-) -> std::result::Result<MediaBufferConfig, MusicStreamError> {
-    let mut config = MediaBufferConfig::default();
-    let Some(input) = input else {
-        return Ok(config);
-    };
-    if let Some(value) = input.decode_batch_ms {
-        config.decode_batch_ms = positive_millis(value, "buffer.decodeBatchMs")?;
-    }
-    if let Some(value) = input.encoded_capacity_ms {
-        config.encoded_capacity_ms = positive_millis(value, "buffer.encodedCapacityMs")?;
-    }
-    if let Some(value) = input.prebuffer_ms {
-        config.prebuffer_ms = positive_millis(value, "buffer.prebufferMs")?;
-    }
-    if let Some(value) = input.next_prime_ms {
-        config.next_prime_ms = non_negative_millis(value, "buffer.nextPrimeMs")?;
-    }
-    if let Some(value) = input.max_playout_lateness_ms {
-        config.max_playout_lateness_ms = non_negative_millis(value, "buffer.maxPlayoutLatenessMs")?;
-    }
-    config.validate()?;
-    Ok(config)
-}
-
 fn positive_millis(value: i64, name: &str) -> std::result::Result<u64, MusicStreamError> {
     if value <= 0 {
         return Err(MusicStreamError::InvalidConfig(format!(
@@ -95,11 +69,6 @@ pub(crate) fn attempt_start_timeout_from_input(
     value
         .map(|value| positive_millis(value, "attemptStartTimeoutMs").map(Duration::from_millis))
         .transpose()
-}
-
-fn non_negative_millis(value: i64, name: &str) -> std::result::Result<u64, MusicStreamError> {
-    u64::try_from(value)
-        .map_err(|_| MusicStreamError::InvalidConfig(format!("{name} must be non-negative")))
 }
 
 pub(crate) fn runtime_resource_limits_from_input(
@@ -488,58 +457,44 @@ impl TryFrom<RtpTransportConfigInput> for RtpTransportConfig {
     type Error = music_stream::MusicStreamError;
 
     fn try_from(value: RtpTransportConfigInput) -> std::result::Result<Self, Self::Error> {
-        Ok(Self {
-            remote_ip: value.ip,
-            remote_rtp_port: checked_port(value.port, "port", false)?,
-            remote_rtcp_port: value
-                .rtcp_port
-                .map(|port| checked_port(port, "rtcpPort", false))
-                .transpose()?,
-            local_ip: value.local_ip.unwrap_or_else(|| "0.0.0.0".to_owned()),
-            local_rtp_port: value
-                .local_port
-                .map(|port| checked_port(port, "localPort", true))
-                .transpose()?
-                .unwrap_or(0),
-            payload_type: value
-                .audio_pt
-                .map(|payload_type| checked_u8(payload_type, "audioPt"))
-                .transpose()?
-                .unwrap_or(96),
-            ssrc: value.audio_ssrc,
-            mtu: value.mtu.unwrap_or(1_200) as usize,
-            rtcp_mux: value.rtcp_mux.unwrap_or(true),
-            rtp_keepalive_interval: value
-                .rtp_keepalive_interval_ms
-                .map(|milliseconds| Duration::from_millis(u64::from(milliseconds))),
-            encryption: value
-                .encryption
-                .map(Into::into)
-                .unwrap_or(RtpEncryptionConfig::None),
-        })
-    }
-}
-
-impl From<RtpEncryptionConfigInput> for RtpEncryptionConfig {
-    fn from(value: RtpEncryptionConfigInput) -> Self {
-        if value.mode == "none" {
-            return Self::None;
+        if value.encryption.is_some() {
+            return Err(MusicStreamError::Unsupported(
+                "RTP encryption must be implemented by the platform transport adapter".to_owned(),
+            ));
         }
-
-        Self::External {
-            mode: value.mode,
-            secret_key: value.secret_key.map(|buffer| buffer.to_vec()),
+        let mut config = Self::new(
+            value.ip,
+            checked_port(value.port, "port", false)?,
+            value.audio_ssrc,
+        );
+        config.remote_rtcp_port = value
+            .rtcp_port
+            .map(|port| checked_port(port, "rtcpPort", false))
+            .transpose()?;
+        if let Some(local_ip) = value.local_ip {
+            config.local_ip = local_ip;
         }
+        if let Some(local_port) = value.local_port {
+            config.local_rtp_port = checked_port(local_port, "localPort", true)?;
+        }
+        if let Some(payload_type) = value.audio_pt {
+            config.payload_type = checked_u8(payload_type, "audioPt")?;
+        }
+        if let Some(mtu) = value.mtu {
+            config.mtu = mtu as usize;
+        }
+        if let Some(rtcp_mux) = value.rtcp_mux {
+            config.rtcp_mux = rtcp_mux;
+        }
+        config.rtp_keepalive_interval = value
+            .rtp_keepalive_interval_ms
+            .map(|milliseconds| Duration::from_millis(u64::from(milliseconds)));
+        Ok(config)
     }
 }
 
 impl From<RtpTransportConfig> for RtpTransportConfigOutput {
     fn from(value: RtpTransportConfig) -> Self {
-        let encryption_mode = match value.encryption {
-            RtpEncryptionConfig::None => "none".to_owned(),
-            RtpEncryptionConfig::External { mode, .. } => mode,
-        };
-
         Self {
             remote_ip: value.remote_ip,
             remote_rtp_port: u32::from(value.remote_rtp_port),
@@ -553,7 +508,6 @@ impl From<RtpTransportConfig> for RtpTransportConfigOutput {
             rtp_keepalive_interval_ms: value
                 .rtp_keepalive_interval
                 .map(|interval| interval.as_millis().try_into().unwrap_or(u32::MAX)),
-            encryption_mode,
         }
     }
 }

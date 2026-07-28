@@ -6,6 +6,15 @@ use crate::Result;
 use crate::audio::frame::{OpusFrame, PcmFrame};
 use crate::error::MusicStreamError;
 
+pub(crate) const OPUS_SAMPLE_RATE_HZ: u32 = 48_000;
+pub(crate) const OPUS_CHANNELS: u16 = 2;
+pub(crate) const OPUS_FRAME_SAMPLES: u32 = 960;
+pub(crate) const OPUS_FRAME_DURATION_MS: u64 = 20;
+pub(crate) const OPUS_MAX_PACKET_BYTES: usize = 1_275;
+pub(crate) const OPUS_MUSIC_BITRATE_BPS: u32 = 320_000;
+pub(crate) const OPUS_MIN_BITRATE_BPS: u32 = 500;
+pub(crate) const OPUS_MAX_BITRATE_BPS: u32 = 512_000;
+
 pub trait OpusEncoderBackend {
     fn encode(&mut self, frame: &PcmFrame<'_>) -> Result<OpusFrame>;
 }
@@ -15,7 +24,7 @@ pub struct LibOpusEncoderConfig {
     pub sample_rate: u32,
     pub channels: u16,
     pub max_packet_bytes: usize,
-    pub bitrate_bps: Option<i32>,
+    pub bitrate_bps: u32,
     pub complexity: i32,
     pub vbr: bool,
     pub constrained_vbr: bool,
@@ -24,10 +33,10 @@ pub struct LibOpusEncoderConfig {
 impl Default for LibOpusEncoderConfig {
     fn default() -> Self {
         Self {
-            sample_rate: 48_000,
-            channels: 2,
-            max_packet_bytes: 1_275,
-            bitrate_bps: Some(320_000),
+            sample_rate: OPUS_SAMPLE_RATE_HZ,
+            channels: OPUS_CHANNELS,
+            max_packet_bytes: OPUS_MAX_PACKET_BYTES,
+            bitrate_bps: OPUS_MUSIC_BITRATE_BPS,
             complexity: 10,
             vbr: true,
             constrained_vbr: true,
@@ -44,7 +53,7 @@ pub struct LibOpusEncoder {
 
 impl LibOpusEncoder {
     pub fn new(config: LibOpusEncoderConfig) -> Result<Self> {
-        if config.sample_rate != 48_000 {
+        if config.sample_rate != OPUS_SAMPLE_RATE_HZ {
             return Err(MusicStreamError::InvalidConfig(
                 "Opus RTP output requires 48kHz input".to_owned(),
             ));
@@ -70,10 +79,7 @@ impl LibOpusEncoder {
                 "Opus complexity must be between 0 and 10".to_owned(),
             ));
         }
-        if config
-            .bitrate_bps
-            .is_some_and(|bitrate| !(500..=512_000).contains(&bitrate))
-        {
+        if !(OPUS_MIN_BITRATE_BPS..=OPUS_MAX_BITRATE_BPS).contains(&config.bitrate_bps) {
             return Err(MusicStreamError::InvalidConfig(
                 "Opus bitrate must be between 500 and 512000 bps".to_owned(),
             ));
@@ -93,11 +99,9 @@ impl LibOpusEncoder {
         inner
             .set_signal(opus::Signal::Music)
             .map_err(|error| MusicStreamError::EncodeError(error.to_string()))?;
-        if let Some(bitrate_bps) = config.bitrate_bps {
-            inner
-                .set_bitrate(opus::Bitrate::Bits(bitrate_bps))
-                .map_err(|error| MusicStreamError::EncodeError(error.to_string()))?;
-        }
+        inner
+            .set_bitrate(opus::Bitrate::Bits(config.bitrate_bps as i32))
+            .map_err(|error| MusicStreamError::EncodeError(error.to_string()))?;
 
         let output = BytesMut::zeroed(config.max_packet_bytes);
         Ok(Self {

@@ -173,26 +173,20 @@ const status = await streamer.startStream({
       retryBackoffMs: 250,
     },
   },
-  buffer: {
-    decodeBatchMs: 80,
-    encodedCapacityMs: 800,
-    prebufferMs: 100,
-    nextPrimeMs: 200,
-    maxPlayoutLatenessMs: 100,
-  },
   volume: 1,
   gainDb: 0,
 })
 ```
 
 native 音乐目标为 320 kbps。`opusBitrateLimitBps` 只在平台或频道存在更低上限时传入；省略或传入更高值
-都不会把目标提高到 320 kbps 以上。buffer 使用 native 统一默认值，普通平台 adapter 不需要重复传入。
+都不会把目标提高到 320 kbps 以上。buffer 策略由 native 统一管理，不属于启动合同；旧调用若仍传入
+`buffer` 会明确失败，不会被静默忽略。
 
 启动 Promise 返回表示 runtime、sender 和 current generation 已建立，不等于第一包已经发送。
 状态通常先是 `buffering`，prebuffer ready 后通过状态事件进入 `playing`。
 
-RTP transport 必须来自实际 gateway 协商。`rtcpMux=false` 时必须提供 RTCP port。当前仅支持
-plaintext；配置其他 protection mode 会 fail closed，不能依赖静默降级。
+RTP transport 必须来自实际 gateway 协商。`rtcpMux=false` 时必须提供 RTCP port；native RTP 当前只发送
+协商方明确允许的 plaintext，平台加密由对应 SDK 或 transport adapter 负责。
 
 ## 用事件驱动 playlist
 

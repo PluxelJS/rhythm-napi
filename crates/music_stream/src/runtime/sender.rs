@@ -10,6 +10,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 use super::StreamRuntimeProgress;
 use super::opus_queue::OpusQueueReceiver;
 use crate::audio::frame::OpusFrame;
+use crate::audio::opus::{OPUS_FRAME_DURATION_MS, OPUS_FRAME_SAMPLES};
 use crate::error::{MusicStreamError, Result};
 use crate::quality::RtcpQualityWindow;
 use crate::session::WorkerEvent;
@@ -21,8 +22,6 @@ use crate::transport::{
 const SENDER_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const DATAGRAM_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 const SENDER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
-const OPUS_FRAME_SAMPLES: u32 = 960;
-const OPUS_FRAME_DURATION_MS: u64 = 20;
 const OPUS_SILENCE_PAYLOAD: &[u8] = &[0xf8, 0xff, 0xfe];
 
 #[derive(Clone, Debug)]
@@ -57,11 +56,6 @@ impl SenderHandle {
         rtcp_interval: Duration,
         events: mpsc::Sender<WorkerEvent>,
     ) -> Result<Self> {
-        if !config.encryption.is_plaintext() {
-            return Err(MusicStreamError::Unsupported(
-                "RTP protection requires an installed packet protector".to_owned(),
-            ));
-        }
         let local = config.local_rtp_addr();
         let remote = config.remote_rtp_addr();
         let socket = UdpSocket::bind(local)
@@ -847,6 +841,7 @@ mod tests {
 
     use super::*;
     use crate::audio::frame::OpusFrame;
+    use crate::audio::opus::{OPUS_CHANNELS, OPUS_SAMPLE_RATE_HZ};
     use crate::runtime::opus_queue;
 
     #[tokio::test]
@@ -873,8 +868,9 @@ mod tests {
 
     #[test]
     fn keepalive_payload_is_a_valid_stereo_opus_silence_frame() {
-        let mut decoder = opus::Decoder::new(48_000, opus::Channels::Stereo).expect("decoder");
-        let mut pcm = [1_i16; OPUS_FRAME_SAMPLES as usize * 2];
+        let mut decoder =
+            opus::Decoder::new(OPUS_SAMPLE_RATE_HZ, opus::Channels::Stereo).expect("decoder");
+        let mut pcm = [1_i16; OPUS_FRAME_SAMPLES as usize * OPUS_CHANNELS as usize];
         let samples = decoder
             .decode(OPUS_SILENCE_PAYLOAD, &mut pcm, false)
             .expect("decode silence");

@@ -34,7 +34,6 @@ test('RTP keeps promoting constrained unique HTTP sources after repeated boundar
 			current: source(0),
 			transport: rtpTransport(socket, 0x66778801),
 			source: { http: { maxRetries: 0, cacheTempFiles: true, maxBytes: 1024 * 1024 } },
-			buffer: { prebufferMs: 20, nextPrimeMs: 40 },
 		})
 		await streamer.reconcilePlan(streamId, {
 			version: 1,
@@ -97,7 +96,6 @@ test('completed extensionless preloads cannot poison tempfile admission for late
 			current: source(0),
 			transport: rtpTransport(socket, 0x66778802),
 			source: { http: { maxRetries: 0, cacheTempFiles: true, maxBytes: 1024 * 1024 } },
-			buffer: { prebufferMs: 20, nextPrimeMs: 40 },
 		})
 		await streamer.reconcilePlan(streamId, {
 			version: 1,

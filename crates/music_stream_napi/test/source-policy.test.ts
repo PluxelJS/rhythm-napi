@@ -56,6 +56,34 @@ test('source and transport policies reject invalid limits synchronously', () => 
 	).toThrow(/transport|invalid/i)
 })
 
+test('removed buffer and RTP encryption options fail closed instead of being ignored', async () => {
+	const streamer = new Streamer()
+	try {
+		expect(() =>
+			streamer.validateRtpTransportConfig({
+				ip: '127.0.0.1',
+				port: 5_000,
+				audioSsrc: 1,
+				encryption: true as never,
+			}),
+		).toThrow(/RTP encryption.*platform transport adapter/i)
+		await expect(
+			streamer.startExternalStream({
+				streamId: `removed-buffer-${Date.now()}`,
+				current: {
+					id: 'removed-buffer',
+					attemptId: 'attempt-removed-buffer',
+					kind: 'file',
+					path: '/does/not/matter.wav',
+				},
+				buffer: true as never,
+			}),
+		).rejects.toThrow(/buffer policy.*native runtime/i)
+	} finally {
+		await streamer.shutdown()
+	}
+})
+
 test('public-only sources reject custom headers at the N-API boundary', async () => {
 	const socket = await createBoundUdpSocket()
 	const streamer = new Streamer()

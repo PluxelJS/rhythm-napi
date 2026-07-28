@@ -234,8 +234,8 @@ sender 在成功完整发送 datagram 后才更新 packet、byte、octet、seque
 RTCP SR 默认每五秒发送。mux 模式复用 RTP socket，非 mux 模式使用独立 socket。RR 解析形成 loss、
 jitter 和 RTT snapshot，再进入 rolling quality window；质量事件只是宿主策略输入。
 
-配置非 plaintext protection 但没有平台 protector 时 fail closed。当前实现绝不能静默降级明文，
-也不能声称已经提供具体平台加密。
+native RTP 只负责 plaintext packetization；需要加密的平台由已协商具体协议和密钥生命周期的 SDK 或
+transport adapter 承担，核心不暴露无法执行的通用 protection 配置。
 
 ## 错误优先级
 

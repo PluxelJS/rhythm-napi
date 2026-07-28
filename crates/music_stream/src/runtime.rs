@@ -19,7 +19,11 @@ pub use external_pull::{ExternalFrameAck, ExternalFrameOutcome, ExternalOpusFram
 use producer::{ProducerHandle, ProducerRole, ProducerSpec};
 use sender::SenderHandle;
 
-use crate::audio::opus::LibOpusEncoderConfig;
+use crate::audio::opus::{
+    LibOpusEncoderConfig, OPUS_CHANNELS as CHANNELS, OPUS_FRAME_SAMPLES as FRAME_SAMPLES,
+    OPUS_MAX_BITRATE_BPS, OPUS_MAX_PACKET_BYTES, OPUS_MIN_BITRATE_BPS, OPUS_MUSIC_BITRATE_BPS,
+    OPUS_SAMPLE_RATE_HZ as SAMPLE_RATE,
+};
 use crate::error::{MusicStreamError, Result};
 use crate::event::{SourceRole, StreamEvent};
 use crate::model::{
@@ -33,10 +37,6 @@ use crate::source::{
 };
 use crate::transport::{RtcpReceiverReportSnapshot, RtpTransportConfig};
 
-const SAMPLE_RATE: u32 = 48_000;
-const CHANNELS: u16 = 2;
-const FRAME_SAMPLES: u32 = 960;
-const PREBUFFER_MS: u64 = 100;
 const ATTEMPT_START_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_ATTEMPT_START_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const RTCP_INTERVAL: Duration = Duration::from_secs(5);
@@ -49,10 +49,6 @@ const MAX_TEMPFILE_BYTES: u64 = 1024 * 1024 * 1024;
 const TEMPFILE_QUOTA_BYTES: u64 = 1024 * 1024;
 const MIN_BLOCKING_PRODUCERS: usize = 64;
 const MAX_BLOCKING_PRODUCERS: usize = 256;
-const EXTERNAL_OPUS_MAX_PACKET_BYTES: usize = 1_275;
-const DEFAULT_OPUS_BITRATE_BPS: u32 = 320_000;
-const MIN_OPUS_BITRATE_BPS: u32 = 500;
-const MAX_OPUS_BITRATE_BPS: u32 = 512_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamOutputConfig {
@@ -265,13 +261,10 @@ impl StreamRuntimeConfig {
     pub fn new(transport: RtpTransportConfig, source: SourceResolverConfig) -> Self {
         Self {
             output: StreamOutputConfig::Rtp(transport),
-            opus_bitrate_bps: DEFAULT_OPUS_BITRATE_BPS,
+            opus_bitrate_bps: OPUS_MUSIC_BITRATE_BPS,
             source,
             resources: Arc::new(RuntimeResources::default()),
-            buffer: MediaBufferConfig {
-                prebuffer_ms: PREBUFFER_MS,
-                ..MediaBufferConfig::default()
-            },
+            buffer: MediaBufferConfig::default(),
             rtcp_interval: RTCP_INTERVAL,
             attempt_start_timeout: ATTEMPT_START_TIMEOUT,
             on_event: None,
@@ -282,13 +275,10 @@ impl StreamRuntimeConfig {
     pub fn new_external_pull(source: SourceResolverConfig) -> Self {
         Self {
             output: StreamOutputConfig::ExternalPull,
-            opus_bitrate_bps: DEFAULT_OPUS_BITRATE_BPS,
+            opus_bitrate_bps: OPUS_MUSIC_BITRATE_BPS,
             source,
             resources: Arc::new(RuntimeResources::default()),
-            buffer: MediaBufferConfig {
-                prebuffer_ms: PREBUFFER_MS,
-                ..MediaBufferConfig::default()
-            },
+            buffer: MediaBufferConfig::default(),
             rtcp_interval: RTCP_INTERVAL,
             attempt_start_timeout: ATTEMPT_START_TIMEOUT,
             on_event: None,
@@ -300,7 +290,7 @@ impl StreamRuntimeConfig {
             StreamOutputConfig::Rtp(transport) => transport.validate()?,
             StreamOutputConfig::ExternalPull => {}
         }
-        if !(MIN_OPUS_BITRATE_BPS..=MAX_OPUS_BITRATE_BPS).contains(&self.opus_bitrate_bps) {
+        if !(OPUS_MIN_BITRATE_BPS..=OPUS_MAX_BITRATE_BPS).contains(&self.opus_bitrate_bps) {
             return Err(MusicStreamError::InvalidConfig(
                 "Opus bitrate must be between 500 and 512000 bps".to_owned(),
             ));
@@ -999,11 +989,11 @@ impl StreamRuntimeInner {
         );
         let max_packet_bytes = match &self.config.output {
             StreamOutputConfig::Rtp(transport) => transport.mtu.saturating_sub(12),
-            StreamOutputConfig::ExternalPull => EXTERNAL_OPUS_MAX_PACKET_BYTES,
+            StreamOutputConfig::ExternalPull => OPUS_MAX_PACKET_BYTES,
         };
         let opus = LibOpusEncoderConfig {
             max_packet_bytes,
-            bitrate_bps: Some(self.config.opus_bitrate_bps as i32),
+            bitrate_bps: self.config.opus_bitrate_bps,
             ..LibOpusEncoderConfig::default()
         };
         Ok(producer::spawn(ProducerSpec {

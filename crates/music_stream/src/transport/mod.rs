@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::{Bytes, BytesMut};
 
 use crate::audio::frame::OpusFrame;
+use crate::audio::opus::OPUS_SAMPLE_RATE_HZ;
 use crate::error::{MusicStreamError, Result};
 
 const RTP_HEADER_BYTES: usize = 12;
@@ -12,43 +13,7 @@ const MAX_RTP_DATAGRAM_BYTES: usize = 65_507;
 const MIN_RTP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_RTP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 const NTP_UNIX_EPOCH_OFFSET_SECS: u64 = 2_208_988_800;
-pub const RTP_OPUS_CLOCK_RATE_HZ: u32 = 48_000;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum RtpEncryptionConfig {
-    #[default]
-    None,
-    External {
-        mode: String,
-        secret_key: Option<Vec<u8>>,
-    },
-}
-
-impl RtpEncryptionConfig {
-    pub fn validate(&self) -> Result<()> {
-        match self {
-            Self::None => Ok(()),
-            Self::External { mode, secret_key } => {
-                if mode.trim().is_empty()
-                    || mode.len() > 64
-                    || secret_key
-                        .as_ref()
-                        .is_some_and(|key| key.is_empty() || key.len() > 4_096)
-                {
-                    return Err(MusicStreamError::InvalidConfig(
-                        "RTP protection mode and key must fit bounded non-empty limits".to_owned(),
-                    ));
-                }
-                Ok(())
-            }
-        }
-    }
-
-    #[must_use]
-    pub fn is_plaintext(&self) -> bool {
-        matches!(self, Self::None)
-    }
-}
+pub const RTP_OPUS_CLOCK_RATE_HZ: u32 = OPUS_SAMPLE_RATE_HZ;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RtpTransportConfig {
@@ -62,7 +27,6 @@ pub struct RtpTransportConfig {
     pub mtu: usize,
     pub rtcp_mux: bool,
     pub rtp_keepalive_interval: Option<Duration>,
-    pub encryption: RtpEncryptionConfig,
 }
 
 impl RtpTransportConfig {
@@ -79,7 +43,6 @@ impl RtpTransportConfig {
             mtu: DEFAULT_MTU,
             rtcp_mux: true,
             rtp_keepalive_interval: None,
-            encryption: RtpEncryptionConfig::None,
         }
     }
 
@@ -100,7 +63,7 @@ impl RtpTransportConfig {
                 "invalid RTP transport configuration".to_owned(),
             ));
         }
-        self.encryption.validate()
+        Ok(())
     }
 
     #[must_use]
@@ -141,16 +104,6 @@ pub struct RtpPacketizerConfig {
     pub payload_type: u8,
     pub ssrc: u32,
     pub mtu: usize,
-}
-
-impl Default for RtpPacketizerConfig {
-    fn default() -> Self {
-        Self {
-            payload_type: 96,
-            ssrc: 1,
-            mtu: DEFAULT_MTU,
-        }
-    }
 }
 
 impl RtpPacketizerConfig {

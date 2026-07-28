@@ -198,12 +198,6 @@ pub struct ReplayGainRecommendationOutput {
 }
 
 #[napi(object)]
-pub struct RtpEncryptionConfigInput {
-    pub mode: String,
-    pub secret_key: Option<Buffer>,
-}
-
-#[napi(object)]
 pub struct RtpTransportConfigInput {
     pub ip: String,
     pub port: u32,
@@ -215,20 +209,9 @@ pub struct RtpTransportConfigInput {
     pub mtu: Option<u32>,
     pub local_ip: Option<String>,
     pub local_port: Option<u32>,
-    pub encryption: Option<RtpEncryptionConfigInput>,
-}
-
-impl std::fmt::Debug for RtpEncryptionConfigInput {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RtpEncryptionConfigInput")
-            .field("mode", &self.mode)
-            .field(
-                "secret_key_len",
-                &self.secret_key.as_ref().map(|key| key.len()),
-            )
-            .finish()
-    }
+    /// Removed compatibility guard. Platform encryption belongs in its transport adapter.
+    #[napi(ts_type = "never")]
+    pub encryption: Option<bool>,
 }
 
 impl std::fmt::Debug for RtpTransportConfigInput {
@@ -245,7 +228,6 @@ impl std::fmt::Debug for RtpTransportConfigInput {
             .field("mtu", &self.mtu)
             .field("local_ip", &self.local_ip)
             .field("local_port", &self.local_port)
-            .field("encryption", &self.encryption)
             .finish()
     }
 }
@@ -306,16 +288,6 @@ pub struct SourceResolverConfigOutput {
 
 #[derive(Debug)]
 #[napi(object)]
-pub struct MediaBufferConfigInput {
-    pub decode_batch_ms: Option<i64>,
-    pub encoded_capacity_ms: Option<i64>,
-    pub prebuffer_ms: Option<i64>,
-    pub next_prime_ms: Option<i64>,
-    pub max_playout_lateness_ms: Option<i64>,
-}
-
-#[derive(Debug)]
-#[napi(object)]
 pub struct StartStreamInput {
     pub stream_id: String,
     pub current: TrackSourceInput,
@@ -325,7 +297,9 @@ pub struct StartStreamInput {
     /// The native music target remains 320000 bps when this is absent or higher.
     pub opus_bitrate_limit_bps: Option<i64>,
     pub source: Option<SourceResolverConfigInput>,
-    pub buffer: Option<MediaBufferConfigInput>,
+    /// Removed compatibility guard. Buffer policy is owned by the native runtime.
+    #[napi(ts_type = "never")]
+    pub buffer: Option<bool>,
     pub volume: Option<f64>,
     pub gain_db: Option<f64>,
     pub attempt_start_timeout_ms: Option<i64>,
@@ -341,7 +315,9 @@ pub struct StartExternalStreamInput {
     /// The native music target remains 320000 bps when this is absent or higher.
     pub opus_bitrate_limit_bps: Option<i64>,
     pub source: Option<SourceResolverConfigInput>,
-    pub buffer: Option<MediaBufferConfigInput>,
+    /// Removed compatibility guard. Buffer policy is owned by the native runtime.
+    #[napi(ts_type = "never")]
+    pub buffer: Option<bool>,
     pub volume: Option<f64>,
     pub gain_db: Option<f64>,
     pub attempt_start_timeout_ms: Option<i64>,
@@ -394,5 +370,4 @@ pub struct RtpTransportConfigOutput {
     pub mtu: u32,
     pub rtcp_mux: bool,
     pub rtp_keepalive_interval_ms: Option<u32>,
-    pub encryption_mode: String,
 }

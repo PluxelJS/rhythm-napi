@@ -32,11 +32,6 @@
 
 ## 尚需外部输入的生产扩展
 
-### RTP protection
-
-当前非 plaintext 配置 fail closed，但没有具体平台 packet protector。实现需要明确目标协议、密钥
-生命周期、nonce/rollover、RTCP 保护和网关兼容性，不能在缺少平台契约时猜测。
-
 ### 真实媒体与规模验证
 
 仍需用生产 corpus 和环境验证 AAC/M4A、ALAC、FLAC、OGG/Vorbis、VBR、超大 metadata、损坏文件、

@@ -48,4 +48,4 @@ pub use source::{
     HttpLiveStreamConfig, HttpSourceConfig, SharedSourceArtifactCache, SourceArtifactCache,
     SourceResolverConfig,
 };
-pub use transport::{RtcpReceiverReportSnapshot, RtpEncryptionConfig, RtpTransportConfig};
+pub use transport::{RtcpReceiverReportSnapshot, RtpTransportConfig};

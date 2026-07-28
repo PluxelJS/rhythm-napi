@@ -79,14 +79,6 @@ export interface HttpSourceConfigOutput {
   retryBackoffMs: number
 }
 
-export interface MediaBufferConfigInput {
-  decodeBatchMs?: number
-  encodedCapacityMs?: number
-  prebufferMs?: number
-  nextPrimeMs?: number
-  maxPlayoutLatenessMs?: number
-}
-
 /**
  * Bounded sender diagnostics. Counters are cumulative for the stream's persistent RTP sender,
  * including track switches; `bufferedMs` is the latest encoded queue depth.
@@ -142,11 +134,6 @@ export interface RtcpReceiverReportOutput {
   roundTripTimeMs?: number
 }
 
-export interface RtpEncryptionConfigInput {
-  mode: string
-  secretKey?: Buffer
-}
-
 export interface RtpTransportConfigInput {
   ip: string
   port: number
@@ -158,7 +145,8 @@ export interface RtpTransportConfigInput {
   mtu?: number
   localIp?: string
   localPort?: number
-  encryption?: RtpEncryptionConfigInput
+  /** Removed compatibility guard. Platform encryption belongs in its transport adapter. */
+  encryption?: never
 }
 
 export interface RtpTransportConfigOutput {
@@ -172,7 +160,6 @@ export interface RtpTransportConfigOutput {
   mtu: number
   rtcpMux: boolean
   rtpKeepaliveIntervalMs?: number
-  encryptionMode: string
 }
 
 /**
@@ -228,7 +215,8 @@ export interface StartExternalStreamInput {
    */
   opusBitrateLimitBps?: number
   source?: SourceResolverConfigInput
-  buffer?: MediaBufferConfigInput
+  /** Removed compatibility guard. Buffer policy is owned by the native runtime. */
+  buffer?: never
   volume?: number
   gainDb?: number
   attemptStartTimeoutMs?: number
@@ -245,7 +233,8 @@ export interface StartStreamInput {
    */
   opusBitrateLimitBps?: number
   source?: SourceResolverConfigInput
-  buffer?: MediaBufferConfigInput
+  /** Removed compatibility guard. Buffer policy is owned by the native runtime. */
+  buffer?: never
   volume?: number
   gainDb?: number
   attemptStartTimeoutMs?: number

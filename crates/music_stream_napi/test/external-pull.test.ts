@@ -27,7 +27,6 @@ test('external pull delivers paced Opus frames and commits progress with the nex
 		streamId,
 		current: { id: 'external', attemptId: 'attempt-external', kind: 'file', path: audioPath },
 		opusBitrateLimitBps: 128_000,
-		buffer: { prebufferMs: 20, encodedCapacityMs: 400, maxPlayoutLatenessMs: 40 },
 	})
 	expect(started.streamId).toBe(streamId)
 
@@ -100,7 +99,6 @@ test('external pull bounds concurrent reads and cancellation wakes a pending rea
 			kind: 'file',
 			path: audioPath,
 		},
-		buffer: { prebufferMs: 20, encodedCapacityMs: 400 },
 	})
 	await streamer.pauseStream(streamId)
 	const pending = streamer.pullExternalFrame(streamId)
@@ -131,7 +129,6 @@ test('external pull accepts the retired lease after seek and continues on the ne
 			path: audioPath,
 			seekable: true,
 		},
-		buffer: { prebufferMs: 20, encodedCapacityMs: 400 },
 	})
 	const beforeSeek = await streamer.pullExternalFrame(streamId)
 	const seeked = await streamer.seekStream(streamId, 1)
@@ -172,7 +169,6 @@ test('external pull stays parked while current is absent and resumes after a lat
 	await streamer.startExternalStream({
 		streamId,
 		current: { id: 'first', attemptId: 'attempt-first', kind: 'file', path: firstPath },
-		buffer: { prebufferMs: 20, encodedCapacityMs: 400 },
 	})
 	const first = await streamer.pullExternalFrame(streamId)
 	await streamer.reconcilePlan(streamId, { version: 1 })
@@ -212,7 +208,6 @@ test('external output unavailability is a stream error, not a track attempt fail
 	await streamer.startExternalStream({
 		streamId,
 		current: { id: 'failure', attemptId: 'attempt-failure', kind: 'file', path: audioPath },
-		buffer: { prebufferMs: 20, encodedCapacityMs: 400 },
 	})
 	const frame = await streamer.pullExternalFrame(streamId)
 	await streamer.finishExternalFrame(streamId, {
@@ -254,7 +249,6 @@ test('an abandoned retired frame lease fails the output within a fixed deadline'
 			path: audioPath,
 			seekable: true,
 		},
-		buffer: { prebufferMs: 20, encodedCapacityMs: 400 },
 	})
 	await streamer.pullExternalFrame(streamId)
 	await streamer.seekStream(streamId, 1)
@@ -291,7 +285,6 @@ test('external pull keeps a pending read alive across repeated automatic promoti
 	await streamer.startExternalStream({
 		streamId,
 		current: { id: 'a', attemptId: 'attempt-a', kind: 'file', path: paths[0] },
-		buffer: { prebufferMs: 20, encodedCapacityMs: 400 },
 	})
 	await streamer.reconcilePlan(streamId, {
 		version: 1,
