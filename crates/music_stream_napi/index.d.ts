@@ -222,11 +222,11 @@ export interface StartExternalStreamInput {
   streamId: string
   current: TrackSourceInput
   /**
-   * Target bitrate for the shared Opus encoder.
+   * Optional platform or channel bitrate ceiling for the shared Opus encoder.
    *
-   * @defaultValue 128000
+   * The native music target remains 320000 bps when this is absent or higher.
    */
-  opusBitrateBps?: number
+  opusBitrateLimitBps?: number
   source?: SourceResolverConfigInput
   buffer?: MediaBufferConfigInput
   volume?: number
@@ -239,11 +239,11 @@ export interface StartStreamInput {
   current: TrackSourceInput
   transport: RtpTransportConfigInput
   /**
-   * Target bitrate for the shared Opus encoder.
+   * Optional platform or channel bitrate ceiling for the shared Opus encoder.
    *
-   * @defaultValue 128000
+   * The native music target remains 320000 bps when this is absent or higher.
    */
-  opusBitrateBps?: number
+  opusBitrateLimitBps?: number
   source?: SourceResolverConfigInput
   buffer?: MediaBufferConfigInput
   volume?: number

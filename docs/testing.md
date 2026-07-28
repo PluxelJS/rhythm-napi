@@ -131,7 +131,7 @@ callsite，应使用保留debug symbol的profiling构建，strip后的Massif `Un
 
 ### 多路质量 soak
 
-N-API runner固定使用Opus complexity 10、128 kbps和现有高质量Rubato配置，循环播放确定性的
+N-API runner固定使用Opus complexity 10、320 kbps和现有高质量Rubato配置，循环播放确定性的
 44.1 kHz stereo非静音fixture，并持续补充next来覆盖promotion：
 
 ```sh

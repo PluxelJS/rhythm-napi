@@ -203,9 +203,9 @@ unity gain 对已经位于合法 float PCM 范围的输入不执行写回；异�
 ### Opus
 
 libopus 接收固定48 kHz stereo float frame，complexity固定为最高质量档10，不提供以并发换音质的
-降档配置。`opusBitrateBps` 属于两种 output 共用的 producer，N-API 未显式提供时使用音乐默认128 kbps；
-宿主负责遵守接收端协商上限，不能为名义高码率覆盖它。RTP payload上限来自`MTU - 12-byte RTP header`，
-external pull 使用有界 Opus packet 上限；编码结果直接进入 immutable `Bytes` frame。不要为“异步化”把编码
+降档配置。`opusBitrateLimitBps` 属于两种 output 共用的可选平台上限；native 音乐目标固定为320 kbps，
+上限更低时自动降到上限，宿主不能用它提高目标。RTP payload上限来自`MTU - 12-byte RTP header`，
+external pull 使用 Opus 规范的 1275-byte packet 上限；编码结果直接进入 immutable `Bytes` frame。不要为“异步化”把编码
 搬到Tokio worker，也不要在producer与output之间增加另一个channel。
 
 ## Opus queue

@@ -26,8 +26,8 @@ impl Default for LibOpusEncoderConfig {
         Self {
             sample_rate: 48_000,
             channels: 2,
-            max_packet_bytes: 1_500,
-            bitrate_bps: Some(128_000),
+            max_packet_bytes: 1_275,
+            bitrate_bps: Some(320_000),
             complexity: 10,
             vbr: true,
             constrained_vbr: true,
@@ -166,7 +166,7 @@ mod tests {
         assert_eq!(encoded.samples_per_channel, 960);
         assert_eq!(encoded.duration_ms, 20);
         assert!(!encoded.payload.is_empty());
-        assert!(encoded.payload.len() <= 1_500);
+        assert!(encoded.payload.len() <= 1_275);
         assert!(encoded.marker);
     }
 

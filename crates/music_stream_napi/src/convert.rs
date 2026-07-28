@@ -10,18 +10,20 @@ use music_stream::{
 
 use crate::types::*;
 
-pub(crate) fn opus_bitrate_from_input(
+pub(crate) fn apply_opus_bitrate_limit(
+    target_bps: u32,
     input: Option<i64>,
-) -> std::result::Result<Option<u32>, MusicStreamError> {
-    input
+) -> std::result::Result<u32, MusicStreamError> {
+    let limit = input
         .map(|value| {
             u32::try_from(value).map_err(|_| {
                 MusicStreamError::InvalidConfig(
-                    "Opus bitrate must fit in a positive u32".to_owned(),
+                    "Opus bitrate limit must fit in a positive u32".to_owned(),
                 )
             })
         })
-        .transpose()
+        .transpose()?;
+    Ok(limit.map_or(target_bps, |limit| target_bps.min(limit)))
 }
 
 impl TryFrom<ExternalOpusFrameAckInput> for ExternalFrameAck {
@@ -651,6 +653,22 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn platform_bitrate_limit_can_only_lower_the_music_target() {
+        assert_eq!(
+            apply_opus_bitrate_limit(320_000, None).expect("default"),
+            320_000
+        );
+        assert_eq!(
+            apply_opus_bitrate_limit(320_000, Some(128_000)).expect("lower ceiling"),
+            128_000
+        );
+        assert_eq!(
+            apply_opus_bitrate_limit(320_000, Some(512_000)).expect("higher ceiling"),
+            320_000
+        );
+    }
 
     #[test]
     fn track_format_hint_is_normalized_and_validated() {

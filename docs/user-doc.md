@@ -144,7 +144,7 @@ const status = await streamer.startStream({
     url: signedNextUrl,
     formatHint: 'mp3',
   },
-  opusBitrateBps: 128_000,
+  opusBitrateLimitBps: 128_000,
   transport: {
     ip: gatewayIp,
     port: gatewayRtpPort,
@@ -184,6 +184,9 @@ const status = await streamer.startStream({
   gainDb: 0,
 })
 ```
+
+native 音乐目标为 320 kbps。`opusBitrateLimitBps` 只在平台或频道存在更低上限时传入；省略或传入更高值
+都不会把目标提高到 320 kbps 以上。buffer 使用 native 统一默认值，普通平台 adapter 不需要重复传入。
 
 启动 Promise 返回表示 runtime、sender 和 current generation 已建立，不等于第一包已经发送。
 状态通常先是 `buffering`，prebuffer ready 后通过状态事件进入 `playing`。

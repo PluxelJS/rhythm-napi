@@ -320,10 +320,10 @@ pub struct StartStreamInput {
     pub stream_id: String,
     pub current: TrackSourceInput,
     pub transport: RtpTransportConfigInput,
-    /// Target bitrate for the shared Opus encoder.
+    /// Optional platform or channel bitrate ceiling for the shared Opus encoder.
     ///
-    /// @defaultValue 128000
-    pub opus_bitrate_bps: Option<i64>,
+    /// The native music target remains 320000 bps when this is absent or higher.
+    pub opus_bitrate_limit_bps: Option<i64>,
     pub source: Option<SourceResolverConfigInput>,
     pub buffer: Option<MediaBufferConfigInput>,
     pub volume: Option<f64>,
@@ -336,10 +336,10 @@ pub struct StartStreamInput {
 pub struct StartExternalStreamInput {
     pub stream_id: String,
     pub current: TrackSourceInput,
-    /// Target bitrate for the shared Opus encoder.
+    /// Optional platform or channel bitrate ceiling for the shared Opus encoder.
     ///
-    /// @defaultValue 128000
-    pub opus_bitrate_bps: Option<i64>,
+    /// The native music target remains 320000 bps when this is absent or higher.
+    pub opus_bitrate_limit_bps: Option<i64>,
     pub source: Option<SourceResolverConfigInput>,
     pub buffer: Option<MediaBufferConfigInput>,
     pub volume: Option<f64>,

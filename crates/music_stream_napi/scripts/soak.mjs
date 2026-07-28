@@ -76,7 +76,6 @@ try {
   await Promise.all(streamIds.map((streamId, index) => streamer.startStream({
     streamId,
     current: track(streamId, 0),
-    opusBitrateBps: 128_000,
     transport: {
       ip: '127.0.0.1',
       port: sinkPort,
@@ -103,7 +102,7 @@ try {
     sampleSeconds: options.sampleSeconds,
     fixtureSeconds: options.fixtureSeconds,
     opusComplexity: 10,
-    opusBitrate: 128_000,
+    opusBitrate: 320_000,
   }))
 
   const deadline = performance.now() + options.durationSeconds * 1_000

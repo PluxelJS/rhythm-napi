@@ -49,8 +49,8 @@ const MAX_TEMPFILE_BYTES: u64 = 1024 * 1024 * 1024;
 const TEMPFILE_QUOTA_BYTES: u64 = 1024 * 1024;
 const MIN_BLOCKING_PRODUCERS: usize = 64;
 const MAX_BLOCKING_PRODUCERS: usize = 256;
-const EXTERNAL_OPUS_MAX_PACKET_BYTES: usize = 1_500;
-const DEFAULT_OPUS_BITRATE_BPS: u32 = 128_000;
+const EXTERNAL_OPUS_MAX_PACKET_BYTES: usize = 1_275;
+const DEFAULT_OPUS_BITRATE_BPS: u32 = 320_000;
 const MIN_OPUS_BITRATE_BPS: u32 = 500;
 const MAX_OPUS_BITRATE_BPS: u32 = 512_000;
 
@@ -1145,6 +1145,11 @@ mod tests {
     #[test]
     fn default_runtime_uses_twenty_millisecond_opus_frames() {
         assert_eq!(FRAME_SAMPLES * 1_000 / SAMPLE_RATE, 20);
+        assert_eq!(
+            StreamRuntimeConfig::new_external_pull(SourceResolverConfig::default())
+                .opus_bitrate_bps,
+            320_000
+        );
     }
 
     #[test]
