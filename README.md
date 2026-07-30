@@ -44,6 +44,7 @@ file / URL / live / HLS ───> decode → resample → DSP → Opus ──�
 
 - [设计总览](docs/architecture.md)：问题边界、所有权、核心决策与理由。
 - [运行模型](docs/runtime.md)：状态、任务、背压、暂停、失败和关闭语义。
+- [CPU 执行与调度](docs/cpu-execution.md)：Tokio blocking、CPU lease、Rayon 取舍和重评条件。
 - [首包延迟](docs/latency.md)：没下完即播放的流水线、退化条件和后续优化重点。
 - [具体实现](docs/implementation.md)：source、音频管线、传输和实现约束。
 - [使用指南](docs/user-doc.md)：宿主如何正确驱动播放器并处理事件与错误。

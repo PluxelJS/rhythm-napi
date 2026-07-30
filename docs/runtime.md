@@ -21,6 +21,9 @@ producer worker 先异步等待 source 和资源 admission，只有真正要进�
 producer 额度并创建 `spawn_blocking`。blocking task 内部以短 turn 获取 CPU lease；在等待 source
 字节、满 Opus queue 或 worker event capacity 时释放 lease。
 
+Tokio blocking pool只提供同步线程，真实 CPU并发、current/next优先级和重评执行器的条件见
+[CPU 执行与调度设计](cpu-execution.md)。
+
 sender task 独立执行 queue receive、prebuffer、`sleep_until`、packetize、UDP 和 RTCP。producer
 退出、panic 或失败由 supervisor 转换成 generation-scoped worker event；已经事件化的媒体失败在
 stop 时不会重复上报。supervisor 自身失败和退出超时才升级为 runtime failure。

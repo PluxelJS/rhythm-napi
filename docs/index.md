@@ -7,8 +7,9 @@
 
 1. [architecture.md](architecture.md)：先理解系统解决什么问题、边界在哪里、谁拥有什么。
 2. [runtime.md](runtime.md)：再理解一次播放如何启动、流转、暂停、失败和结束。
-3. [latency.md](latency.md)：理解零起点 URL 如何边下载边播放，以及首包的真实退化边界。
-4. [implementation.md](implementation.md)：最后进入 source、codec、queue 和 RTP 的实现约束。
+3. [cpu-execution.md](cpu-execution.md)：理解 async/blocking 分层、CPU 优先级和执行器取舍。
+4. [latency.md](latency.md)：理解零起点 URL 如何边下载边播放，以及首包的真实退化边界。
+5. [implementation.md](implementation.md)：最后进入 source、codec、queue 和 RTP 的实现约束。
 
 面向 Node.js 宿主的接入者直接阅读 [user-doc.md](user-doc.md)。它按业务工作流说明如何组织
 source、current/next、事件、错误恢复和 shutdown，不复制生成的 TypeScript API 清单。
