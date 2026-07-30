@@ -8,6 +8,7 @@ use tokio::time::Instant;
 
 use super::StreamRuntimeProgress;
 use super::opus_queue::OpusQueueReceiver;
+use super::playout_clock::PlayoutClock;
 use crate::error::{MusicStreamError, Result};
 use crate::session::WorkerEvent;
 
@@ -285,6 +286,7 @@ struct ActiveMedia {
     started: bool,
     prebuffer_reported: bool,
     deadline: Option<Instant>,
+    playout_clock: PlayoutClock,
     media_sent_ms: u64,
 }
 
@@ -293,8 +295,8 @@ struct Lease {
     id: u32,
     generation: u64,
     duration_ms: u64,
+    samples_per_channel: u32,
     payload_len: usize,
-    delivered_at: Instant,
     expires_at: Instant,
 }
 
@@ -355,8 +357,10 @@ async fn run_worker(
                 && !paused
                 && (buffered_ms >= prebuffer_ms || (source_closed && buffered_ms > 0))
             {
+                let now = Instant::now();
                 media.started = true;
-                media.deadline = Some(Instant::now());
+                media.deadline = Some(now);
+                media.playout_clock.reanchor(now);
                 if !media.prebuffer_reported {
                     emit_event(
                         &events,
@@ -404,6 +408,7 @@ async fn run_worker(
                             started: false,
                             prebuffer_reported: false,
                             deadline: None,
+                            playout_clock: PlayoutClock::default(),
                             media_sent_ms: 0,
                         });
                         paused = initial_paused;
@@ -425,7 +430,11 @@ async fn run_worker(
                     Some(Command::Resume { generation, reply }) => {
                         if let Some(media) = active.as_mut().filter(|media| media.generation == generation) {
                             paused = false;
-                            media.deadline = Some(Instant::now());
+                            let now = Instant::now();
+                            media.deadline = Some(now);
+                            if media.started {
+                                media.playout_clock.reanchor(now);
+                            }
                         }
                         let _ = reply.send(Ok(()));
                     }
@@ -508,23 +517,23 @@ async fn run_worker(
             } => {
                 let Some(media) = active.as_mut() else { continue; };
                 let Some(reply) = pending_pull.take() else { continue; };
-                let mut scheduled_deadline = media.deadline.unwrap_or_else(Instant::now);
-                let observed_lateness = Instant::now().saturating_duration_since(scheduled_deadline);
+                let scheduled_deadline = media.deadline.unwrap_or_else(Instant::now);
+                let observed_lateness = media.playout_clock.lateness(Instant::now());
                 stats.max_lateness_ms = stats.max_lateness_ms.max(
                     u64::try_from(observed_lateness.as_millis()).unwrap_or(u64::MAX),
                 );
                 let mut recovered = false;
-                while Instant::now().saturating_duration_since(scheduled_deadline)
-                    > max_playout_lateness
-                {
+                while media.playout_clock.lateness(Instant::now()) > max_playout_lateness {
                     let Some(stale) = media.receiver.try_drop_oldest_if_followed() else {
                         break;
                     };
                     recovered = true;
                     stats.dropped_frames = stats.dropped_frames.saturating_add(1);
                     stats.dropped_media_ms = stats.dropped_media_ms.saturating_add(stale.duration_ms);
+                    media
+                        .playout_clock
+                        .advance_samples(stale.samples_per_channel, Instant::now());
                     media.media_sent_ms = media.media_sent_ms.saturating_add(stale.duration_ms);
-                    scheduled_deadline += Duration::from_millis(stale.duration_ms.max(1));
                 }
                 if recovered {
                     stats.latency_recoveries = stats.latency_recoveries.saturating_add(1);
@@ -540,8 +549,11 @@ async fn run_worker(
                 let lease_id = next_lease_id;
                 next_lease_id = next_lease_id.wrapping_add(1).max(1);
                 let now = Instant::now();
-                let send_deadline = scheduled_deadline + max_playout_lateness;
+                let send_deadline = media
+                    .playout_clock
+                    .deadline_with_tolerance(now, max_playout_lateness);
                 let duration_ms = frame.duration_ms;
+                let samples_per_channel = frame.samples_per_channel;
                 let payload_len = frame.payload.len();
                 let output = ExternalOpusFrame {
                     lease_id,
@@ -558,8 +570,8 @@ async fn run_worker(
                     id: lease_id,
                     generation: media.generation,
                     duration_ms,
+                    samples_per_channel,
                     payload_len,
-                    delivered_at: now,
                     expires_at: now + LEASE_TIMEOUT,
                 }));
                 media.deadline = Some(scheduled_deadline);
@@ -648,18 +660,17 @@ fn apply_ack(
     match ack.outcome {
         ExternalFrameOutcome::Sent | ExternalFrameOutcome::Late => {
             media.media_sent_ms = media.media_sent_ms.saturating_add(current.duration_ms);
+            media
+                .playout_clock
+                .advance_samples(current.samples_per_channel, Instant::now());
             record_ack_stats(stats, &current, ack.outcome);
             let duration = Duration::from_millis(current.duration_ms.max(1));
             let anchored = media.deadline.unwrap_or_else(Instant::now) + duration;
             let now = Instant::now();
-            let acknowledgement_late =
-                now.saturating_duration_since(current.delivered_at) > duration;
-            // A delayed consumer must expose its accumulated lateness to the next pull so stale
-            // queued media is discarded. Once the consumer is prompt again, re-anchor exactly as
-            // the RTP sender does to avoid a burst of catch-up packets.
-            media.deadline = Some(if acknowledgement_late {
-                anchored
-            } else if anchored <= now {
+            // Keep delivery paced at no more than one frame per media duration. The persistent
+            // playout clock, rather than this local wake-up, retains consumer delay and exposes
+            // accumulated lateness to the next pull without producing a catch-up burst.
+            media.deadline = Some(if anchored <= now {
                 now + duration
             } else {
                 anchored
@@ -761,7 +772,13 @@ fn flush_events(sender: &mpsc::Sender<WorkerEvent>, pending: &mut VecDeque<Worke
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
+    use crate::audio::frame::OpusFrame;
+    use crate::audio::opus::{OPUS_FRAME_DURATION_MS, OPUS_FRAME_SAMPLES};
+    use crate::runtime::opus_queue;
 
     #[tokio::test]
     async fn worker_panic_is_published_as_an_output_failure() {
@@ -782,5 +799,65 @@ mod tests {
             }
         ));
         assert!(supervisor.await.expect("supervisor").is_err());
+    }
+
+    #[tokio::test]
+    async fn repeated_prompt_but_slow_consumers_trigger_cumulative_lateness_recovery() {
+        let (events, _event_rx) = mpsc::channel(4);
+        let output = ExternalPullHandle::spawn(20, 100, events);
+        let (producer, receiver) = opus_queue::bounded(800);
+        let cancellation = CancellationToken::new();
+        for position in 0..40 {
+            producer
+                .send_blocking(
+                    OpusFrame {
+                        generation: 1,
+                        payload: Bytes::from_static(b"opus"),
+                        samples_per_channel: OPUS_FRAME_SAMPLES,
+                        duration_ms: OPUS_FRAME_DURATION_MS,
+                        marker: false,
+                        track_position_samples: u64::from(position * OPUS_FRAME_SAMPLES),
+                    },
+                    &cancellation,
+                )
+                .expect("queue frame");
+        }
+        output
+            .activate(1, 0, false, receiver)
+            .await
+            .expect("activate");
+
+        let mut frame = output
+            .pull(None)
+            .await
+            .expect("initial pull")
+            .expect("initial frame");
+        let initial_progress = output.progress();
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(70)).await;
+            frame = output
+                .pull(Some(ExternalFrameAck {
+                    lease_id: frame.lease_id,
+                    generation: frame.generation,
+                    outcome: ExternalFrameOutcome::Sent,
+                }))
+                .await
+                .expect("pull after delayed consumer acknowledgement")
+                .expect("next frame");
+        }
+
+        let progress = output.progress();
+        assert!(progress.max_lateness_ms > 100);
+        assert!(progress.dropped_frames > initial_progress.dropped_frames);
+        assert!(progress.latency_recoveries > initial_progress.latency_recoveries);
+        output
+            .finish(ExternalFrameAck {
+                lease_id: frame.lease_id,
+                generation: frame.generation,
+                outcome: ExternalFrameOutcome::Sent,
+            })
+            .await
+            .expect("finish last frame");
+        output.shutdown().await.expect("shutdown");
     }
 }

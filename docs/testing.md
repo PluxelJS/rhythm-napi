@@ -71,11 +71,18 @@ localhost UDP 测试必须观察真实 packet，而不是只检查内部计数�
 
 - 首包 marker、SSRC、sequence 和 timestamp；
 - pacing 不 burst；
+- 反复20至100 ms亚阈值scheduler/CPU停顿会按持久媒体时钟累计，超过上限后丢旧帧恢复；
 - 文件、渐进 URL 和 finite live 能完成 decode → Opus → RTP；
 - next promotion、switch 和 seek 不重建 session；
 - pause 期间停止 playout，resume 从同一 session 继续；
 - RTCP mux/non-mux、SR 和 RR status；
 - 慢 source 不占用 sender deadline。
+
+故障注入按真实边界分层：sender单线程测试用反复70 ms同步停顿验证累计迟滞、drop、timestamp与
+sequence；external pull用延迟ack验证慢消费者遵循同一媒体时钟；playout flow用暂停live body验证慢
+HTTP/source不占sender；source测试用零tempfile permit验证磁盘压力不占HTTP slot；RTCP quality测试
+注入loss/jitter/RTT snapshot验证网络退化只形成宿主策略输入。UDP接收端主动丢包或重排不会反向改变
+sender，因此网络恢复能力必须在真实接收端/jitter buffer测试，不能伪装成发送端单元测试。
 
 ### N-API 测试
 

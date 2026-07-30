@@ -316,7 +316,7 @@ current failure可能已经 promotion 到 next，不能看到 `error` 就无条�
 | 参数组 | 默认思路 | 调大后的主要代价 |
 | --- | --- | --- |
 | prebuffer 100 ms | 小范围网络/CPU 抖动 | 首包更慢 |
-| encoded capacity 400 ms | 有界 producer/sender 解耦 | 每流内存和可积累延迟增加 |
+| encoded capacity 800 ms | 有界 producer/sender 解耦 | 每流内存和可积累延迟增加 |
 | next prime 200 ms | 低 promotion 延迟 | preload CPU/内存增加 |
 | max lateness 100 ms | 实时优先，严重 stall 后追赶 | 更大值保留更多延迟 |
 | URL max 256 MiB | 有界歌曲 artifact | 需要更大 tempfile worst-case reservation |
@@ -336,7 +336,8 @@ sender lateness 和 Node event-loop delay，再调整最接近瓶颈的一层。
 
 - `bufferedMs`：最新encoded queue深度；持续贴近0且`underruns`增长表示producer/source供给不足；
 - `droppedFrames`/`droppedMediaMs`与`latencyRecoveries`：sender为恢复实时性丢弃的旧媒体；
-- `maxLatenessMs`：该sender生命周期观察到的最大deadline迟滞；
+- `maxLatenessMs`：该sender生命周期中，相对持久媒体时钟观察到的最大累计播放落后；它不会因本地
+  pacing为避免burst而重置相邻包deadline被清零，但pause/resume和underrun重新prebuffer会建立新基准；
 - `packetsSent`/`bytesSent`、`sequence`/`rtpTimestamp`：实际成功交给UDP的累计进度和RTP clock。
 
 计数跨switch、seek和promotion累计，因为sender不会随track重建。10/50路soak应每1至5秒用

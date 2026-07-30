@@ -12,6 +12,7 @@ use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 
 mod external_pull;
 mod opus_queue;
+mod playout_clock;
 mod producer;
 mod sender;
 

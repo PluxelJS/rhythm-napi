@@ -66,7 +66,7 @@ promotion。`activation_to_prebuffer_us` 记录从 generation 激活到 prebuffe
 
 完整首包分解、渐进格式边界和优化判断见 [latency.md](latency.md)。
 
-默认媒体参数是 20 ms Opus frame、100 ms prebuffer、400 ms encoded capacity、200 ms next prime、
+默认媒体参数是 20 ms Opus frame、100 ms prebuffer、800 ms encoded capacity、200 ms next prime、
 80 ms decode batch 和 100 ms最大 playout lateness。这些值表达低延迟与抗抖动之间的默认折中，
 不是吞吐越大越好的缓存目标。
 
@@ -195,20 +195,31 @@ sender 每个 deadline 最多发送一帧，绝不通过 burst 清空 backlog：
 
 ```text
 wait for prebuffer
-deadline = now
+playout_clock = now
+pacing_deadline = now
 loop:
-  sleep_until(deadline)
-  while lateness exceeds limit and a newer frame exists:
+  sleep_until(pacing_deadline)
+  accumulated_lateness = now - playout_clock
+  while accumulated_lateness exceeds limit and a newer frame exists:
     drop oldest stale frame
     advance RTP timestamp and media position
+    advance playout_clock by dropped media samples
   send one frame
   increment sequence only after successful UDP send
-  schedule next frame deadline
+  advance playout_clock by sent media samples
+  schedule the next pacing deadline without a catch-up burst
 ```
 
 丢弃的媒体推进 timestamp，因为接收端媒体时钟必须跳过那段时间；sequence 不推进，因为没有 RTP
 packet。唯一可播放帧不会因暂时 starve 被丢掉。underrun 后 sender 重新等待 prebuffer，并从新的
 wall-clock base 恢复，不倒退 RTP clock。
+
+`pacing_deadline`只约束相邻包不会突发；独立的`playout_clock`是下一媒体sample应对应的持久
+wall-clock投影。单次20至100 ms调度停顿可以重置本地pacing deadline，但不能抹掉已经形成的媒体
+落后；反复亚阈值停顿会累计，并在总落后超过max playout lateness后触发丢帧恢复。pause、显式
+resume和underrun重新prebuffer会重建wall-clock基准，因此用户暂停或source断粮时间不被误算成应
+跳过的音乐。`pacing_late_us`记录单次scheduler deadline迟到，`playout_late_us`和
+`maxLatenessMs`记录相对持久媒体时钟的累计落后。
 
 sender通过watch保留最新progress。Node查询status时可读取`playoutDiagnostics`：`bufferedMs`是当前
 encoded queue深度，其余packet/byte、underrun、drop和recovery计数在同一persistent sender生命周期

@@ -216,8 +216,10 @@ queue capacity 和水位都以媒体毫秒表示。blocking sender 满载时通�
 通过 watch 观察 buffered duration 和 sender lifetime。最后一个 producer sender guard drop 后才
 标记 source closed，确保 failure event 有机会先到 actor，而不是被 sender 误判为正常 drained。
 
-迟滞恢复只在至少还有一个后继 frame 时丢弃最旧 frame；唯一可播 frame 保留。receiver drop 会清空
-queue、关闭写端并唤醒所有 producer。
+迟滞恢复只在至少还有一个后继 frame 时丢弃最旧 frame；唯一可播 frame 保留。RTP sender与external
+pull各自维护独立于本地wake-up deadline的持久媒体时钟，实发或丢弃都按sample推进。这样为避免burst
+而重置相邻包deadline时不会抹掉累计落后；pause/resume或underrun重新prebuffer才允许重建wall-clock
+基准。receiver drop会清空queue、关闭写端并唤醒所有producer。
 
 next producer 在 prime 水位发布 ready 后等待 promotion，而不是继续填满更大的 encoded
 capacity。promotion 是身份转换：释放 blocking preload permit，提升共享 URL subscriber，
@@ -263,7 +265,7 @@ underrun、RTP lateness/drop、RTCP 和 stop/shutdown 收敛。
 
 N-API 宿主不需要安装 Rust recorder才能做容量巡检：查询 status 时会得到可选
 `playoutDiagnostics`，包含最新 encoded queue深度和 persistent sender累计的 packet/byte、underrun、
-lateness recovery、drop、max lateness及RTP clock。状态事件来自actor提交点，可能不带这份sender
+lateness recovery、drop、累计媒体时钟max lateness及RTP clock。状态事件来自actor提交点，可能不带这份sender
 快照；监控应使用`getStatus`/`getStatuses`，按相邻样本差值计算区间事件率。
 
 `getResourceDiagnostics` 是另一条按需控制面快照：报告 stream、HTTP、tempfile、blocking、live byte 的

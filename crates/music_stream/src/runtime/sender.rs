@@ -9,6 +9,7 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use super::StreamRuntimeProgress;
 use super::opus_queue::OpusQueueReceiver;
+use super::playout_clock::PlayoutClock;
 use crate::audio::frame::OpusFrame;
 use crate::audio::opus::{OPUS_FRAME_DURATION_MS, OPUS_FRAME_SAMPLES};
 use crate::error::{MusicStreamError, Result};
@@ -263,6 +264,7 @@ struct ActiveMedia {
     prebuffer_reported: bool,
     first_packet: bool,
     deadline: Option<Instant>,
+    playout_clock: PlayoutClock,
     media_sent_ms: u64,
     activation_started: Option<Instant>,
     first_packet_started: Option<Instant>,
@@ -401,8 +403,10 @@ async fn run_sender(
                 && !paused
                 && (buffered_ms >= prebuffer_ms || (source_closed && buffered_ms > 0))
             {
+                let now = Instant::now();
                 media.started = true;
-                media.deadline = Some(Instant::now());
+                media.deadline = Some(now);
+                media.playout_clock.reanchor(now);
                 metrics::counter!("music_stream.runtime.prebuffer_ready").increment(1);
                 if let Some(started) = media.activation_started.take() {
                     metrics::histogram!("music_stream.runtime.activation_to_prebuffer_us")
@@ -451,6 +455,7 @@ async fn run_sender(
                             prebuffer_reported: false,
                             first_packet: true,
                             deadline: None,
+                            playout_clock: PlayoutClock::default(),
                             media_sent_ms: 0,
                             activation_started,
                             first_packet_started: activation_started,
@@ -479,7 +484,11 @@ async fn run_sender(
                     Some(SenderCommand::Resume { generation, reply }) => {
                         if let Some(media) = active.as_mut().filter(|media| media.generation == generation) {
                             paused = false;
-                            media.deadline = Some(Instant::now());
+                            let now = Instant::now();
+                            media.deadline = Some(now);
+                            if media.started {
+                                media.playout_clock.reanchor(now);
+                            }
                             media.first_packet = true;
                             if !media.started {
                                 let activation_started = Instant::now();
@@ -510,18 +519,20 @@ async fn run_sender(
                 }
             } => {
                 let Some(media) = active.as_mut() else { continue; };
-                let mut scheduled_deadline = media.deadline.unwrap_or_else(Instant::now);
-                let observed_lateness = Instant::now().saturating_duration_since(scheduled_deadline);
+                let scheduled_deadline = media.deadline.unwrap_or_else(Instant::now);
+                let now = Instant::now();
+                let scheduler_lateness = now.saturating_duration_since(scheduled_deadline);
+                let observed_lateness = media.playout_clock.lateness(now);
                 max_lateness_ms = max_lateness_ms.max(
                     u64::try_from(observed_lateness.as_millis()).unwrap_or(u64::MAX),
                 );
                 metrics::histogram!("music_stream.runtime.pacing_late_us")
+                    .record(scheduler_lateness.as_micros() as f64);
+                metrics::histogram!("music_stream.runtime.playout_late_us")
                     .record(observed_lateness.as_micros() as f64);
 
                 let mut recovered = false;
-                while Instant::now().saturating_duration_since(scheduled_deadline)
-                    > max_playout_lateness
-                {
+                while media.playout_clock.lateness(Instant::now()) > max_playout_lateness {
                     let Some(stale) = media.receiver.try_drop_oldest_if_followed() else {
                         break;
                     };
@@ -529,8 +540,10 @@ async fn run_sender(
                     dropped_frames = dropped_frames.saturating_add(1);
                     dropped_media_ms = dropped_media_ms.saturating_add(stale.duration_ms);
                     rtp_clock.advance_samples(stale.samples_per_channel, Instant::now());
+                    media
+                        .playout_clock
+                        .advance_samples(stale.samples_per_channel, Instant::now());
                     media.media_sent_ms = media.media_sent_ms.saturating_add(stale.duration_ms);
-                    scheduled_deadline += Duration::from_millis(stale.duration_ms.max(1));
                     metrics::counter!("music_stream.runtime.late_frames_dropped").increment(1);
                     metrics::counter!("music_stream.runtime.late_media_ms_dropped")
                         .increment(stale.duration_ms);
@@ -586,6 +599,7 @@ async fn run_sender(
                             }
                             sequence = sequence.wrapping_add(1);
                             rtp_clock.advance_samples(samples, Instant::now());
+                            media.playout_clock.advance_samples(samples, Instant::now());
                             media.media_sent_ms = media.media_sent_ms.saturating_add(duration_ms);
                             let duration = Duration::from_millis(duration_ms.max(1));
                             let anchored = scheduled_deadline + duration;
@@ -1160,6 +1174,82 @@ mod tests {
         );
         assert_eq!(progress.dropped_media_ms, progress.dropped_frames * 20);
         assert_eq!(progress.latency_recoveries, 1);
+
+        sender.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn repeated_subthreshold_cpu_stalls_recover_against_the_persistent_media_clock() {
+        let remote = UdpSocket::bind("127.0.0.1:0").await.expect("remote");
+        let mut config = RtpTransportConfig::new(
+            "127.0.0.1",
+            remote.local_addr().expect("remote address").port(),
+            81,
+        );
+        config.local_ip = "127.0.0.1".to_owned();
+        let (events, _event_rx) = mpsc::channel(4);
+        let sender = SenderHandle::spawn(config, 20, 100, Duration::from_secs(60), events)
+            .await
+            .expect("sender");
+        let (output, receiver) = opus_queue::bounded(800);
+        let cancellation = CancellationToken::new();
+        for position in 0..40 {
+            output
+                .send_blocking(
+                    OpusFrame {
+                        generation: 1,
+                        payload: Bytes::from_static(b"opus"),
+                        samples_per_channel: OPUS_FRAME_SAMPLES,
+                        duration_ms: OPUS_FRAME_DURATION_MS,
+                        marker: false,
+                        track_position_samples: u64::from(position * OPUS_FRAME_SAMPLES),
+                    },
+                    &cancellation,
+                )
+                .expect("queue frame");
+        }
+        sender
+            .activate(1, 0, false, receiver)
+            .await
+            .expect("activate");
+
+        let mut packet = [0_u8; 1_500];
+        let first_len = tokio::time::timeout(Duration::from_secs(1), remote.recv(&mut packet))
+            .await
+            .expect("first RTP timeout")
+            .expect("first RTP receive");
+        assert!(first_len >= 12);
+        let first_sequence = u16::from_be_bytes([packet[2], packet[3]]);
+        let first_timestamp = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+        let initial_progress = sender.progress();
+
+        let mut last_sequence = first_sequence;
+        let mut last_timestamp = first_timestamp;
+        for _ in 0..3 {
+            // Each individual pause is below max_playout_lateness, but because it exceeds one
+            // media frame it contributes about 50 ms of persistent media lag.
+            std::thread::sleep(Duration::from_millis(70));
+            let len = tokio::time::timeout(Duration::from_secs(1), remote.recv(&mut packet))
+                .await
+                .expect("RTP timeout after injected CPU stall")
+                .expect("RTP receive after injected CPU stall");
+            assert!(len >= 12);
+            last_sequence = u16::from_be_bytes([packet[2], packet[3]]);
+            last_timestamp = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
+        }
+
+        let progress = sender.progress();
+        let dropped_during_stalls = progress
+            .dropped_frames
+            .saturating_sub(initial_progress.dropped_frames);
+        assert!(progress.max_lateness_ms > 100);
+        assert!(dropped_during_stalls > 0);
+        assert!(progress.latency_recoveries > initial_progress.latency_recoveries);
+        assert_eq!(last_sequence, first_sequence.wrapping_add(3));
+        assert_eq!(
+            last_timestamp.wrapping_sub(first_timestamp),
+            u32::try_from(dropped_during_stalls + 3).expect("frame count") * OPUS_FRAME_SAMPLES
+        );
 
         sender.shutdown().await.expect("shutdown");
     }
