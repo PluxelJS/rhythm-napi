@@ -94,7 +94,7 @@ PCM）为：fake encoder 约 176 µs，libopus pipeline 约 39.1 ms，约 128 �
 
 | 阶段/fixture | 媒体时长 | 运行时间 | 约实时倍数 |
 | --- | ---: | ---: | ---: |
-| Rubato mono 44.1→stereo 48 kHz | 5 s | 22.2 ms | 225x |
+| Rubato mono 44.1→stereo 48 kHz | 5 s | 16.0 ms | 313x |
 | Opus stereo 48 kHz complexity 10 | 5 s | 35.1 ms | 142x |
 | MP3完整pipeline | 0.25 s | 5.07 ms | 49x |
 | FLAC完整pipeline | 0.20 s | 3.98 ms | 50x |
@@ -110,8 +110,9 @@ cargo bench --bench criterion_media -- --save-baseline before
 cargo bench --bench criterion_media -- --baseline before
 ```
 
-结果显示生产常见44.1 kHz输入不能只看Opus：Rubato也是主要CPU阶段；下一步优化应按真实曲库的
-格式占比和并发尾延迟排序。
+结果显示生产常见44.1 kHz输入不能只看Opus：Rubato也是主要CPU阶段。mono-first resample 保持原
+质量参数和 bit-for-bit stereo 输出，在受控基线中让独立阶段中位时间下降约41%，并让五种完整pipeline
+下降约3%至19%；后续优化仍应按真实曲库的格式占比和并发尾延迟排序。
 
 音乐播放采用质量优先基线：Opus complexity固定为10，Rubato默认质量参数不因吞吐测试下调。
 benchmark用于寻找等质量实现中的CPU、复制和allocation浪费，不用于论证降低编码或重采样质量。
@@ -122,8 +123,8 @@ benchmark用于寻找等质量实现中的CPU、复制和allocation浪费，不�
 cargo bench --bench allocation_profile
 ```
 
-2026-07-22的5秒基线中，Rubato是527次/574462 bytes，Opus是250次/80570 bytes；Opus恰好每个
-20 ms frame产生一次payload allocation，但总量只有约16 KiB/s。短fixture的完整pipeline为
+当前5秒基线中，Rubato是526次/567333 bytes，Opus是250次/201050 bytes；Opus恰好每个
+20 ms frame产生一次payload allocation，但总量只有约39 KiB/s。短fixture的完整pipeline为
 568至2280次allocation，其中Vorbis的高值主要来自open/init（open并drain为1737次，预先open后的
 steady drain只有4次），不能把每首歌冷启动成本误判成持续decode热点。基于这组证据，暂不增加
 Opus payload pool；先用长时间多路运行确认allocator或RSS确实构成压力。若要定位Rubato内部
@@ -132,12 +133,14 @@ callsite，应使用保留debug symbol的profiling构建，strip后的Massif `Un
 ### 多路质量 soak
 
 N-API runner固定使用Opus complexity 10、320 kbps和现有高质量Rubato配置，循环播放确定性的
-44.1 kHz stereo非静音fixture，并持续补充next来覆盖promotion：
+44.1 kHz非静音fixture，并持续补充next来覆盖promotion。默认使用stereo；验证mono resample路径时
+显式传入`--fixture-channels 1`：
 
 ```sh
 cd crates/music_stream_napi
 npm run soak -- --streams 10 --duration-seconds 1800 --sample-seconds 2 --fixture-seconds 5
 npm run soak -- --streams 50 --duration-seconds 7200 --sample-seconds 2 --fixture-seconds 5
+npm run soak -- --streams 50 --duration-seconds 1800 --sample-seconds 2 --fixture-seconds 5 --fixture-channels 1
 ```
 
 runner输出JSONL：

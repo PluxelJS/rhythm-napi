@@ -84,6 +84,7 @@ mod rubato_backend {
         config: RubatoResamplerConfig,
         resampler: Option<Box<dyn Resampler<f32>>>,
         input_sample_rate: Option<u32>,
+        resample_channels: Option<u16>,
         pending_input: Vec<f32>,
         pending_input_start: usize,
         pending_output: VecDeque<DecodedChunk>,
@@ -105,6 +106,7 @@ mod rubato_backend {
                 .field("inner", &self.inner)
                 .field("config", &self.config)
                 .field("input_sample_rate", &self.input_sample_rate)
+                .field("resample_channels", &self.resample_channels)
                 .field("pending_input_samples", &self.pending_input.len())
                 .field("pending_output_chunks", &self.pending_output.len())
                 .field(
@@ -126,6 +128,7 @@ mod rubato_backend {
                 config,
                 resampler: None,
                 input_sample_rate: None,
+                resample_channels: None,
                 pending_input: Vec::new(),
                 pending_input_start: 0,
                 pending_output: VecDeque::new(),
@@ -198,7 +201,40 @@ mod rubato_backend {
             }
 
             self.transformed = true;
-            let mut normalized = if channels_match {
+            if input_sample_rate == self.config.target.sample_rate {
+                let normalized = if channels_match {
+                    std::mem::take(&mut chunk.samples_interleaved)
+                } else {
+                    if self.config.target.channels != 2 {
+                        return Err(MusicStreamError::Unsupported(format!(
+                            "channel normalization to {} channels is not supported",
+                            self.config.target.channels
+                        )));
+                    }
+                    let mut normalized = self.take_recycled_buffer();
+                    to_stereo_interleaved(
+                        &chunk.samples_interleaved,
+                        chunk.channels,
+                        &mut normalized,
+                    )?;
+                    normalized
+                };
+                self.inner.recycle(chunk);
+                self.pending_output.push_back(DecodedChunk {
+                    sample_rate: self.config.target.sample_rate,
+                    channels: self.config.target.channels,
+                    samples_interleaved: normalized,
+                });
+                return Ok(());
+            }
+
+            let resample_channels = if chunk.channels == 1 && self.config.target.channels == 2 {
+                1
+            } else {
+                self.config.target.channels
+            };
+            let channels_match_resampler = chunk.channels == resample_channels;
+            let mut normalized = if channels_match_resampler {
                 std::mem::take(&mut chunk.samples_interleaved)
             } else {
                 if self.config.target.channels != 2 {
@@ -211,22 +247,13 @@ mod rubato_backend {
                 to_stereo_interleaved(&chunk.samples_interleaved, chunk.channels, &mut normalized)?;
                 normalized
             };
-            let frames = normalized.len() / usize::from(self.config.target.channels);
-            if input_sample_rate == self.config.target.sample_rate {
-                self.inner.recycle(chunk);
-                self.pending_output.push_back(DecodedChunk {
-                    sample_rate: self.config.target.sample_rate,
-                    channels: self.config.target.channels,
-                    samples_interleaved: normalized,
-                });
-                return Ok(());
-            }
+            let frames = normalized.len() / usize::from(resample_channels);
 
-            self.ensure_resampler(input_sample_rate)?;
+            self.ensure_resampler(input_sample_rate, resample_channels)?;
             self.input_frames_seen = self.input_frames_seen.saturating_add(frames);
             self.compact_pending_input();
             self.pending_input.append(&mut normalized);
-            if channels_match {
+            if channels_match_resampler {
                 chunk.samples_interleaved = normalized;
             } else {
                 self.recycle_buffer(normalized);
@@ -248,11 +275,20 @@ mod rubato_backend {
             }
         }
 
-        fn ensure_resampler(&mut self, input_sample_rate: u32) -> Result<()> {
+        fn ensure_resampler(
+            &mut self,
+            input_sample_rate: u32,
+            resample_channels: u16,
+        ) -> Result<()> {
             if let Some(existing) = self.input_sample_rate {
                 if existing != input_sample_rate {
                     return Err(MusicStreamError::ResampleError(
                         "decoder changed sample rate mid-stream".to_owned(),
+                    ));
+                }
+                if self.resample_channels != Some(resample_channels) {
+                    return Err(MusicStreamError::ResampleError(
+                        "decoder changed channel count mid-stream".to_owned(),
                     ));
                 }
                 return Ok(());
@@ -271,13 +307,14 @@ mod rubato_backend {
                 self.config.max_resample_ratio_relative,
                 &params,
                 self.config.chunk_frames,
-                usize::from(self.config.target.channels),
+                usize::from(resample_channels),
                 FixedAsync::Input,
             )
             .map_err(map_rubato_construction_error)?;
 
             self.trim_output_frames_remaining = resampler.output_delay();
             self.input_sample_rate = Some(input_sample_rate);
+            self.resample_channels = Some(resample_channels);
             self.resampler = Some(Box::new(resampler));
             Ok(())
         }
@@ -320,14 +357,17 @@ mod rubato_backend {
         }
 
         fn process_one(&mut self, partial_len: Option<usize>) -> Result<()> {
-            let channels = usize::from(self.config.target.channels);
+            let channels = usize::from(self.resample_channels.ok_or_else(|| {
+                MusicStreamError::Internal("resampler channels were not initialized".to_owned())
+            })?);
+            let target_channels = usize::from(self.config.target.channels);
             let input_frames = self.pending_input_frames();
             let mut output = self.take_recycled_buffer();
             let resampler = self.resampler.as_mut().ok_or_else(|| {
                 MusicStreamError::Internal("rubato resampler was not initialized".to_owned())
             })?;
             let output_frames_next = resampler.output_frames_next();
-            output.resize(output_frames_next * channels, 0.0);
+            output.resize(output_frames_next * target_channels.max(channels), 0.0);
 
             let input_adapter = InterleavedSlice::new(
                 &self.pending_input[self.pending_input_start..],
@@ -386,7 +426,20 @@ mod rubato_backend {
             if start > 0 {
                 output.copy_within(start..end, 0);
             }
-            output.truncate(emit_frames * channels);
+            if channels == target_channels {
+                output.truncate(emit_frames * channels);
+            } else if channels == 1 && target_channels == 2 {
+                for frame in (0..emit_frames).rev() {
+                    let sample = output[frame];
+                    output[frame * 2] = sample;
+                    output[frame * 2 + 1] = sample;
+                }
+                output.truncate(emit_frames * target_channels);
+            } else {
+                return Err(MusicStreamError::Internal(format!(
+                    "unsupported post-resample channel expansion {channels} -> {target_channels}"
+                )));
+            }
             self.pending_output.push_back(DecodedChunk {
                 sample_rate: self.config.target.sample_rate,
                 channels: self.config.target.channels,
@@ -400,7 +453,10 @@ mod rubato_backend {
             self.pending_input
                 .len()
                 .saturating_sub(self.pending_input_start)
-                / usize::from(self.config.target.channels)
+                / usize::from(
+                    self.resample_channels
+                        .unwrap_or(self.config.target.channels),
+                )
         }
 
         fn compact_pending_input(&mut self) {
@@ -473,6 +529,12 @@ mod rubato_backend {
                         assert_eq!(chunk.sample_rate, 48_000);
                         assert_eq!(chunk.channels, 2);
                         assert_eq!(chunk.samples_interleaved.len() % 2, 0);
+                        assert!(
+                            chunk
+                                .samples_interleaved
+                                .chunks_exact(2)
+                                .all(|frame| frame[0] == frame[1])
+                        );
                         output_frames += chunk.samples_per_channel();
                     }
                     DecodePoll::NeedMore => panic!("memory decoder should not need more data"),
@@ -481,6 +543,41 @@ mod rubato_backend {
             }
 
             assert_eq!(output_frames, 4_800);
+        }
+
+        #[test]
+        fn mono_first_resampling_matches_duplicate_stereo_input() {
+            let mono: Vec<f32> = (0..4_410)
+                .map(|index| ((index as f32) / 32.0).sin() * 0.5)
+                .collect();
+            let stereo: Vec<f32> = mono.iter().flat_map(|sample| [*sample, *sample]).collect();
+            let drain = |channels, samples| {
+                let source = DecodedChunk {
+                    sample_rate: 44_100,
+                    channels,
+                    samples_interleaved: samples,
+                };
+                let mut decoder = RubatoResamplingDecoder::new(
+                    MemoryDecoder::new([source]),
+                    RubatoResamplerConfig::new(AudioFormat {
+                        sample_rate: 48_000,
+                        channels: 2,
+                    }),
+                )
+                .expect("resampling decoder");
+                let mut output = Vec::new();
+                loop {
+                    match decoder.poll_decode().expect("decode") {
+                        DecodePoll::Chunk(chunk) => {
+                            output.extend_from_slice(&chunk.samples_interleaved);
+                        }
+                        DecodePoll::NeedMore => panic!("memory decoder should not need more data"),
+                        DecodePoll::End => return output,
+                    }
+                }
+            };
+
+            assert_eq!(drain(1, mono), drain(2, stereo));
         }
 
         #[test]

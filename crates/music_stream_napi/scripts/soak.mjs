@@ -14,8 +14,11 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 }
 
 const temporaryDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'rhythm-soak-'))
-const fixturePath = path.join(temporaryDirectory, 'quality-baseline-44100-stereo.wav')
-await fs.writeFile(fixturePath, makeFixtureWav(options.fixtureSeconds))
+const fixturePath = path.join(
+  temporaryDirectory,
+  `quality-baseline-44100-${options.fixtureChannels === 1 ? 'mono' : 'stereo'}.wav`,
+)
+await fs.writeFile(fixturePath, makeFixtureWav(options.fixtureSeconds, options.fixtureChannels))
 
 const sink = dgram.createSocket('udp4')
 let sinkPackets = 0
@@ -103,6 +106,7 @@ try {
     durationSeconds: options.durationSeconds,
     sampleSeconds: options.sampleSeconds,
     fixtureSeconds: options.fixtureSeconds,
+    fixtureChannels: options.fixtureChannels,
     opusComplexity: 10,
     opusBitrate: 320_000,
     cpuWorkers: options.cpuWorkers ?? 'default',
@@ -344,6 +348,7 @@ function parseOptions(arguments_) {
     durationSeconds: integerOption(values, 'duration-seconds', 120, 5, 86_400),
     sampleSeconds: integerOption(values, 'sample-seconds', 2, 1, 60),
     fixtureSeconds: integerOption(values, 'fixture-seconds', 5, 2, 60),
+    fixtureChannels: integerOption(values, 'fixture-channels', 2, 1, 2),
     cpuWorkers: optionalIntegerOption(values, 'cpu-workers', 1, 256),
     blockingProducers: optionalIntegerOption(values, 'blocking-producers', 2, 256),
     blockingPreloads: optionalIntegerOption(values, 'blocking-preloads', 1, 255),
@@ -371,13 +376,13 @@ function usage(message) {
   throw new TypeError(
     `${message}\nusage: node scripts/soak.mjs --streams 10 --duration-seconds 120 `
       + '--sample-seconds 2 --fixture-seconds 5 [--cpu-workers 8] '
+      + '[--fixture-channels 1] '
       + '[--blocking-producers 64] [--blocking-preloads 16]',
   )
 }
 
-function makeFixtureWav(seconds) {
+function makeFixtureWav(seconds, channels) {
   const sampleRate = 44_100
-  const channels = 2
   const frames = sampleRate * seconds
   const dataBytes = frames * channels * 2
   const wav = Buffer.allocUnsafe(44 + dataBytes)
@@ -405,8 +410,9 @@ function makeFixtureWav(seconds) {
       0.35 * Math.sin(2 * Math.PI * 329.63 * time)
       + 0.2 * Math.sin(2 * Math.PI * 2_640 * time)
     ) - transient
-    wav.writeInt16LE(toPcm16(left), 44 + frame * 4)
-    wav.writeInt16LE(toPcm16(right), 46 + frame * 4)
+    const offset = 44 + frame * channels * 2
+    wav.writeInt16LE(toPcm16(left), offset)
+    if (channels === 2) wav.writeInt16LE(toPcm16(right), offset + 2)
   }
   return wav
 }

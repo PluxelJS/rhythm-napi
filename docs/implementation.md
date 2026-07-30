@@ -186,8 +186,10 @@ pipeline 消费完 chunk 后把 PCM allocation 归还 decoder；Symphonia 在合
 
 ### Normalize 与 resample
 
-DSP 前统一为 stereo、48 kHz。mono 扩展到双声道，多声道按确定规则 downmix；Rubato 只在 sample
-rate 不匹配时工作，并复用其输出缓冲。等待 source 数据不属于 resample 工作，不能持有 CPU lease。
+DSP 前统一为 stereo、48 kHz。sample rate 不匹配的 mono 输入先由 Rubato 以单声道处理，再在输出
+buffer 内原地扩展为双声道，避免对两个相同声道重复 sinc 计算；无需 resample 的 mono 输入直接扩展。
+多声道按确定规则 downmix。Rubato 复用其输出缓冲；等待 source 数据不属于 resample 工作，不能持有
+CPU lease。
 
 ### Frame assembly 与 DSP
 
