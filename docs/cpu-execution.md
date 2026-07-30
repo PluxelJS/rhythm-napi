@@ -89,6 +89,10 @@ next 还受 `maxBlockingPreloads = maxBlockingProducers / 4` 限制。多核时 
 必须满足没有 current waiter，并至少给 current 留一个 CPU 名额。promotion 会让同一个 producer
 以后按 current 身份竞争，不重建 decoder 或 encoder。
 
+current 与 next 使用分离的 condition variable。permit 释放时只唤醒一个符合角色与预留规则的
+waiter；若仍有空位，获得 permit 的 waiter 会继续唤醒下一个。不能在每个 Opus frame 边界广播唤醒
+全部 producer，否则高并发下会把公平性开销变成 mutex 惊群。诊断同时报告 current/next waiter。
+
 因此允许存在：
 
 ```text
@@ -103,6 +107,10 @@ promotion；用可扩展 blocking thread 承载这些等待，再用更小的 CP
 
 producer 获得 CPU lease 后推进有界的媒体 turn，当前默认 `decodeBatchMs` 为 80 ms。这个值是一次
 turn 最多处理的媒体时长，不是 80 ms 墙钟时间，也不是不可抢占的 CPU 时间。
+
+blocking closure 开始后必须先取得 CPU lease，再执行 Symphonia open/probe、seek、Rubato pipeline
+准备和 libopus encoder 初始化。这样并发冷启动同样服从 CPU 总预算；progressive/live reader 在 probe
+期间等待新字节时仍通过 observer 归还 lease。
 
 每个 Opus frame 进入 duration-bounded queue 前，producer 先归还 lease，再执行可能阻塞的 send，
 send 返回后重新参与调度。reader 在真正等待新 source 字节前也通过 wait observer 归还 lease。
@@ -170,8 +178,9 @@ pool，会让两套执行器都按整机 CPU 数扩张。结果可能是更多�
   上执行，仍会与 Tokio worker、Node、内核和 TLS/文件系统竞争物理 CPU。
 - Tokio blocking pool 还承载少量 tempfile、cleanup 等辅助操作。若长期 producer 把上游 pool
   容量占满，这些操作也会排队；Rhythm 自己的 semaphore 不能观察上游 pool queue。
-- `music_stream.runtime.worker_turn_us` 当前记录整个 turn 的墙钟时间，其中可能包含 source 或 queue
-  等待；它不能单独当作纯 CPU service time，也不能证明 Rayon 会更快。
+- `music_stream.runtime.worker_turn_us` 记录整个 turn 的墙钟时间，其中可能包含 source 或 queue
+  等待；应结合 `cpuCurrentHold`/`cpuNextHold`、`sourceWait` 和 `outputWait` 区分阶段，不能单独把它
+  当作纯 CPU service time或证明 Rayon 会更快。
 - `available_parallelism` 是合理默认，不代表所有容器 CPU quota、共享宿主和延迟目标下的最佳配置。
 
 因此生产调优可以降低 `maxCpuWorkers` 给 async/Node/系统留下余量，也可以收紧 blocking producer，
@@ -189,13 +198,14 @@ pool，会让两套执行器都按整机 CPU 数扩张。结果可能是更多�
    `decodeBatchMs` 或 `maxCpuWorkers` 无法解决。
 5. 新增了大量独立、有限、纯计算的离线任务，现有 realtime admission 无法表达其低优先级预算。
 
-评估前应先补齐观测：
+`getResourceDiagnostics()` 已内置current/next blocking admission、从提交 `spawn_blocking` 到闭包开始、
+current/next CPU lease wait/hold、source wait和output handoff的累计样本、总时间、最大值及log2近似
+p50/p95/p99，不依赖宿主安装Rust metrics recorder。`metrics` histogram仍保留role/source标签，供已
+安装recorder的宿主做更细分聚合。
 
-- 从提交 `spawn_blocking` 到闭包开始的 queue wait；
-- CPU lease 的等待时间、实际持有时间和每角色分布；
-- source wait、Opus queue wait、promotion wait 与纯 codec service time的拆分；
-- 进程 thread 数、上下文切换和内存；
-- sender deadline lateness、underrun、drop 与上述阶段的关联。
+评估执行器前仍需由进程/操作系统补齐 thread数、上下文切换、CPU time、迁核、NUMA remote access和
+内存，并把这些数据与sender deadline lateness、underrun、drop关联。`cpu lease hold`是受准入保护的
+墙钟时间；本地文件page fault等同步等待仍可能包含其中，不能冒充线程CPU time。
 
 基准至少覆盖 1/2/4/8/16 核或等价 CPU quota，以及 current-only、current+ready next、慢渐进
 URL、live/HLS、pause/promotion、cache hit/miss 和并发 shutdown。比较结果必须包含 p50/p95/p99

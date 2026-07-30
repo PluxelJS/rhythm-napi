@@ -178,6 +178,16 @@ export interface RuntimeResourceDiagnosticsOutput {
   blockingPreloadsAvailable: number
   cpuActive: number
   cpuCurrentWaiters: number
+  cpuNextWaiters: number
+  blockingCurrentAdmissionWait: RuntimeTimingDiagnosticsOutput
+  blockingNextAdmissionWait: RuntimeTimingDiagnosticsOutput
+  blockingStartWait: RuntimeTimingDiagnosticsOutput
+  cpuCurrentWait: RuntimeTimingDiagnosticsOutput
+  cpuNextWait: RuntimeTimingDiagnosticsOutput
+  cpuCurrentHold: RuntimeTimingDiagnosticsOutput
+  cpuNextHold: RuntimeTimingDiagnosticsOutput
+  sourceWait: RuntimeTimingDiagnosticsOutput
+  outputWait: RuntimeTimingDiagnosticsOutput
   artifactCacheEntries: number
   artifactCacheRetainedQuotaBytes: number
   downloadRegistryEntries: number
@@ -193,6 +203,16 @@ export interface RuntimeResourceLimitsInput {
   maxConcurrentLiveStreams?: number
   maxLiveBufferedBytes?: number
   maxTempfileBytes?: number
+}
+
+/** Cumulative timing distribution summary since this Streamer was constructed. */
+export interface RuntimeTimingDiagnosticsOutput {
+  samples: number
+  totalUs: number
+  maxUs: number
+  p50Us: number
+  p95Us: number
+  p99Us: number
 }
 
 export interface SourceResolverConfigInput {

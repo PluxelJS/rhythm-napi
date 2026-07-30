@@ -8,7 +8,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::opus_queue::{self, OpusQueueReceiver, OpusQueueSender};
-use super::{CHANNELS, FRAME_SAMPLES, SAMPLE_RATE};
+use super::{CHANNELS, FRAME_SAMPLES, RuntimePerformanceCounters, SAMPLE_RATE};
 use crate::audio::AudioFormat;
 use crate::audio::decode::{DecoderBackend, SymphoniaFileDecoder, SymphoniaStreamDecoder};
 use crate::audio::dsp::VolumeConfig;
@@ -28,22 +28,46 @@ use crate::source::{
 #[derive(Debug)]
 pub(super) struct CpuScheduler {
     state: std::sync::Mutex<CpuSchedulerState>,
-    changed: Condvar,
+    current_changed: Condvar,
+    next_changed: Condvar,
     maximum: usize,
+    performance: Arc<RuntimePerformanceCounters>,
 }
 
 #[derive(Debug, Default)]
 struct CpuSchedulerState {
     active: usize,
     current_waiters: usize,
+    next_waiters: usize,
 }
 
 impl CpuScheduler {
+    #[cfg(test)]
     pub(super) fn with_maximum(maximum: usize) -> Self {
+        Self::with_maximum_and_counters(maximum, Arc::new(RuntimePerformanceCounters::default()))
+    }
+
+    pub(super) fn with_maximum_and_counters(
+        maximum: usize,
+        performance: Arc<RuntimePerformanceCounters>,
+    ) -> Self {
         Self {
             state: std::sync::Mutex::new(CpuSchedulerState::default()),
-            changed: Condvar::new(),
+            current_changed: Condvar::new(),
+            next_changed: Condvar::new(),
             maximum: maximum.max(1),
+            performance,
+        }
+    }
+
+    fn notify_eligible_waiter(&self, state: &CpuSchedulerState) {
+        if state.current_waiters > 0 && state.active < self.maximum {
+            self.current_changed.notify_one();
+            return;
+        }
+        let next_limit = self.maximum.saturating_sub(1).max(1);
+        if state.current_waiters == 0 && state.next_waiters > 0 && state.active < next_limit {
+            self.next_changed.notify_one();
         }
     }
 
@@ -56,13 +80,20 @@ impl CpuScheduler {
         let current = matches!(role, ProducerRole::Current);
         if current {
             state.current_waiters += 1;
+        } else {
+            state.next_waiters += 1;
         }
+        let started = std::time::Instant::now();
         loop {
             if cancellation.is_cancelled() {
                 if current {
                     state.current_waiters = state.current_waiters.saturating_sub(1);
-                    self.changed.notify_all();
+                } else {
+                    state.next_waiters = state.next_waiters.saturating_sub(1);
                 }
+                self.notify_eligible_waiter(&state);
+                drop(state);
+                record_cpu_wait(&self.performance, current, started.elapsed());
                 return None;
             }
             let allowed = match role {
@@ -75,29 +106,42 @@ impl CpuScheduler {
             if allowed {
                 if current {
                     state.current_waiters = state.current_waiters.saturating_sub(1);
+                } else {
+                    state.next_waiters = state.next_waiters.saturating_sub(1);
                 }
                 state.active += 1;
+                self.notify_eligible_waiter(&state);
+                drop(state);
+                record_cpu_wait(&self.performance, current, started.elapsed());
                 return Some(CpuPermit {
                     scheduler: Arc::clone(self),
+                    current,
+                    acquired_at: std::time::Instant::now(),
                 });
             }
-            let (next, _) = self
-                .changed
+            let changed = if current {
+                &self.current_changed
+            } else {
+                &self.next_changed
+            };
+            let (next, _) = changed
                 .wait_timeout(state, Duration::from_millis(20))
                 .expect("CPU scheduler lock poisoned");
             state = next;
         }
     }
 
-    pub(super) fn diagnostics(&self) -> (usize, usize) {
+    pub(super) fn diagnostics(&self) -> (usize, usize, usize) {
         let state = self.state.lock().expect("CPU scheduler lock poisoned");
-        (state.active, state.current_waiters)
+        (state.active, state.current_waiters, state.next_waiters)
     }
 }
 
 #[derive(Debug)]
 struct CpuPermit {
     scheduler: Arc<CpuScheduler>,
+    current: bool,
+    acquired_at: std::time::Instant,
 }
 
 #[derive(Debug)]
@@ -106,6 +150,7 @@ struct CpuLease {
     cancellation: CancellationToken,
     scheduler: Arc<CpuScheduler>,
     permit: std::sync::Mutex<Option<CpuPermit>>,
+    source_wait_started: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl CpuLease {
@@ -119,6 +164,7 @@ impl CpuLease {
             cancellation,
             scheduler,
             permit: std::sync::Mutex::new(None),
+            source_wait_started: std::sync::Mutex::new(None),
         }
     }
 
@@ -144,22 +190,53 @@ impl CpuLease {
 impl BlockingReadObserver for CpuLease {
     fn before_wait(&self) {
         self.release();
+        self.source_wait_started
+            .lock()
+            .expect("source wait lock poisoned")
+            .replace(std::time::Instant::now());
     }
 
     fn after_wait(&self) {
+        if let Some(started) = self
+            .source_wait_started
+            .lock()
+            .expect("source wait lock poisoned")
+            .take()
+        {
+            let elapsed = started.elapsed();
+            self.scheduler.performance.record_source_wait(elapsed);
+            metrics::histogram!(
+                "music_stream.runtime.source_wait_us",
+                "role" => role_name(if self.current_role.load(Ordering::Acquire) {
+                    ProducerRole::Current
+                } else {
+                    ProducerRole::Next
+                })
+            )
+            .record(elapsed.as_micros() as f64);
+        }
         let _ = self.acquire();
     }
 }
 
 impl Drop for CpuPermit {
     fn drop(&mut self) {
+        let elapsed = self.acquired_at.elapsed();
+        self.scheduler
+            .performance
+            .record_cpu_hold(self.current, elapsed);
+        metrics::histogram!(
+            "music_stream.runtime.cpu_lease_hold_us",
+            "role" => if self.current { "current" } else { "next" }
+        )
+        .record(elapsed.as_micros() as f64);
         let mut state = self
             .scheduler
             .state
             .lock()
             .expect("CPU scheduler lock poisoned");
         state.active = state.active.saturating_sub(1);
-        self.scheduler.changed.notify_all();
+        self.scheduler.notify_eligible_waiter(&state);
     }
 }
 
@@ -183,6 +260,7 @@ pub(super) struct ProducerSpec {
     pub source: SourceResolverConfig,
     pub live_byte_budget: LiveByteBudget,
     pub live_streams: Arc<Semaphore>,
+    pub performance: Arc<RuntimePerformanceCounters>,
     pub cpu_scheduler: Arc<CpuScheduler>,
     pub blocking_producers: Arc<Semaphore>,
     pub blocking_preloads: Arc<Semaphore>,
@@ -427,6 +505,7 @@ pub(super) fn spawn(spec: ProducerSpec) -> ProducerHandle {
             role,
             next_prime_ms: matches!(role, ProducerRole::Next).then_some(spec.buffer.next_prime_ms),
             events: worker_events,
+            performance: spec.performance,
             cpu_scheduler: spec.cpu_scheduler,
             blocking_producers: spec.blocking_producers,
             blocking_preloads: spec.blocking_preloads,
@@ -524,6 +603,7 @@ struct ProducerJob {
     role: ProducerRole,
     next_prime_ms: Option<u64>,
     events: mpsc::Sender<WorkerEvent>,
+    performance: Arc<RuntimePerformanceCounters>,
     cpu_scheduler: Arc<CpuScheduler>,
     blocking_producers: Arc<Semaphore>,
     blocking_preloads: Arc<Semaphore>,
@@ -641,8 +721,18 @@ async fn run_file_artifact(
     artifact: SourceArtifact,
     admission: AdmissionPermit,
 ) -> Result<()> {
+    let lease = Arc::new(CpuLease::new(
+        Arc::clone(&job.control.current_role),
+        job.cancellation.clone(),
+        Arc::clone(&job.cpu_scheduler),
+    ));
+    let submitted_at = std::time::Instant::now();
     tokio::task::spawn_blocking(move || {
         let _admission = admission;
+        record_blocking_start(&job, submitted_at);
+        if !lease.acquire() {
+            return Ok(());
+        }
         let decoder_started = std::time::Instant::now();
         let decoder = SymphoniaFileDecoder::open_at(artifact.path(), job.start_position_ms)?;
         record_decoder_open(&job, decoder_started);
@@ -653,11 +743,6 @@ async fn run_file_artifact(
                 channels: CHANNELS,
             }),
         )?;
-        let lease = Arc::new(CpuLease::new(
-            Arc::clone(&job.control.current_role),
-            job.cancellation.clone(),
-            Arc::clone(&job.cpu_scheduler),
-        ));
         run_cpu(decoder, job, lease)
     })
     .await
@@ -682,8 +767,13 @@ async fn run_progressive_url(
         Arc::clone(&job.cpu_scheduler),
     ));
     reader.set_wait_observer(lease.clone());
+    let submitted_at = std::time::Instant::now();
     let mut cpu = tokio::task::spawn_blocking(move || {
         let _admission = admission;
+        record_blocking_start(&job, submitted_at);
+        if !lease.acquire() {
+            return Ok(());
+        }
         let decoder_started = std::time::Instant::now();
         let decoder = SymphoniaStreamDecoder::open(reader, hint.as_deref())?;
         record_decoder_open(&job, decoder_started);
@@ -818,8 +908,13 @@ async fn run_http_stream(
         Arc::clone(&job.cpu_scheduler),
     ));
     reader.set_wait_observer(lease.clone());
+    let submitted_at = std::time::Instant::now();
     let mut cpu = tokio::task::spawn_blocking(move || {
         let _admission = admission;
+        record_blocking_start(&job, submitted_at);
+        if !lease.acquire() {
+            return Ok(());
+        }
         let decoder_started = std::time::Instant::now();
         let decoder = SymphoniaStreamDecoder::open(reader, hint.as_deref())?;
         record_decoder_open(&job, decoder_started);
@@ -899,11 +994,18 @@ async fn acquire_blocking_job(job: &ProducerJob) -> Result<AdmissionPermit> {
         &job.cancellation,
     )
     .await?;
+    let elapsed = started.elapsed();
+    // Attribute the whole wait to the role that entered admission. A next producer may be
+    // promoted while waiting; relabeling that historical preload wait as current would make
+    // current capacity look blocked even though promotion is what released the preload gate.
+    let current = matches!(job.role, ProducerRole::Current);
+    job.performance
+        .record_blocking_admission_wait(current, elapsed);
     metrics::histogram!(
         "music_stream.runtime.blocking_admission_wait_us",
-        "role" => role_name(job.control.role())
+        "role" => role_name(job.role)
     )
-    .record(started.elapsed().as_micros() as f64);
+    .record(elapsed.as_micros() as f64);
     Ok(AdmissionPermit { _global: producer })
 }
 
@@ -1028,7 +1130,16 @@ where
                     "producer cancelled while paused".to_owned(),
                 ));
             }
-            job.output.send_blocking(frame, &job.cancellation)?;
+            let output_started = std::time::Instant::now();
+            let output_result = job.output.send_blocking(frame, &job.cancellation);
+            let output_elapsed = output_started.elapsed();
+            job.performance.record_output_wait(output_elapsed);
+            metrics::histogram!(
+                "music_stream.runtime.output_wait_us",
+                "role" => role_name(job.control.role())
+            )
+            .record(output_elapsed.as_micros() as f64);
+            output_result?;
             if !first_opus_recorded {
                 metrics::histogram!(
                     "music_stream.runtime.activation_to_first_opus_us",
@@ -1103,6 +1214,26 @@ where
             std::thread::yield_now();
         }
     }
+}
+
+fn record_cpu_wait(performance: &RuntimePerformanceCounters, current: bool, elapsed: Duration) {
+    performance.record_cpu_wait(current, elapsed);
+    metrics::histogram!(
+        "music_stream.runtime.cpu_lease_wait_us",
+        "role" => if current { "current" } else { "next" }
+    )
+    .record(elapsed.as_micros() as f64);
+}
+
+fn record_blocking_start(job: &ProducerJob, submitted_at: std::time::Instant) {
+    let elapsed = submitted_at.elapsed();
+    job.performance.record_blocking_start_wait(elapsed);
+    metrics::histogram!(
+        "music_stream.runtime.blocking_start_wait_us",
+        "role" => role_name(job.control.role()),
+        "source" => source_kind_name(&job.track),
+    )
+    .record(elapsed.as_micros() as f64);
 }
 
 fn role_name(role: ProducerRole) -> &'static str {
@@ -1301,6 +1432,7 @@ mod tests {
             role: ProducerRole::Next,
             next_prime_ms: Some(100),
             events,
+            performance: Arc::new(RuntimePerformanceCounters::default()),
             cpu_scheduler: Arc::new(CpuScheduler::with_maximum(1)),
             blocking_producers: Arc::new(Semaphore::new(1)),
             blocking_preloads: Arc::new(Semaphore::new(1)),
@@ -1414,6 +1546,7 @@ mod tests {
             role: ProducerRole::Current,
             next_prime_ms: None,
             events,
+            performance: Arc::new(RuntimePerformanceCounters::default()),
             cpu_scheduler: Arc::new(CpuScheduler::with_maximum(1)),
             blocking_producers: Arc::clone(&blocking_producers),
             blocking_preloads,
@@ -1536,6 +1669,62 @@ mod tests {
         std::thread::sleep(Duration::from_millis(30));
         waiting_cancellation.cancel();
         assert!(waiter.join().expect("waiter").is_none());
+        assert_eq!(scheduler.diagnostics(), (1, 0, 0));
         drop(active);
+        assert_eq!(scheduler.diagnostics(), (0, 0, 0));
+    }
+
+    #[test]
+    fn current_waiter_is_woken_before_an_older_next_waiter() {
+        let scheduler = Arc::new(CpuScheduler::with_maximum(1));
+        let active_cancellation = CancellationToken::new();
+        let active = scheduler
+            .acquire(ProducerRole::Current, &active_cancellation)
+            .expect("active permit");
+        let next_cancellation = CancellationToken::new();
+        let next_worker_cancellation = next_cancellation.clone();
+        let next_scheduler = Arc::clone(&scheduler);
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let next_tx = acquired_tx.clone();
+        let next_waiter = std::thread::spawn(move || {
+            let permit = next_scheduler.acquire(ProducerRole::Next, &next_worker_cancellation);
+            if let Some(permit) = permit {
+                next_tx.send("next").expect("report next acquisition");
+                drop(permit);
+            }
+        });
+        while scheduler.diagnostics().2 == 0 {
+            std::thread::yield_now();
+        }
+
+        let current_cancellation = CancellationToken::new();
+        let current_worker_cancellation = current_cancellation.clone();
+        let current_scheduler = Arc::clone(&scheduler);
+        let current_waiter = std::thread::spawn(move || {
+            let permit = current_scheduler
+                .acquire(ProducerRole::Current, &current_worker_cancellation)
+                .expect("current permit");
+            acquired_tx
+                .send("current")
+                .expect("report current acquisition");
+            std::thread::sleep(Duration::from_millis(20));
+            drop(permit);
+        });
+        while scheduler.diagnostics().1 == 0 {
+            std::thread::yield_now();
+        }
+
+        drop(active);
+        assert_eq!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("first waiter acquisition"),
+            "current"
+        );
+
+        current_waiter.join().expect("current waiter");
+        next_cancellation.cancel();
+        next_waiter.join().expect("next waiter");
+        assert_eq!(scheduler.diagnostics(), (0, 0, 0));
     }
 }

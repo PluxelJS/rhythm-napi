@@ -265,9 +265,12 @@ lateness recovery、drop、max lateness及RTP clock。状态事件来自actor提
 快照；监控应使用`getStatus`/`getStatuses`，按相邻样本差值计算区间事件率。
 
 `getResourceDiagnostics` 是另一条按需控制面快照：报告 stream、HTTP、tempfile、blocking、live byte 的
-available permits，CPU active/current waiters，以及 artifact cache 和 shared-flight registry 计数。它只在
-显式调用时取得短锁，禁止由 sender 或每帧 producer 自动调用。`tempfile_preload_units_released{reason="transfer_complete"}`
-记录完整传输终态转换实际归还的 unit 数。
+available permits，CPU active/current/next waiters，以及 artifact cache 和 shared-flight registry 计数。
+同一快照还从无锁原子计数读取current/next blocking admission、blocking启动、CPU lease、source和
+output阶段的累计延迟摘要；log2桶给出有界近似p50/p95/p99，避免N-API宿主必须安装Rust metrics
+recorder。它只在显式调用时取得短锁，禁止由
+sender或每帧producer自动调用。`tempfile_preload_units_released{reason="transfer_complete"}`记录完整传输
+终态转换实际归还的 unit 数。
 
 优化结论必须同时看首包、实时 deadline、资源等待和 event-loop delay，不能只看离线吞吐。
 

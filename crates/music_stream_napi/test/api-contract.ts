@@ -23,6 +23,9 @@ type _PlayStateContract = Assert<
 type _ResourceDiagnosticsContract = Assert<
 	Equal<RuntimeResourceDiagnosticsOutput['tempfilePreloadUnitsAvailable'], number>
 >
+type _RuntimeTimingDiagnosticsContract = Assert<
+	Equal<RuntimeResourceDiagnosticsOutput['cpuCurrentWait']['maxUs'], number>
+>
 type _PlayoutDiagnosticsContract = Assert<
 	Equal<
 		StreamStatusOutput['playoutDiagnostics'],

@@ -4,6 +4,7 @@
 //! decode/resample/encode always runs on blocking CPU workers and can never delay output pacing.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -68,24 +69,194 @@ pub struct RuntimeResourceLimits {
     pub max_tempfile_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeTimingSnapshot {
+    pub samples: u64,
+    pub total_us: u64,
+    pub max_us: u64,
+    pub p50_us: u64,
+    pub p95_us: u64,
+    pub p99_us: u64,
+}
+
+const TIMING_SUB_BUCKETS: usize = 4;
+const TIMING_BUCKETS: usize = u64::BITS as usize * TIMING_SUB_BUCKETS;
+
+#[derive(Debug)]
+struct RuntimeTimingCounter {
+    samples: AtomicU64,
+    total_us: AtomicU64,
+    max_us: AtomicU64,
+    buckets: [AtomicU64; TIMING_BUCKETS],
+}
+
+impl Default for RuntimeTimingCounter {
+    fn default() -> Self {
+        Self {
+            samples: AtomicU64::new(0),
+            total_us: AtomicU64::new(0),
+            max_us: AtomicU64::new(0),
+            buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl RuntimeTimingCounter {
+    fn record(&self, elapsed: Duration) {
+        let elapsed_us = elapsed.as_micros().try_into().unwrap_or(u64::MAX);
+        self.samples.fetch_add(1, Ordering::Relaxed);
+        let _ = self
+            .total_us
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(elapsed_us))
+            });
+        self.max_us.fetch_max(elapsed_us, Ordering::Relaxed);
+        let bucket = if elapsed_us == 0 {
+            0
+        } else {
+            let exponent = usize::try_from(elapsed_us.ilog2()).unwrap_or(u64::BITS as usize - 1);
+            let base = 1_u64 << exponent;
+            let sub_bucket = usize::try_from(
+                (u128::from(elapsed_us - base) * TIMING_SUB_BUCKETS as u128) / u128::from(base),
+            )
+            .unwrap_or(TIMING_SUB_BUCKETS - 1)
+            .min(TIMING_SUB_BUCKETS - 1);
+            exponent * TIMING_SUB_BUCKETS + sub_bucket
+        };
+        self.buckets[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> RuntimeTimingSnapshot {
+        let buckets = self
+            .buckets
+            .each_ref()
+            .map(|bucket| bucket.load(Ordering::Relaxed));
+        let max_us = self.max_us.load(Ordering::Relaxed);
+        RuntimeTimingSnapshot {
+            samples: self.samples.load(Ordering::Relaxed),
+            total_us: self.total_us.load(Ordering::Relaxed),
+            max_us,
+            p50_us: timing_percentile(&buckets, 50).min(max_us),
+            p95_us: timing_percentile(&buckets, 95).min(max_us),
+            p99_us: timing_percentile(&buckets, 99).min(max_us),
+        }
+    }
+}
+
+fn timing_percentile(buckets: &[u64; TIMING_BUCKETS], percentile: u64) -> u64 {
+    let samples = buckets.iter().copied().fold(0_u64, u64::saturating_add);
+    if samples == 0 {
+        return 0;
+    }
+    let target = (u128::from(samples) * u128::from(percentile)).div_ceil(100);
+    let mut seen = 0_u128;
+    for (index, samples) in buckets.iter().copied().enumerate() {
+        seen += u128::from(samples);
+        if seen >= target {
+            let exponent = index / TIMING_SUB_BUCKETS;
+            let sub_bucket = index % TIMING_SUB_BUCKETS;
+            let base = 1_u128 << exponent;
+            let upper =
+                base + (base * (sub_bucket + 1) as u128).div_ceil(TIMING_SUB_BUCKETS as u128) - 1;
+            return upper.try_into().unwrap_or(u64::MAX);
+        }
+    }
+    u64::MAX
+}
+
+#[derive(Debug, Default)]
+pub(super) struct RuntimePerformanceCounters {
+    blocking_current_admission_wait: RuntimeTimingCounter,
+    blocking_next_admission_wait: RuntimeTimingCounter,
+    blocking_start_wait: RuntimeTimingCounter,
+    cpu_current_wait: RuntimeTimingCounter,
+    cpu_next_wait: RuntimeTimingCounter,
+    cpu_current_hold: RuntimeTimingCounter,
+    cpu_next_hold: RuntimeTimingCounter,
+    source_wait: RuntimeTimingCounter,
+    output_wait: RuntimeTimingCounter,
+}
+
+impl RuntimePerformanceCounters {
+    pub(super) fn record_blocking_admission_wait(&self, current: bool, elapsed: Duration) {
+        if current {
+            self.blocking_current_admission_wait.record(elapsed);
+        } else {
+            self.blocking_next_admission_wait.record(elapsed);
+        }
+    }
+
+    pub(super) fn record_blocking_start_wait(&self, elapsed: Duration) {
+        self.blocking_start_wait.record(elapsed);
+    }
+
+    pub(super) fn record_cpu_wait(&self, current: bool, elapsed: Duration) {
+        if current {
+            self.cpu_current_wait.record(elapsed);
+        } else {
+            self.cpu_next_wait.record(elapsed);
+        }
+    }
+
+    pub(super) fn record_cpu_hold(&self, current: bool, elapsed: Duration) {
+        if current {
+            self.cpu_current_hold.record(elapsed);
+        } else {
+            self.cpu_next_hold.record(elapsed);
+        }
+    }
+
+    pub(super) fn record_source_wait(&self, elapsed: Duration) {
+        self.source_wait.record(elapsed);
+    }
+
+    pub(super) fn record_output_wait(&self, elapsed: Duration) {
+        self.output_wait.record(elapsed);
+    }
+}
+
 impl Default for RuntimeResourceLimits {
     fn default() -> Self {
         let max_cpu_workers = std::thread::available_parallelism()
             .map_or(2, |value| value.get())
             .min(MAX_BLOCKING_PRODUCERS);
-        let max_blocking_producers = max_cpu_workers
-            .saturating_mul(4)
-            .clamp(MIN_BLOCKING_PRODUCERS, MAX_BLOCKING_PRODUCERS);
+        let (max_blocking_producers, max_blocking_preloads) =
+            Self::blocking_defaults(max_cpu_workers);
         Self {
             max_streams: MAX_STREAMS,
             max_cpu_workers,
             max_blocking_producers,
-            max_blocking_preloads: (max_blocking_producers / 4).max(1),
+            max_blocking_preloads,
             max_concurrent_http_downloads: MAX_CONCURRENT_HTTP_DOWNLOADS,
             max_concurrent_live_streams: MAX_CONCURRENT_LIVE_STREAMS,
             max_live_buffered_bytes: MAX_LIVE_BUFFERED_BYTES,
             max_tempfile_bytes: MAX_TEMPFILE_BYTES,
         }
+    }
+}
+
+impl RuntimeResourceLimits {
+    fn blocking_defaults(max_cpu_workers: usize) -> (usize, usize) {
+        let producers = max_cpu_workers
+            .saturating_mul(4)
+            .clamp(MIN_BLOCKING_PRODUCERS, MAX_BLOCKING_PRODUCERS);
+        (producers, (producers / 4).max(1))
+    }
+
+    /// Updates the CPU limit and recomputes blocking defaults that depend on it.
+    pub fn set_max_cpu_workers_with_blocking_defaults(&mut self, max_cpu_workers: usize) {
+        self.max_cpu_workers = max_cpu_workers;
+        (self.max_blocking_producers, self.max_blocking_preloads) =
+            Self::blocking_defaults(max_cpu_workers);
+    }
+
+    /// Updates the blocking producer limit and resets its preload sub-limit to one quarter.
+    pub fn set_max_blocking_producers_with_preload_default(
+        &mut self,
+        max_blocking_producers: usize,
+    ) {
+        self.max_blocking_producers = max_blocking_producers;
+        self.max_blocking_preloads = (max_blocking_producers / 4).max(1);
     }
 }
 
@@ -101,6 +272,7 @@ pub struct RuntimeResources {
     live_byte_budget: LiveByteBudget,
     tempfile_budget: Arc<Semaphore>,
     tempfile_preloads: Arc<Semaphore>,
+    performance: Arc<RuntimePerformanceCounters>,
     cpu_scheduler: Arc<producer::CpuScheduler>,
     blocking_producers: Arc<Semaphore>,
     blocking_preloads: Arc<Semaphore>,
@@ -121,6 +293,16 @@ pub struct RuntimeResourceSnapshot {
     pub blocking_preloads_available: usize,
     pub cpu_active: usize,
     pub cpu_current_waiters: usize,
+    pub cpu_next_waiters: usize,
+    pub blocking_current_admission_wait: RuntimeTimingSnapshot,
+    pub blocking_next_admission_wait: RuntimeTimingSnapshot,
+    pub blocking_start_wait: RuntimeTimingSnapshot,
+    pub cpu_current_wait: RuntimeTimingSnapshot,
+    pub cpu_next_wait: RuntimeTimingSnapshot,
+    pub cpu_current_hold: RuntimeTimingSnapshot,
+    pub cpu_next_hold: RuntimeTimingSnapshot,
+    pub source_wait: RuntimeTimingSnapshot,
+    pub output_wait: RuntimeTimingSnapshot,
     pub artifact_cache_entries: usize,
     pub artifact_cache_retained_quota_bytes: u64,
     pub download_registry_entries: usize,
@@ -163,6 +345,7 @@ impl RuntimeResources {
             .map_err(|_| {
                 MusicStreamError::InvalidConfig("tempfile byte limit is too large".to_owned())
             })?;
+        let performance = Arc::new(RuntimePerformanceCounters::default());
         Ok(Self {
             streams: Arc::new(Semaphore::new(limits.max_streams)),
             http_downloads: Arc::new(Semaphore::new(limits.max_concurrent_http_downloads)),
@@ -171,7 +354,11 @@ impl RuntimeResources {
             live_byte_budget: LiveByteBudget::new(limits.max_live_buffered_bytes)?,
             tempfile_budget: Arc::new(Semaphore::new(tempfile_permits)),
             tempfile_preloads: Arc::new(Semaphore::new((tempfile_permits / 4).max(1))),
-            cpu_scheduler: Arc::new(producer::CpuScheduler::with_maximum(limits.max_cpu_workers)),
+            cpu_scheduler: Arc::new(producer::CpuScheduler::with_maximum_and_counters(
+                limits.max_cpu_workers,
+                Arc::clone(&performance),
+            )),
+            performance,
             blocking_producers: Arc::new(Semaphore::new(limits.max_blocking_producers)),
             blocking_preloads: Arc::new(Semaphore::new(limits.max_blocking_preloads)),
             source_cache: Arc::new(std::sync::Mutex::new(SourceArtifactCache::new(
@@ -207,7 +394,7 @@ impl RuntimeResources {
             .diagnostics();
         let (download_registry_entries, live_download_flights) =
             self.source_downloads.diagnostics()?;
-        let (cpu_active, cpu_current_waiters) = self.cpu_scheduler.diagnostics();
+        let (cpu_active, cpu_current_waiters, cpu_next_waiters) = self.cpu_scheduler.diagnostics();
         Ok(RuntimeResourceSnapshot {
             streams_available: self.streams.available_permits(),
             http_downloads_available: self.http_downloads.available_permits(),
@@ -220,6 +407,19 @@ impl RuntimeResources {
             blocking_preloads_available: self.blocking_preloads.available_permits(),
             cpu_active,
             cpu_current_waiters,
+            cpu_next_waiters,
+            blocking_current_admission_wait: self
+                .performance
+                .blocking_current_admission_wait
+                .snapshot(),
+            blocking_next_admission_wait: self.performance.blocking_next_admission_wait.snapshot(),
+            blocking_start_wait: self.performance.blocking_start_wait.snapshot(),
+            cpu_current_wait: self.performance.cpu_current_wait.snapshot(),
+            cpu_next_wait: self.performance.cpu_next_wait.snapshot(),
+            cpu_current_hold: self.performance.cpu_current_hold.snapshot(),
+            cpu_next_hold: self.performance.cpu_next_hold.snapshot(),
+            source_wait: self.performance.source_wait.snapshot(),
+            output_wait: self.performance.output_wait.snapshot(),
             artifact_cache_entries,
             artifact_cache_retained_quota_bytes,
             download_registry_entries,
@@ -1010,6 +1210,7 @@ impl StreamRuntimeInner {
             source: self.config.source.clone(),
             live_byte_budget: self.config.resources.live_byte_budget.clone(),
             live_streams: Arc::clone(&self.config.resources.live_streams),
+            performance: Arc::clone(&self.config.resources.performance),
             cpu_scheduler: Arc::clone(&self.config.resources.cpu_scheduler),
             blocking_producers: Arc::clone(&self.config.resources.blocking_producers),
             blocking_preloads: Arc::clone(&self.config.resources.blocking_preloads),
@@ -1115,6 +1316,26 @@ mod tests {
         .expect_err("zero download slots must fail");
 
         assert_eq!(error.code(), crate::error::ErrorCode::InvalidConfig);
+    }
+
+    #[test]
+    fn runtime_timing_counter_exposes_bounded_percentiles() {
+        let counter = RuntimeTimingCounter::default();
+        for elapsed_us in 1..=100 {
+            counter.record(Duration::from_micros(elapsed_us));
+        }
+
+        assert_eq!(
+            counter.snapshot(),
+            RuntimeTimingSnapshot {
+                samples: 100,
+                total_us: 5_050,
+                max_us: 100,
+                p50_us: 55,
+                p95_us: 95,
+                p99_us: 100,
+            }
+        );
     }
 
     #[test]

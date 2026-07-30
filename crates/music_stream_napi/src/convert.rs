@@ -4,8 +4,8 @@ use music_stream::{
     ExternalFrameAck, ExternalFrameOutcome, GainLevel, HttpLiveStreamConfig, HttpSourceConfig,
     MusicStreamError, ReplayGainConfig, ReplayGainMetadata, ReplayGainMode,
     ReplayGainRecommendation, ReplayGainSource, RtcpReceiverReportSnapshot, RtpTransportConfig,
-    RuntimeResourceLimits, RuntimeResourceSnapshot, SourceResolverConfig, StreamRuntimeProgress,
-    TrackSource,
+    RuntimeResourceLimits, RuntimeResourceSnapshot, RuntimeTimingSnapshot, SourceResolverConfig,
+    StreamRuntimeProgress, TrackSource,
 };
 
 use crate::types::*;
@@ -82,10 +82,10 @@ pub(crate) fn runtime_resource_limits_from_input(
         limits.max_streams = value as usize;
     }
     if let Some(value) = input.max_cpu_workers {
-        limits.max_cpu_workers = value as usize;
+        limits.set_max_cpu_workers_with_blocking_defaults(value as usize);
     }
     if let Some(value) = input.max_blocking_producers {
-        limits.max_blocking_producers = value as usize;
+        limits.set_max_blocking_producers_with_preload_default(value as usize);
     }
     if let Some(value) = input.max_blocking_preloads {
         limits.max_blocking_preloads = value as usize;
@@ -165,6 +165,16 @@ impl From<RuntimeResourceSnapshot> for RuntimeResourceDiagnosticsOutput {
                 .unwrap_or(i64::MAX),
             cpu_active: value.cpu_active.try_into().unwrap_or(i64::MAX),
             cpu_current_waiters: value.cpu_current_waiters.try_into().unwrap_or(i64::MAX),
+            cpu_next_waiters: value.cpu_next_waiters.try_into().unwrap_or(i64::MAX),
+            blocking_current_admission_wait: value.blocking_current_admission_wait.into(),
+            blocking_next_admission_wait: value.blocking_next_admission_wait.into(),
+            blocking_start_wait: value.blocking_start_wait.into(),
+            cpu_current_wait: value.cpu_current_wait.into(),
+            cpu_next_wait: value.cpu_next_wait.into(),
+            cpu_current_hold: value.cpu_current_hold.into(),
+            cpu_next_hold: value.cpu_next_hold.into(),
+            source_wait: value.source_wait.into(),
+            output_wait: value.output_wait.into(),
             artifact_cache_entries: value.artifact_cache_entries.try_into().unwrap_or(i64::MAX),
             artifact_cache_retained_quota_bytes: value
                 .artifact_cache_retained_quota_bytes
@@ -175,6 +185,19 @@ impl From<RuntimeResourceSnapshot> for RuntimeResourceDiagnosticsOutput {
                 .try_into()
                 .unwrap_or(i64::MAX),
             live_download_flights: value.live_download_flights.try_into().unwrap_or(i64::MAX),
+        }
+    }
+}
+
+impl From<RuntimeTimingSnapshot> for RuntimeTimingDiagnosticsOutput {
+    fn from(value: RuntimeTimingSnapshot) -> Self {
+        Self {
+            samples: saturating_i64(value.samples),
+            total_us: saturating_i64(value.total_us),
+            max_us: saturating_i64(value.max_us),
+            p50_us: saturating_i64(value.p50_us),
+            p95_us: saturating_i64(value.p95_us),
+            p99_us: saturating_i64(value.p99_us),
         }
     }
 }
@@ -607,6 +630,44 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    fn resource_limits_input() -> RuntimeResourceLimitsInput {
+        RuntimeResourceLimitsInput {
+            max_streams: None,
+            max_cpu_workers: None,
+            max_blocking_producers: None,
+            max_blocking_preloads: None,
+            max_concurrent_http_downloads: None,
+            max_concurrent_live_streams: None,
+            max_live_buffered_bytes: None,
+            max_tempfile_bytes: None,
+        }
+    }
+
+    #[test]
+    fn cpu_override_recomputes_dependent_blocking_defaults() {
+        let mut input = resource_limits_input();
+        input.max_cpu_workers = Some(8);
+        let limits = runtime_resource_limits_from_input(Some(input)).expect("CPU override");
+        assert_eq!(limits.max_cpu_workers, 8);
+        assert_eq!(limits.max_blocking_producers, 64);
+        assert_eq!(limits.max_blocking_preloads, 16);
+
+        let mut input = resource_limits_input();
+        input.max_cpu_workers = Some(64);
+        input.max_blocking_producers = Some(80);
+        let limits = runtime_resource_limits_from_input(Some(input)).expect("blocking override");
+        assert_eq!(limits.max_cpu_workers, 64);
+        assert_eq!(limits.max_blocking_producers, 80);
+        assert_eq!(limits.max_blocking_preloads, 20);
+
+        let mut input = resource_limits_input();
+        input.max_cpu_workers = Some(64);
+        input.max_blocking_producers = Some(80);
+        input.max_blocking_preloads = Some(7);
+        let limits = runtime_resource_limits_from_input(Some(input)).expect("preload override");
+        assert_eq!(limits.max_blocking_preloads, 7);
+    }
 
     #[test]
     fn platform_bitrate_limit_can_only_lower_the_music_target() {

@@ -60,6 +60,10 @@ producer；preload 必须严格小于 blocking 总量；HTTP 至少有两个槽�
 current；live 只有 current，因此最小为一；单个
 URL `maxBytes` 不得超过 tempfile 总预算四分之一。
 
+只覆盖`maxCpuWorkers`时，binding会按新的CPU值重算blocking默认值；覆盖
+`maxBlockingProducers`时也会把preload默认重算为四分之一。显式提供更下游字段始终优先，因此可以像
+上例一样固定全部三项。这样降低CPU额度不会意外继承启动机器原先可能为256的blocking thread预算。
+
 ## 正确描述 source
 
 ### 稳定内容 ID
@@ -338,7 +342,12 @@ sender lateness 和 Node event-loop delay，再调整最接近瓶颈的一层。
 
 共享 admission 或 cache 疑似卡住时，按需调用 `getResourceDiagnostics()`。其中 tempfile 字段以 1 MiB
 quota unit 表示；完整 artifact 可以继续占用 global units，但没有 active next transfer 时
-`tempfilePreloadUnitsAvailable` 应回到配置基线。该快照不包含签名 URL/header，也不应作为高频时钟轮询。
+`tempfilePreloadUnitsAvailable` 应回到配置基线。`cpuCurrentWaiters`/`cpuNextWaiters`区分播放与预载竞争；
+`blockingCurrentAdmissionWait`/`blockingNextAdmissionWait`、`blockingStartWait`、`cpuCurrentWait`/
+`cpuNextWait`、`cpuCurrentHold`/`cpuNextHold`、`sourceWait`和`outputWait`均提供
+`{samples,totalUs,maxUs,p50Us,p95Us,p99Us}`累计摘要。分位数在每个2倍区间内再分4个子桶，
+适合容量告警和版本对比，不替代需要精确bucket/role/source标签的metrics recorder。该快照不包含签名
+URL/header，不重置计数，也不应作为高频时钟轮询。
 
 stop 后保留最近的轻量 stopped status，因此重复 stop/status 可以用于收敛。该历史是容量等于
 `maxStreams` 的 LRU，旧 ID 会被淘汰，不是持久存储。新的 start 可以复用已停止的 `streamId`；

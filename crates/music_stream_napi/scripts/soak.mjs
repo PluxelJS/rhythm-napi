@@ -44,7 +44,15 @@ await new Promise((resolve, reject) => {
 })
 const sinkPort = sink.address().port
 
-const streamer = new Streamer({ maxStreams: options.streams })
+const resourceLimits = { maxStreams: options.streams }
+if (options.cpuWorkers !== undefined) resourceLimits.maxCpuWorkers = options.cpuWorkers
+if (options.blockingProducers !== undefined) {
+  resourceLimits.maxBlockingProducers = options.blockingProducers
+}
+if (options.blockingPreloads !== undefined) {
+  resourceLimits.maxBlockingPreloads = options.blockingPreloads
+}
+const streamer = new Streamer(resourceLimits)
 const streamIds = Array.from({ length: options.streams }, (_, index) => `soak-${index}`)
 const nextTrackIndex = new Map(streamIds.map((streamId) => [streamId, 1]))
 let maintenanceErrors = 0
@@ -69,6 +77,7 @@ let eventLoopP99MaxMs = 0
 let eventLoopMaxMs = 0
 let missingDiagnosticsSamples = 0
 let peakMissingDiagnostics = 0
+let finalResourceDiagnostics
 let startedAt = performance.now()
 let previousSampleAt = startedAt
 let lastSampleAt = startedAt
@@ -83,13 +92,6 @@ try {
       rtcpMux: true,
       mtu: 1_200,
     },
-    buffer: {
-      decodeBatchMs: 80,
-      encodedCapacityMs: 800,
-      prebufferMs: 100,
-      nextPrimeMs: 200,
-      maxPlayoutLatenessMs: 100,
-    },
   })))
 
   startedAt = performance.now()
@@ -103,6 +105,9 @@ try {
     fixtureSeconds: options.fixtureSeconds,
     opusComplexity: 10,
     opusBitrate: 320_000,
+    cpuWorkers: options.cpuWorkers ?? 'default',
+    blockingProducers: options.blockingProducers ?? 'default',
+    blockingPreloads: options.blockingPreloads ?? 'default',
   }))
 
   const deadline = performance.now() + options.durationSeconds * 1_000
@@ -188,6 +193,7 @@ try {
     await Promise.all(maintenance)
 
     const events = streamer.drainEvents()
+    const resourceDiagnostics = streamer.getResourceDiagnostics()
     runtimeErrors += events.filter((event) => event.type === 'error').length
     buffered.sort((left, right) => left - right)
     const memory = process.memoryUsage()
@@ -244,6 +250,8 @@ try {
       nextTracks,
       maintenanceErrors,
       runtimeErrors,
+      resources: summarizeResources(resourceDiagnostics),
+      runtimeTiming: summarizeRuntimeTiming(resourceDiagnostics),
     }
     console.log(JSON.stringify(sample))
     previousSinkPackets = currentSinkPackets
@@ -259,6 +267,7 @@ try {
   }
 } finally {
   eventLoop.disable()
+  finalResourceDiagnostics = streamer.getResourceDiagnostics()
   await streamer.shutdown().catch(() => {
     runtimeErrors += 1
   })
@@ -295,6 +304,8 @@ console.log(JSON.stringify({
   maintenanceErrors,
   runtimeErrors,
   interrupted: abort.signal.aborted,
+  resources: summarizeResources(finalResourceDiagnostics),
+  runtimeTiming: summarizeRuntimeTiming(finalResourceDiagnostics),
 }))
 if (runtimeErrors > 0) process.exitCode = 1
 
@@ -333,11 +344,19 @@ function parseOptions(arguments_) {
     durationSeconds: integerOption(values, 'duration-seconds', 120, 5, 86_400),
     sampleSeconds: integerOption(values, 'sample-seconds', 2, 1, 60),
     fixtureSeconds: integerOption(values, 'fixture-seconds', 5, 2, 60),
+    cpuWorkers: optionalIntegerOption(values, 'cpu-workers', 1, 256),
+    blockingProducers: optionalIntegerOption(values, 'blocking-producers', 2, 256),
+    blockingPreloads: optionalIntegerOption(values, 'blocking-preloads', 1, 255),
   }
   if (options.sampleSeconds * 2 > options.fixtureSeconds) {
     usage('--sample-seconds must be at most half of --fixture-seconds so next stays primed')
   }
   return options
+}
+
+function optionalIntegerOption(values, name, minimum, maximum) {
+  if (!values.has(name)) return undefined
+  return integerOption(values, name, minimum, minimum, maximum)
 }
 
 function integerOption(values, name, fallback, minimum, maximum) {
@@ -351,7 +370,8 @@ function integerOption(values, name, fallback, minimum, maximum) {
 function usage(message) {
   throw new TypeError(
     `${message}\nusage: node scripts/soak.mjs --streams 10 --duration-seconds 120 `
-      + '--sample-seconds 2 --fixture-seconds 5',
+      + '--sample-seconds 2 --fixture-seconds 5 [--cpu-workers 8] '
+      + '[--blocking-producers 64] [--blocking-preloads 16]',
   )
 }
 
@@ -439,6 +459,30 @@ function summarize(values) {
     p50: percentile(values, 0.5),
     p95: percentile(values, 0.95),
     max: values.at(-1),
+  }
+}
+
+function summarizeResources(diagnostics) {
+  return {
+    cpuActive: diagnostics.cpuActive,
+    cpuCurrentWaiters: diagnostics.cpuCurrentWaiters,
+    cpuNextWaiters: diagnostics.cpuNextWaiters,
+    blockingProducersAvailable: diagnostics.blockingProducersAvailable,
+    blockingPreloadsAvailable: diagnostics.blockingPreloadsAvailable,
+  }
+}
+
+function summarizeRuntimeTiming(diagnostics) {
+  return {
+    blockingCurrentAdmissionWait: diagnostics.blockingCurrentAdmissionWait,
+    blockingNextAdmissionWait: diagnostics.blockingNextAdmissionWait,
+    blockingStartWait: diagnostics.blockingStartWait,
+    cpuCurrentWait: diagnostics.cpuCurrentWait,
+    cpuNextWait: diagnostics.cpuNextWait,
+    cpuCurrentHold: diagnostics.cpuCurrentHold,
+    cpuNextHold: diagnostics.cpuNextHold,
+    sourceWait: diagnostics.sourceWait,
+    outputWait: diagnostics.outputWait,
   }
 }
 

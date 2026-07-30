@@ -31,10 +31,32 @@ pub struct RuntimeResourceDiagnosticsOutput {
     pub blocking_preloads_available: i64,
     pub cpu_active: i64,
     pub cpu_current_waiters: i64,
+    pub cpu_next_waiters: i64,
+    pub blocking_current_admission_wait: RuntimeTimingDiagnosticsOutput,
+    pub blocking_next_admission_wait: RuntimeTimingDiagnosticsOutput,
+    pub blocking_start_wait: RuntimeTimingDiagnosticsOutput,
+    pub cpu_current_wait: RuntimeTimingDiagnosticsOutput,
+    pub cpu_next_wait: RuntimeTimingDiagnosticsOutput,
+    pub cpu_current_hold: RuntimeTimingDiagnosticsOutput,
+    pub cpu_next_hold: RuntimeTimingDiagnosticsOutput,
+    pub source_wait: RuntimeTimingDiagnosticsOutput,
+    pub output_wait: RuntimeTimingDiagnosticsOutput,
     pub artifact_cache_entries: i64,
     pub artifact_cache_retained_quota_bytes: i64,
     pub download_registry_entries: i64,
     pub live_download_flights: i64,
+}
+
+/// Cumulative timing distribution summary since this Streamer was constructed.
+#[derive(Debug)]
+#[napi(object)]
+pub struct RuntimeTimingDiagnosticsOutput {
+    pub samples: i64,
+    pub total_us: i64,
+    pub max_us: i64,
+    pub p50_us: i64,
+    pub p95_us: i64,
+    pub p99_us: i64,
 }
 
 #[derive(Debug)]
