@@ -188,7 +188,7 @@ impl VolumeConfig {
         if gain == 1.0
             && samples
                 .iter()
-                .all(|sample| sample.is_finite() && (-1.0..=1.0).contains(sample))
+                .all(|sample| sample.abs() <= 1.0)
         {
             return;
         }
@@ -384,6 +384,11 @@ mod tests {
         let mut over_range = vec![1.25, -1.5];
         config.apply_in_place(&mut over_range);
         assert_eq!(over_range, vec![1.0, -1.0]);
+
+        let mut non_finite = vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+        config.apply_in_place(&mut non_finite);
+        assert!(non_finite[0].is_nan());
+        assert_eq!(&non_finite[1..], &[1.0, -1.0]);
     }
 
     #[test]

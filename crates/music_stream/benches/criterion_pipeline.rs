@@ -1,10 +1,10 @@
 use std::hint::black_box;
 
 use bytes::Bytes;
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use music_stream::{
     DecodePoll, DecodedChunk, DecoderBackend, LibOpusEncoder, LibOpusEncoderConfig,
-    OpusEncoderBackend, OpusFrame, PcmFrame, PipelineConfig, PlayoutPipeline, Result,
+    OpusEncoderBackend, OpusFrame, PcmFrame, PipelineConfig, PlayoutPipeline, Result, VolumeConfig,
 };
 
 const SAMPLE_RATE: u32 = 48_000;
@@ -21,6 +21,37 @@ fn criterion_pipeline(c: &mut Criterion) {
     c.bench_function("pipeline/libopus_worker_and_drain_5s", |b| {
         b.iter(|| run_libopus_pipeline().expect("libopus pipeline benchmark"))
     });
+    benchmark_unity_gain(c);
+}
+
+fn benchmark_unity_gain(c: &mut Criterion) {
+    let sample_count = SAMPLE_RATE as usize * CHANNELS as usize * BENCH_SECONDS as usize;
+    let valid: Vec<f32> = (0..sample_count)
+        .map(|sample| ((sample % 256) as f32 / 128.0) - 1.0)
+        .collect();
+    let mut over_range = valid.clone();
+    if let Some(last) = over_range.last_mut() {
+        *last = 1.5;
+    }
+    let volume = VolumeConfig::default();
+    let mut group = c.benchmark_group("dsp/volume");
+    group.throughput(Throughput::Elements(sample_count as u64));
+    for (name, samples) in [
+        ("unity_valid_stereo_5s", valid),
+        ("unity_over_range_tail_stereo_5s", over_range),
+    ] {
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || samples.clone(),
+                |mut samples| {
+                    volume.apply_in_place(&mut samples);
+                    black_box(samples);
+                },
+                BatchSize::LargeInput,
+            );
+        });
+    }
+    group.finish();
 }
 
 fn run_libopus_pipeline() -> Result<(usize, usize)> {

@@ -30,6 +30,8 @@ pub use audio::AudioFormat;
 #[doc(hidden)]
 pub use audio::decode::SymphoniaFileDecoder;
 #[doc(hidden)]
+pub use audio::dsp::VolumeConfig;
+#[doc(hidden)]
 pub use audio::resample::{RubatoResamplerConfig, RubatoResamplingDecoder};
 pub use error::{ErrorCode, MusicStreamError, Result};
 pub use event::{SourceRole, StreamEvent};

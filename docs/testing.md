@@ -117,6 +117,10 @@ cargo bench --bench criterion_media -- --baseline before
 音乐播放采用质量优先基线：Opus complexity固定为10，Rubato默认质量参数不因吞吐测试下调。
 benchmark用于寻找等质量实现中的CPU、复制和allocation浪费，不用于论证降低编码或重采样质量。
 
+`criterion_pipeline`另有独立`dsp/volume`基线。等价地把unity-gain合法性判断化简为
+`sample.abs() <= 1.0`后，编译器可向量化整buffer扫描；5秒合法stereo PCM从约757 µs降至242 µs，
+末尾含越界值并执行clamp的路径从约814 µs降至298 µs。NaN与infinity仍进入原clamp路径。
+
 `allocation_profile`用release构建直接统计每次workload的allocation次数和申请字节，不测耗时：
 
 ```sh

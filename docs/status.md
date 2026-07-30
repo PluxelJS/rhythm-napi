@@ -60,8 +60,9 @@
 1. 分析剩余 Rubato/PCM 分配。mono 输入已改为先 resample、再原地扩展 stereo；确定性 5 秒 fixture
    保持 bit-for-bit 双声道等价，resample 中位时间下降约 41%，当前约 526 次分配、567333 bytes。
    后续只在 callsite profile 证明收益时检查 pending input compact、output recycle 和 Rubato 内部分配。
-2. 分析 DSP。为 unity-gain 路径的整 buffer validity scan 建立独立基准；只有 profile 证明收益时，
-   才评估 gain/downmix/limiter 融合或 SIMD，并保持相同 clipping、NaN 处理和输出质量。
+2. 继续分析 DSP。unity-gain validity scan 已通过等价条件化简获得自动向量化，5 秒合法 PCM 基线
+   中位时间下降约 66%，并保持 over-range、NaN 和 infinity 处理。后续只有 profile 证明收益时，
+   才评估 gain/downmix/limiter 融合或显式 SIMD，并保持相同 clipping 与输出质量。
 3. NUMA 首选部署隔离：一 node 一进程，同时绑定 CPU 与 memory。只有生产 profile 显示 remote memory
    access、频繁迁核或跨 node 尾延迟后，才评估 node-local 专用 executor；不因机器具有多个 NUMA node
    就增加运行时复杂度。
