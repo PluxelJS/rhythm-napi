@@ -63,6 +63,9 @@ URL `maxBytes` 不得超过 tempfile 总预算四分之一。
 只覆盖`maxCpuWorkers`时，binding会按新的CPU值重算blocking默认值；覆盖
 `maxBlockingProducers`时也会把preload默认重算为四分之一。显式提供更下游字段始终优先，因此可以像
 上例一样固定全部三项。这样降低CPU额度不会意外继承启动机器原先可能为256的blocking thread预算。
+省略`maxCpuWorkers`时，native在进程可见并行度大于1时默认保留一个logical CPU，最少仍允许一个codec
+worker。`getResourceDiagnostics()`中的`cpuParallelism`、`cpuWorkersMaximum`和`cpuSystemHeadroom`可用于
+确认容器cpuset和最终额度是否符合部署预期。
 
 ## 正确描述 source
 

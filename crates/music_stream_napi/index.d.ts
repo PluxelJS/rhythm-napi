@@ -177,6 +177,9 @@ export interface RuntimeResourceDiagnosticsOutput {
   blockingProducersAvailable: number
   blockingPreloadsAvailable: number
   cpuActive: number
+  cpuParallelism: number
+  cpuWorkersMaximum: number
+  cpuSystemHeadroom: number
   cpuCurrentWaiters: number
   cpuNextWaiters: number
   blockingCurrentAdmissionWait: RuntimeTimingDiagnosticsOutput

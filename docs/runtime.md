@@ -165,7 +165,7 @@ source 成功出口同步归还 preload permit，只有 global permit 随完整 
 和普通 growing spool 使用相同的 terminal accounting。
 
 Node 可按需调用 `getResourceDiagnostics()` 读取各 semaphore available permits、cache retained quota、flight、
-current/next CPU waiter和分阶段运行时延迟。每个延迟摘要包含累计samples/total/max及log2桶近似
+CPU parallelism/maximum/system headroom、current/next CPU waiter和分阶段运行时延迟。每个延迟摘要包含累计samples/total/max及log2桶近似
 p50/p95/p99，覆盖blocking closure启动、CPU lease wait/hold、source wait和output handoff；读取不重置
 统计；blocking admission按current/next分别汇总，能与上游closure启动排队区分。该方法不进入逐帧
 热循环，也不回显 URL/header；最小额度回归用它断言每次 promotion 后

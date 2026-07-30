@@ -5,14 +5,15 @@
 
 ## CPU 预算
 
-`maxCpuWorkers` 的默认值来自进程可见 `available_parallelism`，它通常包含 SMT logical CPU，也不会自动
-为 Node event loop、Tokio async workers、TLS、磁盘、内核和 IRQ 保留余量。生产必须以实际 cpuset 为
-边界测试，而不是按宿主机总核数填写。
+`maxCpuWorkers` 的默认值来自进程可见 `available_parallelism`：大于1时自动减去一个logical CPU，
+并保持至少1、最多256。它通常包含SMT logical CPU；一个CPU的默认headroom只是安全起点，生产仍必须
+以实际cpuset为边界测试，而不是按宿主机总核数填写。
 
 建议从以下矩阵起步：
 
 - 只创建一个长生命周期 `Streamer`；每个实例拥有独立的整套 CPU/resource预算；
-- 在进程可见 CPU 中为非codec工作保留至少一个logical CPU，大于8个logical CPU时同时比较保留1/2个；
+- 通过`cpuParallelism`、`cpuWorkersMaximum`和`cpuSystemHeadroom`确认实际预算；大于8个logical CPU时
+  同时比较默认保留1个与显式保留2个；
 - 对 SMT 主机同时测试物理核数、物理核数加部分 sibling和全部logical CPU，不能假设超线程线性扩展；
 - `maxBlockingProducers`按允许同时存活的current、next和慢source设置，不因CPU worker较少而盲目保留
   64/256个parked thread；`maxBlockingPreloads`只覆盖确实需要的预载；

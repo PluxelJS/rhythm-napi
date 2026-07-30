@@ -53,6 +53,25 @@
 
 这些优化不得重新引入第二层 queue、跨 sender payload 复制或更差的取消语义。
 
+### 下一阶段性能优化
+
+下一阶段只处理 profile 已证明的热点，并按以下顺序评估；这些项目尚未成为当前实现能力：
+
+1. 先分析 Rubato/PCM 分配。当前确定性 5 秒 resample fixture 的基线约为 527 次分配、574462
+   bytes；分别检查 pending input compact、output buffer recycle 和 Rubato 内部分配，并评估 mono
+   输入先 resample、再扩展为 stereo 是否能在等质量下减少工作量。
+2. 再分析 DSP。为 unity-gain 路径的整 buffer validity scan 建立独立基准；只有 profile 证明收益时，
+   才评估 gain/downmix/limiter 融合或 SIMD，并保持相同 clipping、NaN 处理和输出质量。
+3. NUMA 首选部署隔离：一 node 一进程，同时绑定 CPU 与 memory。只有生产 profile 显示 remote memory
+   access、频繁迁核或跨 node 尾延迟后，才评估 node-local 专用 executor；不因机器具有多个 NUMA node
+   就增加运行时复杂度。
+4. io_uring 只在 growing spool、本地文件或 tempfile I/O 被证明是瓶颈后评估。codec 计算本身不会因
+   io_uring 加速，且 Tokio 异步网络路径不应为了统一模型而重写。
+
+每项候选改动都必须使用命名 Criterion baseline 和 allocation profile，并通过相同 source/fixture 的
+10/50 路 N-API soak。验收同时比较 CPU、allocation、sender lateness、underrun、取消收敛和 Node
+event-loop delay；降低分配次数但增加 CPU，或改善平均值但恶化尾延迟，都不视为优化。
+
 ### Loudness 分析
 
 当前会在首个 PCM frame 前读取容器中标准化的 ReplayGain track/album gain 与 peak 标签，冻结一次安全

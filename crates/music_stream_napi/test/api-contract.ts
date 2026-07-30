@@ -23,6 +23,9 @@ type _PlayStateContract = Assert<
 type _ResourceDiagnosticsContract = Assert<
 	Equal<RuntimeResourceDiagnosticsOutput['tempfilePreloadUnitsAvailable'], number>
 >
+type _CpuHeadroomDiagnosticsContract = Assert<
+	Equal<RuntimeResourceDiagnosticsOutput['cpuSystemHeadroom'], number>
+>
 type _RuntimeTimingDiagnosticsContract = Assert<
 	Equal<RuntimeResourceDiagnosticsOutput['cpuCurrentWait']['maxUs'], number>
 >

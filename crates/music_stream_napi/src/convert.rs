@@ -164,6 +164,9 @@ impl From<RuntimeResourceSnapshot> for RuntimeResourceDiagnosticsOutput {
                 .try_into()
                 .unwrap_or(i64::MAX),
             cpu_active: value.cpu_active.try_into().unwrap_or(i64::MAX),
+            cpu_parallelism: value.cpu_parallelism.try_into().unwrap_or(i64::MAX),
+            cpu_workers_maximum: value.cpu_workers_maximum.try_into().unwrap_or(i64::MAX),
+            cpu_system_headroom: value.cpu_system_headroom.try_into().unwrap_or(i64::MAX),
             cpu_current_waiters: value.cpu_current_waiters.try_into().unwrap_or(i64::MAX),
             cpu_next_waiters: value.cpu_next_waiters.try_into().unwrap_or(i64::MAX),
             blocking_current_admission_wait: value.blocking_current_admission_wait.into(),

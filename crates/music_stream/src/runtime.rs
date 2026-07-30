@@ -50,6 +50,7 @@ const MAX_TEMPFILE_BYTES: u64 = 1024 * 1024 * 1024;
 const TEMPFILE_QUOTA_BYTES: u64 = 1024 * 1024;
 const MIN_BLOCKING_PRODUCERS: usize = 64;
 const MAX_BLOCKING_PRODUCERS: usize = 256;
+const SYSTEM_CPU_HEADROOM: usize = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StreamOutputConfig {
@@ -217,9 +218,9 @@ impl RuntimePerformanceCounters {
 
 impl Default for RuntimeResourceLimits {
     fn default() -> Self {
-        let max_cpu_workers = std::thread::available_parallelism()
-            .map_or(2, |value| value.get())
-            .min(MAX_BLOCKING_PRODUCERS);
+        let available_parallelism =
+            std::thread::available_parallelism().map_or(2, |value| value.get());
+        let max_cpu_workers = default_max_cpu_workers(available_parallelism);
         let (max_blocking_producers, max_blocking_preloads) =
             Self::blocking_defaults(max_cpu_workers);
         Self {
@@ -233,6 +234,12 @@ impl Default for RuntimeResourceLimits {
             max_tempfile_bytes: MAX_TEMPFILE_BYTES,
         }
     }
+}
+
+fn default_max_cpu_workers(available_parallelism: usize) -> usize {
+    available_parallelism
+        .saturating_sub(SYSTEM_CPU_HEADROOM)
+        .clamp(1, MAX_BLOCKING_PRODUCERS)
 }
 
 impl RuntimeResourceLimits {
@@ -263,6 +270,7 @@ impl RuntimeResourceLimits {
 #[derive(Debug)]
 pub struct RuntimeResources {
     limits: RuntimeResourceLimits,
+    cpu_parallelism: usize,
     streams: Arc<Semaphore>,
     source_cache: SharedSourceArtifactCache,
     source_downloads: SharedSourceDownloadRegistry,
@@ -292,6 +300,9 @@ pub struct RuntimeResourceSnapshot {
     pub blocking_producers_available: usize,
     pub blocking_preloads_available: usize,
     pub cpu_active: usize,
+    pub cpu_parallelism: usize,
+    pub cpu_workers_maximum: usize,
+    pub cpu_system_headroom: usize,
     pub cpu_current_waiters: usize,
     pub cpu_next_waiters: usize,
     pub blocking_current_admission_wait: RuntimeTimingSnapshot,
@@ -341,12 +352,14 @@ impl RuntimeResources {
                 "stream, CPU, blocking producer, HTTP/live connection, live byte, and tempfile limits are invalid".to_owned(),
             ));
         }
+        let cpu_parallelism = std::thread::available_parallelism().map_or(1, |value| value.get());
         let tempfile_permits = usize::try_from(limits.max_tempfile_bytes / TEMPFILE_QUOTA_BYTES)
             .map_err(|_| {
                 MusicStreamError::InvalidConfig("tempfile byte limit is too large".to_owned())
             })?;
         let performance = Arc::new(RuntimePerformanceCounters::default());
         Ok(Self {
+            cpu_parallelism,
             streams: Arc::new(Semaphore::new(limits.max_streams)),
             http_downloads: Arc::new(Semaphore::new(limits.max_concurrent_http_downloads)),
             http_preloads: Arc::new(Semaphore::new(limits.max_concurrent_http_downloads - 1)),
@@ -406,6 +419,11 @@ impl RuntimeResources {
             blocking_producers_available: self.blocking_producers.available_permits(),
             blocking_preloads_available: self.blocking_preloads.available_permits(),
             cpu_active,
+            cpu_parallelism: self.cpu_parallelism,
+            cpu_workers_maximum: self.limits.max_cpu_workers,
+            cpu_system_headroom: self
+                .cpu_parallelism
+                .saturating_sub(self.limits.max_cpu_workers),
             cpu_current_waiters,
             cpu_next_waiters,
             blocking_current_admission_wait: self
@@ -1308,6 +1326,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_cpu_budget_reserves_system_headroom() {
+        assert_eq!(default_max_cpu_workers(1), 1);
+        assert_eq!(default_max_cpu_workers(2), 1);
+        assert_eq!(default_max_cpu_workers(4), 3);
+        assert_eq!(default_max_cpu_workers(12), 11);
+        assert_eq!(default_max_cpu_workers(512), 256);
+    }
+
+    #[test]
     fn runtime_resources_reject_zero_download_concurrency() {
         let error = RuntimeResources::new(RuntimeResourceLimits {
             max_concurrent_http_downloads: 0,
@@ -1351,6 +1378,23 @@ mod tests {
         assert!(Arc::clone(&resources.streams).try_acquire_owned().is_err());
         drop(first);
         assert!(Arc::clone(&resources.streams).try_acquire_owned().is_ok());
+    }
+
+    #[test]
+    fn resource_snapshot_reports_effective_cpu_headroom() {
+        let resources = RuntimeResources::new(RuntimeResourceLimits {
+            max_cpu_workers: 1,
+            ..RuntimeResourceLimits::default()
+        })
+        .expect("resources");
+        let snapshot = resources.snapshot().expect("resource snapshot");
+
+        assert_eq!(snapshot.cpu_workers_maximum, 1);
+        assert!(snapshot.cpu_parallelism >= 1);
+        assert_eq!(
+            snapshot.cpu_system_headroom,
+            snapshot.cpu_parallelism.saturating_sub(1)
+        );
     }
 
     #[test]

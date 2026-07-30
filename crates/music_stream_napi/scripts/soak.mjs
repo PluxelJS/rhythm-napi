@@ -465,6 +465,9 @@ function summarize(values) {
 function summarizeResources(diagnostics) {
   return {
     cpuActive: diagnostics.cpuActive,
+    cpuParallelism: diagnostics.cpuParallelism,
+    cpuWorkersMaximum: diagnostics.cpuWorkersMaximum,
+    cpuSystemHeadroom: diagnostics.cpuSystemHeadroom,
     cpuCurrentWaiters: diagnostics.cpuCurrentWaiters,
     cpuNextWaiters: diagnostics.cpuNextWaiters,
     blockingProducersAvailable: diagnostics.blockingProducersAvailable,

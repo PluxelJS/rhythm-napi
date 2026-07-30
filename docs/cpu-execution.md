@@ -83,7 +83,7 @@ decode、Rubato resample、音量与 limiter、libopus encode，以及同步 rea
 | --- | --- | --- | --- |
 | Tokio blocking thread | Tokio runtime | 可执行同步闭包的 OS thread | 上游 runtime 默认，Rhythm 当前不配置 |
 | `maxBlockingProducers` | Rhythm semaphore | 可长期存活的 codec producer | `clamp(maxCpuWorkers * 4, 64, 256)` |
-| `maxCpuWorkers` | Rhythm `CpuScheduler` | 同时真正进行 codec 计算的 turn | `available_parallelism`，最多 256 |
+| `maxCpuWorkers` | Rhythm `CpuScheduler` | 同时真正进行 codec 计算的 turn | `available_parallelism - 1`，至少1、最多256 |
 
 next 还受 `maxBlockingPreloads = maxBlockingProducers / 4` 限制。多核时 next 重新获取 CPU lease
 必须满足没有 current waiter，并至少给 current 留一个 CPU 名额。promotion 会让同一个 producer
@@ -174,14 +174,15 @@ pool，会让两套执行器都按整机 CPU 数扩张。结果可能是更多�
 
 - `maxBlockingProducers` 下的 producer 可以各自占驻 blocking thread，即使同时计算的只有
   `maxCpuWorkers` 个。小 CPU、大并发或许会出现较多 parked thread、虚拟栈空间和调度开销。
-- 默认 `maxCpuWorkers` 接近进程可用并行度。多个 current 饱和时，虽然 codec 不在 async worker
-  上执行，仍会与 Tokio worker、Node、内核和 TLS/文件系统竞争物理 CPU。
+- 默认 `maxCpuWorkers` 在可见并行度大于1时保留一个logical CPU给Tokio、Node和系统；这只是最小
+  headroom。多个current饱和时仍会与Tokio worker、Node、内核和TLS/文件系统竞争物理CPU。
 - Tokio blocking pool 还承载少量 tempfile、cleanup 等辅助操作。若长期 producer 把上游 pool
   容量占满，这些操作也会排队；Rhythm 自己的 semaphore 不能观察上游 pool queue。
 - `music_stream.runtime.worker_turn_us` 记录整个 turn 的墙钟时间，其中可能包含 source 或 queue
   等待；应结合 `cpuCurrentHold`/`cpuNextHold`、`sourceWait` 和 `outputWait` 区分阶段，不能单独把它
   当作纯 CPU service time或证明 Rayon 会更快。
-- `available_parallelism` 是合理默认，不代表所有容器 CPU quota、共享宿主和延迟目标下的最佳配置。
+- `available_parallelism - 1` 是安全起点，不代表所有容器 CPU quota、SMT、共享宿主和延迟目标下的
+  最佳配置。显式`maxCpuWorkers`可以覆盖默认，诊断会报告parallelism、maximum和实际headroom。
 
 因此生产调优可以降低 `maxCpuWorkers` 给 async/Node/系统留下余量，也可以收紧 blocking producer，
 但必须用相同流量和 source 组合比较首包、underrun、lateness 与 admission wait，不能仅看平均 CPU。

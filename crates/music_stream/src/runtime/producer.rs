@@ -1653,6 +1653,51 @@ mod tests {
     }
 
     #[test]
+    fn next_workers_cannot_consume_the_reserved_current_cpu_slot() {
+        let scheduler = Arc::new(CpuScheduler::with_maximum(4));
+        let cancellation = CancellationToken::new();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let worker_scheduler = Arc::clone(&scheduler);
+            let worker_cancellation = cancellation.clone();
+            let worker_tx = acquired_tx.clone();
+            workers.push(std::thread::spawn(move || {
+                let Some(permit) =
+                    worker_scheduler.acquire(ProducerRole::Next, &worker_cancellation)
+                else {
+                    return;
+                };
+                worker_tx.send(()).expect("report next acquisition");
+                while !worker_cancellation.is_cancelled() {
+                    std::thread::yield_now();
+                }
+                drop(permit);
+            }));
+        }
+        drop(acquired_tx);
+
+        for _ in 0..3 {
+            acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("reserved next capacity");
+        }
+        assert!(acquired_rx.recv_timeout(Duration::from_millis(30)).is_err());
+        assert_eq!(scheduler.diagnostics().0, 3);
+        let current = scheduler
+            .acquire(ProducerRole::Current, &CancellationToken::new())
+            .expect("reserved current permit");
+        assert_eq!(scheduler.diagnostics().0, 4);
+        drop(current);
+
+        cancellation.cancel();
+        for worker in workers {
+            worker.join().expect("next worker");
+        }
+        assert_eq!(scheduler.diagnostics(), (0, 0, 0));
+    }
+
+    #[test]
     fn cancelled_cpu_waiter_leaves_the_scheduler() {
         let scheduler = Arc::new(CpuScheduler::with_maximum(1));
         let active_cancellation = CancellationToken::new();
