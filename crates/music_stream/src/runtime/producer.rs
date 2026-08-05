@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU16, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -7,7 +8,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::opus_queue::{self, OpusQueueReceiver, OpusQueueSender};
+use super::opus_queue::{self, OpusQueueDepth, OpusQueueReceiver, OpusQueueSender};
 use super::{CHANNELS, FRAME_SAMPLES, RuntimePerformanceCounters, SAMPLE_RATE};
 use crate::audio::AudioFormat;
 use crate::audio::decode::{DecoderBackend, SymphoniaFileDecoder, SymphoniaStreamDecoder};
@@ -28,8 +29,6 @@ use crate::source::{
 #[derive(Debug)]
 pub(super) struct CpuScheduler {
     state: std::sync::Mutex<CpuSchedulerState>,
-    current_changed: Condvar,
-    next_changed: Condvar,
     maximum: usize,
     performance: Arc<RuntimePerformanceCounters>,
 }
@@ -37,8 +36,29 @@ pub(super) struct CpuScheduler {
 #[derive(Debug, Default)]
 struct CpuSchedulerState {
     active: usize,
-    current_waiters: usize,
-    next_waiters: usize,
+    current_waiters: VecDeque<Arc<CpuWaiter>>,
+    next_waiters: VecDeque<Arc<CpuWaiter>>,
+}
+
+#[derive(Debug, Default)]
+struct CpuWaiter {
+    changed: Condvar,
+    depth: Option<OpusQueueDepth>,
+}
+
+impl CpuWaiter {
+    fn with_depth(depth: OpusQueueDepth) -> Self {
+        Self {
+            changed: Condvar::new(),
+            depth: Some(depth),
+        }
+    }
+
+    fn buffered_ms(&self) -> u64 {
+        self.depth
+            .as_ref()
+            .map_or(u64::MAX, OpusQueueDepth::buffered_ms)
+    }
 }
 
 impl CpuScheduler {
@@ -53,61 +73,109 @@ impl CpuScheduler {
     ) -> Self {
         Self {
             state: std::sync::Mutex::new(CpuSchedulerState::default()),
-            current_changed: Condvar::new(),
-            next_changed: Condvar::new(),
             maximum: maximum.max(1),
             performance,
         }
     }
 
     fn notify_eligible_waiter(&self, state: &CpuSchedulerState) {
-        if state.current_waiters > 0 && state.active < self.maximum {
-            self.current_changed.notify_one();
+        if state.active >= self.maximum {
+            return;
+        }
+        if let Some(waiter) = most_urgent_current_waiter(state) {
+            waiter.changed.notify_one();
             return;
         }
         let next_limit = self.maximum.saturating_sub(1).max(1);
-        if state.current_waiters == 0 && state.next_waiters > 0 && state.active < next_limit {
-            self.next_changed.notify_one();
+        if state.active < next_limit
+            && let Some(waiter) = state.next_waiters.front()
+        {
+            waiter.changed.notify_one();
         }
     }
 
+    #[cfg(test)]
     fn acquire(
         self: &Arc<Self>,
         role: ProducerRole,
         cancellation: &CancellationToken,
     ) -> Option<CpuPermit> {
+        let waiter = Arc::new(CpuWaiter::default());
+        self.acquire_with_waiter(role, cancellation, &waiter)
+    }
+
+    fn acquire_with_waiter(
+        self: &Arc<Self>,
+        role: ProducerRole,
+        cancellation: &CancellationToken,
+        waiter: &Arc<CpuWaiter>,
+    ) -> Option<CpuPermit> {
         let mut state = self.state.lock().expect("CPU scheduler lock poisoned");
         let current = matches!(role, ProducerRole::Current);
-        if current {
-            state.current_waiters += 1;
-        } else {
-            state.next_waiters += 1;
-        }
         let started = std::time::Instant::now();
+        if cancellation.is_cancelled() {
+            drop(state);
+            record_cpu_wait(&self.performance, current, started.elapsed());
+            return None;
+        }
+
+        let next_limit = self.maximum.saturating_sub(1).max(1);
+        let can_acquire_immediately = if current {
+            state.current_waiters.is_empty() && state.active < self.maximum
+        } else {
+            state.current_waiters.is_empty()
+                && state.next_waiters.is_empty()
+                && state.active < next_limit
+        };
+        if can_acquire_immediately {
+            state.active += 1;
+            drop(state);
+            record_cpu_wait(&self.performance, current, started.elapsed());
+            return Some(CpuPermit {
+                scheduler: Arc::clone(self),
+                current,
+                acquired_at: std::time::Instant::now(),
+            });
+        }
+
+        if current {
+            state.current_waiters.push_back(Arc::clone(waiter));
+        } else {
+            state.next_waiters.push_back(Arc::clone(waiter));
+        }
         loop {
             if cancellation.is_cancelled() {
-                if current {
-                    state.current_waiters = state.current_waiters.saturating_sub(1);
-                } else {
-                    state.next_waiters = state.next_waiters.saturating_sub(1);
-                }
+                remove_cpu_waiter(&mut state, current, waiter);
                 self.notify_eligible_waiter(&state);
                 drop(state);
                 record_cpu_wait(&self.performance, current, started.elapsed());
                 return None;
             }
-            let allowed = match role {
-                ProducerRole::Current => state.active < self.maximum,
-                ProducerRole::Next => {
-                    state.current_waiters == 0
-                        && state.active < self.maximum.saturating_sub(1).max(1)
-                }
+            let first_in_role = if current {
+                most_urgent_current_waiter(&state)
+                    .is_some_and(|selected| Arc::ptr_eq(selected, waiter))
+            } else {
+                state
+                    .next_waiters
+                    .front()
+                    .is_some_and(|first| Arc::ptr_eq(first, waiter))
             };
+            let allowed = first_in_role
+                && if current {
+                    state.active < self.maximum
+                } else {
+                    state.current_waiters.is_empty() && state.active < next_limit
+                };
             if allowed {
                 if current {
-                    state.current_waiters = state.current_waiters.saturating_sub(1);
+                    debug_assert!(remove_cpu_waiter(&mut state, current, waiter));
                 } else {
-                    state.next_waiters = state.next_waiters.saturating_sub(1);
+                    let acquired = state.next_waiters.pop_front();
+                    debug_assert!(
+                        acquired
+                            .as_ref()
+                            .is_some_and(|first| Arc::ptr_eq(first, waiter))
+                    );
                 }
                 state.active += 1;
                 self.notify_eligible_waiter(&state);
@@ -119,12 +187,14 @@ impl CpuScheduler {
                     acquired_at: std::time::Instant::now(),
                 });
             }
-            let changed = if current {
-                &self.current_changed
-            } else {
-                &self.next_changed
-            };
-            let (next, _) = changed
+            if state.active < self.maximum {
+                // Queue depth can change between notifying a waiter and that waiter reacquiring
+                // the scheduler lock. Redirect the wake to the newly most-urgent current instead
+                // of waiting for the cancellation poll timeout or another permit release.
+                self.notify_eligible_waiter(&state);
+            }
+            let (next, _) = waiter
+                .changed
                 .wait_timeout(state, Duration::from_millis(20))
                 .expect("CPU scheduler lock poisoned");
             state = next;
@@ -133,7 +203,43 @@ impl CpuScheduler {
 
     pub(super) fn diagnostics(&self) -> (usize, usize, usize) {
         let state = self.state.lock().expect("CPU scheduler lock poisoned");
-        (state.active, state.current_waiters, state.next_waiters)
+        (
+            state.active,
+            state.current_waiters.len(),
+            state.next_waiters.len(),
+        )
+    }
+}
+
+fn most_urgent_current_waiter(state: &CpuSchedulerState) -> Option<&Arc<CpuWaiter>> {
+    // `min_by_key` retains the first minimum, so equal queue depths remain FIFO. A waiting
+    // producer cannot replenish its queue while the sender continues draining it; reading the
+    // live depth therefore naturally ages a healthy current toward urgency without a wall-clock
+    // priority boost or a scheduler timer.
+    state
+        .current_waiters
+        .iter()
+        .min_by_key(|waiter| waiter.buffered_ms())
+}
+
+fn remove_cpu_waiter(
+    state: &mut CpuSchedulerState,
+    current: bool,
+    waiter: &Arc<CpuWaiter>,
+) -> bool {
+    let waiters = if current {
+        &mut state.current_waiters
+    } else {
+        &mut state.next_waiters
+    };
+    if let Some(index) = waiters
+        .iter()
+        .position(|queued| Arc::ptr_eq(queued, waiter))
+    {
+        waiters.remove(index);
+        true
+    } else {
+        false
     }
 }
 
@@ -149,6 +255,7 @@ struct CpuLease {
     current_role: Arc<AtomicBool>,
     cancellation: CancellationToken,
     scheduler: Arc<CpuScheduler>,
+    waiter: Arc<CpuWaiter>,
     permit: std::sync::Mutex<Option<CpuPermit>>,
     source_wait_started: std::sync::Mutex<Option<std::time::Instant>>,
 }
@@ -158,11 +265,13 @@ impl CpuLease {
         current_role: Arc<AtomicBool>,
         cancellation: CancellationToken,
         scheduler: Arc<CpuScheduler>,
+        depth: OpusQueueDepth,
     ) -> Self {
         Self {
             current_role,
             cancellation,
             scheduler,
+            waiter: Arc::new(CpuWaiter::with_depth(depth)),
             permit: std::sync::Mutex::new(None),
             source_wait_started: std::sync::Mutex::new(None),
         }
@@ -178,7 +287,9 @@ impl CpuLease {
         } else {
             ProducerRole::Next
         };
-        *permit = self.scheduler.acquire(role, &self.cancellation);
+        *permit = self
+            .scheduler
+            .acquire_with_waiter(role, &self.cancellation, &self.waiter);
         permit.is_some()
     }
 
@@ -725,6 +836,7 @@ async fn run_file_artifact(
         Arc::clone(&job.control.current_role),
         job.cancellation.clone(),
         Arc::clone(&job.cpu_scheduler),
+        job.output.depth(),
     ));
     let submitted_at = std::time::Instant::now();
     tokio::task::spawn_blocking(move || {
@@ -765,6 +877,7 @@ async fn run_progressive_url(
         Arc::clone(&job.control.current_role),
         job.cancellation.clone(),
         Arc::clone(&job.cpu_scheduler),
+        job.output.depth(),
     ));
     reader.set_wait_observer(lease.clone());
     let submitted_at = std::time::Instant::now();
@@ -906,6 +1019,7 @@ async fn run_http_stream(
         Arc::clone(&job.control.current_role),
         job.cancellation.clone(),
         Arc::clone(&job.cpu_scheduler),
+        job.output.depth(),
     ));
     reader.set_wait_observer(lease.clone());
     let submitted_at = std::time::Instant::now();
@@ -1287,8 +1401,11 @@ fn decoder_hint(source: &TrackSource) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::*;
     use crate::audio::decode::{DecodedChunk, MemoryDecoder};
+    use crate::audio::frame::OpusFrame;
     use crate::source::{SourceArtifactCache, SourceDownloadRegistry, SourceRuntimeResources};
 
     #[tokio::test]
@@ -1446,6 +1563,7 @@ mod tests {
             Arc::clone(&control.current_role),
             cancellation.clone(),
             Arc::clone(&job.cpu_scheduler),
+            job.output.depth(),
         ));
         let worker = tokio::task::spawn_blocking(move || run_cpu(decoder, job, lease));
 
@@ -1770,6 +1888,149 @@ mod tests {
         current_waiter.join().expect("current waiter");
         next_cancellation.cancel();
         next_waiter.join().expect("next waiter");
+        assert_eq!(scheduler.diagnostics(), (0, 0, 0));
+    }
+
+    #[test]
+    fn current_waiters_acquire_cpu_in_fifo_order() {
+        const WAITERS: usize = 8;
+
+        let scheduler = Arc::new(CpuScheduler::with_maximum(1));
+        let active = scheduler
+            .acquire(ProducerRole::Current, &CancellationToken::new())
+            .expect("active permit");
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let mut waiters = Vec::new();
+        for index in 0..WAITERS {
+            let worker_scheduler = Arc::clone(&scheduler);
+            let acquired_tx = acquired_tx.clone();
+            waiters.push(std::thread::spawn(move || {
+                let permit = worker_scheduler
+                    .acquire(ProducerRole::Current, &CancellationToken::new())
+                    .expect("current permit");
+                acquired_tx.send(index).expect("report acquisition");
+                drop(permit);
+            }));
+            while scheduler.diagnostics().1 != index + 1 {
+                std::thread::yield_now();
+            }
+        }
+        drop(acquired_tx);
+
+        drop(active);
+        let acquired = acquired_rx.iter().collect::<Vec<_>>();
+        assert_eq!(acquired, (0..WAITERS).collect::<Vec<_>>());
+        for waiter in waiters {
+            waiter.join().expect("current waiter");
+        }
+        assert_eq!(scheduler.diagnostics(), (0, 0, 0));
+    }
+
+    #[test]
+    fn next_waiters_acquire_cpu_in_fifo_order() {
+        const WAITERS: usize = 8;
+
+        let scheduler = Arc::new(CpuScheduler::with_maximum(2));
+        let active = scheduler
+            .acquire(ProducerRole::Current, &CancellationToken::new())
+            .expect("active permit");
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let mut waiters = Vec::new();
+        for index in 0..WAITERS {
+            let worker_scheduler = Arc::clone(&scheduler);
+            let acquired_tx = acquired_tx.clone();
+            waiters.push(std::thread::spawn(move || {
+                let permit = worker_scheduler
+                    .acquire(ProducerRole::Next, &CancellationToken::new())
+                    .expect("next permit");
+                acquired_tx.send(index).expect("report acquisition");
+                drop(permit);
+            }));
+            while scheduler.diagnostics().2 != index + 1 {
+                std::thread::yield_now();
+            }
+        }
+        drop(acquired_tx);
+
+        drop(active);
+        let acquired = acquired_rx.iter().collect::<Vec<_>>();
+        assert_eq!(acquired, (0..WAITERS).collect::<Vec<_>>());
+        for waiter in waiters {
+            waiter.join().expect("next waiter");
+        }
+        assert_eq!(scheduler.diagnostics(), (0, 0, 0));
+    }
+
+    #[test]
+    fn least_buffered_current_is_scheduled_before_a_healthy_waiter() {
+        let scheduler = Arc::new(CpuScheduler::with_maximum(1));
+        let active = scheduler
+            .acquire(ProducerRole::Current, &CancellationToken::new())
+            .expect("active permit");
+        let cancellation = CancellationToken::new();
+        let (healthy_output, _healthy_receiver) = opus_queue::bounded(400);
+        for index in 0..10 {
+            healthy_output
+                .send_blocking(
+                    OpusFrame {
+                        generation: 1,
+                        payload: Bytes::from_static(b"opus"),
+                        samples_per_channel: FRAME_SAMPLES,
+                        duration_ms: 20,
+                        marker: false,
+                        track_position_samples: index * u64::from(FRAME_SAMPLES),
+                    },
+                    &cancellation,
+                )
+                .expect("buffer healthy current");
+        }
+        let (starved_output, _starved_receiver) = opus_queue::bounded(400);
+        let healthy_waiter = Arc::new(CpuWaiter::with_depth(healthy_output.depth()));
+        let starved_waiter = Arc::new(CpuWaiter::with_depth(starved_output.depth()));
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+
+        let healthy_scheduler = Arc::clone(&scheduler);
+        let healthy_tx = acquired_tx.clone();
+        let healthy = std::thread::spawn(move || {
+            let permit = healthy_scheduler
+                .acquire_with_waiter(
+                    ProducerRole::Current,
+                    &CancellationToken::new(),
+                    &healthy_waiter,
+                )
+                .expect("healthy current permit");
+            healthy_tx.send("healthy").expect("report acquisition");
+            drop(permit);
+        });
+        while scheduler.diagnostics().1 != 1 {
+            std::thread::yield_now();
+        }
+
+        let starved_scheduler = Arc::clone(&scheduler);
+        let starved = std::thread::spawn(move || {
+            let permit = starved_scheduler
+                .acquire_with_waiter(
+                    ProducerRole::Current,
+                    &CancellationToken::new(),
+                    &starved_waiter,
+                )
+                .expect("starved current permit");
+            acquired_tx.send("starved").expect("report acquisition");
+            drop(permit);
+        });
+        while scheduler.diagnostics().1 != 2 {
+            std::thread::yield_now();
+        }
+
+        drop(active);
+        assert_eq!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .expect("urgent acquisition"),
+            "starved"
+        );
+        healthy.join().expect("healthy waiter");
+        starved.join().expect("starved waiter");
         assert_eq!(scheduler.diagnostics(), (0, 0, 0));
     }
 }

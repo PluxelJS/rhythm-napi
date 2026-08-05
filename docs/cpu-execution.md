@@ -89,9 +89,16 @@ next 还受 `maxBlockingPreloads = maxBlockingProducers / 4` 限制。多核时 
 必须满足没有 current waiter，并至少给 current 留一个 CPU 名额。promotion 会让同一个 producer
 以后按 current 身份竞争，不重建 decoder 或 encoder。
 
-current 与 next 使用分离的 condition variable。permit 释放时只唤醒一个符合角色与预留规则的
-waiter；若仍有空位，获得 permit 的 waiter 会继续唤醒下一个。不能在每个 Opus frame 边界广播唤醒
-全部 producer，否则高并发下会把公平性开销变成 mutex 惊群。诊断同时报告 current/next waiter。
+current 与 next 使用分离的 waiter 队列，每个 producer 拥有一个可复用的 condition variable，
+permit 释放时只精确唤醒一个符合角色与预留规则的 waiter；若仍有空位，获得 permit 的 waiter 会继续
+唤醒下一个。无竞争获取不进入队列，也不产生逐 turn 分配或引用计数修改。不能在每个 Opus frame
+边界广播唤醒全部 producer，否则高并发下会把公平性开销变成 mutex 惊群。
+
+current waiter 按其 Opus queue 的实时 `bufferedMs` 从低到高选择；相同深度保持 FIFO。等待 CPU 时
+producer 不能补充 queue，而 sender 仍会继续消费，因此健康 current 会自然向低水位老化，不需要
+额外 timer 或人为 priority boost。next 仍严格 FIFO，且只有没有 current waiter并满足 `N-1` 预留时
+才能取得 permit。队列深度通过无锁只读投影提供，scheduler 不获取 Opus queue mutex。诊断仍同时
+报告 current/next waiter。
 
 因此允许存在：
 

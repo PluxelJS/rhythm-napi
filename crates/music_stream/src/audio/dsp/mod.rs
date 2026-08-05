@@ -185,11 +185,7 @@ impl VolumeConfig {
         // Decoded PCM is normally already in libopus' [-1, 1] float range. Preserve the previous
         // clamping behavior for malformed or over-range sources, but avoid dirtying every cache
         // line for the overwhelmingly common 100%-volume, 0 dB path.
-        if gain == 1.0
-            && samples
-                .iter()
-                .all(|sample| sample.abs() <= 1.0)
-        {
+        if gain == 1.0 && samples.iter().all(|sample| sample.abs() <= 1.0) {
             return;
         }
 

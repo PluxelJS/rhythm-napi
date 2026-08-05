@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -26,6 +27,7 @@ struct QueueState {
 #[derive(Debug)]
 struct QueueInner {
     capacity_ms: u64,
+    buffered_ms: AtomicU64,
     state: Mutex<QueueState>,
     space_available: Condvar,
     changed: watch::Sender<QueueSnapshot>,
@@ -42,6 +44,18 @@ pub(super) struct OpusQueueReceiver {
     changed: watch::Receiver<QueueSnapshot>,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct OpusQueueDepth {
+    inner: Arc<QueueInner>,
+}
+
+impl OpusQueueDepth {
+    #[must_use]
+    pub(super) fn buffered_ms(&self) -> u64 {
+        self.inner.buffered_ms.load(Ordering::Relaxed)
+    }
+}
+
 pub(super) fn bounded(capacity_ms: u64) -> (OpusQueueSender, OpusQueueReceiver) {
     let initial = QueueSnapshot {
         buffered_ms: 0,
@@ -50,6 +64,7 @@ pub(super) fn bounded(capacity_ms: u64) -> (OpusQueueSender, OpusQueueReceiver) 
     let (changed, receiver) = watch::channel(initial);
     let inner = Arc::new(QueueInner {
         capacity_ms,
+        buffered_ms: AtomicU64::new(0),
         state: Mutex::new(QueueState {
             frames: VecDeque::new(),
             buffered_ms: 0,
@@ -72,6 +87,12 @@ pub(super) fn bounded(capacity_ms: u64) -> (OpusQueueSender, OpusQueueReceiver) 
 }
 
 impl OpusQueueSender {
+    pub(super) fn depth(&self) -> OpusQueueDepth {
+        OpusQueueDepth {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
     pub(super) fn send_blocking(
         &self,
         frame: OpusFrame,
@@ -107,8 +128,12 @@ impl OpusQueueSender {
             ));
         }
 
-        state.buffered_ms = state.buffered_ms.saturating_add(frame.duration_ms);
+        let duration_ms = frame.duration_ms;
         state.frames.push_back(frame);
+        state.buffered_ms = state.buffered_ms.saturating_add(duration_ms);
+        self.inner
+            .buffered_ms
+            .store(state.buffered_ms, Ordering::Relaxed);
         self.publish(&state);
         Ok(())
     }
@@ -163,6 +188,9 @@ impl OpusQueueReceiver {
         let mut state = self.inner.state.lock().expect("Opus queue lock poisoned");
         let frame = state.frames.pop_front()?;
         state.buffered_ms = state.buffered_ms.saturating_sub(frame.duration_ms);
+        self.inner
+            .buffered_ms
+            .store(state.buffered_ms, Ordering::Relaxed);
         self.inner.changed.send_replace(QueueSnapshot {
             buffered_ms: state.buffered_ms,
             sender_alive: state.sender_alive,
@@ -181,6 +209,9 @@ impl OpusQueueReceiver {
         }
         let frame = state.frames.pop_front().expect("queue length was checked");
         state.buffered_ms = state.buffered_ms.saturating_sub(frame.duration_ms);
+        self.inner
+            .buffered_ms
+            .store(state.buffered_ms, Ordering::Relaxed);
         self.inner.changed.send_replace(QueueSnapshot {
             buffered_ms: state.buffered_ms,
             sender_alive: state.sender_alive,
@@ -200,6 +231,7 @@ impl Drop for OpusQueueReceiver {
         state.receiver_alive = false;
         state.frames.clear();
         state.buffered_ms = 0;
+        self.inner.buffered_ms.store(0, Ordering::Relaxed);
         self.inner.space_available.notify_all();
     }
 }
@@ -224,6 +256,7 @@ mod tests {
     #[test]
     fn queue_is_bounded_by_media_duration() {
         let (sender, receiver) = bounded(40);
+        let depth = sender.depth();
         let cancellation = CancellationToken::new();
         sender
             .send_blocking(frame(20), &cancellation)
@@ -232,8 +265,12 @@ mod tests {
             .send_blocking(frame(20), &cancellation)
             .expect("second frame");
         assert_eq!(receiver.buffered_ms(), 40);
+        assert_eq!(depth.buffered_ms(), 40);
         assert_eq!(receiver.try_recv().expect("queued frame").duration_ms, 20);
         assert_eq!(receiver.buffered_ms(), 20);
+        assert_eq!(depth.buffered_ms(), 20);
+        drop(receiver);
+        assert_eq!(depth.buffered_ms(), 0);
     }
 
     #[test]

@@ -29,6 +29,7 @@ npm test
 | shared download 相互阻塞 | 单 subscriber pause/cancel 不影响 active follower；全部 pause 才冻结 |
 | partial response 被伪装完整 | 正文交付后不重试拼接；partial 不进入 cache |
 | codec 阻塞 realtime | source wait 和 queue wait 释放 CPU lease；sender 独立按 deadline 发送 |
+| current 之间互相饿死 | CPU 饱和时低 `bufferedMs` current先执行；相同深度和 next分别保持 FIFO |
 | queue 无界或重复 | 唯一 Opus queue 按媒体时长限流；next prime 后停止生产 |
 | RTP session 被 track 重置 | switch、seek、promotion 后 sequence/timestamp 连续 |
 | sender stall 形成 burst | 超限丢旧媒体；timestamp 跳过、sequence 只统计实际包 |
@@ -36,6 +37,7 @@ npm test
 | 任务 panic 或关闭泄漏 | producer/shared-flight panic 事件化；stop/shutdown 有 deadline 与 barrier |
 | sender panic 后假 Playing | supervisor立即发布active generation failure并收敛runtime |
 | Node event loop 被阻塞 | URL 启动期间 heartbeat 继续；所有等待型方法返回 Promise |
+| 多 stream事件乱序 | sequence 分配、补偿入队和 callback enqueue使用同一全局发布顺序 |
 
 ## 测试层次
 

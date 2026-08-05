@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use napi::bindgen_prelude::Status;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
@@ -15,8 +14,13 @@ pub(crate) type EventCallback =
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EventQueue {
-    events: Arc<RwLock<VecDeque<QueuedStreamEvent>>>,
-    next_sequence: Arc<AtomicU64>,
+    state: Arc<Mutex<EventQueueState>>,
+}
+
+#[derive(Debug, Default)]
+struct EventQueueState {
+    events: VecDeque<QueuedStreamEvent>,
+    next_sequence: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -31,35 +35,45 @@ impl EventQueue {
         callback: &Arc<RwLock<Option<EventCallback>>>,
         event: StreamEvent,
     ) {
+        // Keep sequence allocation, compensation-queue insertion, and TSFN enqueue in one
+        // publication order. Stream runtimes may publish concurrently, so an atomic sequence
+        // allocated before taking the queue lock could otherwise let sequence N+1 become visible
+        // before sequence N in either delivery path.
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.next_sequence = state.next_sequence.saturating_add(1);
         let queued = QueuedStreamEvent {
-            sequence: self.next_sequence.fetch_add(1, Ordering::Relaxed) + 1,
+            sequence: state.next_sequence,
             event,
         };
-        if let Ok(mut events) = self.events.write() {
-            // Coalesce only an adjacent projection. Removing an older state across a demand or
-            // failure event would move the replacement behind that event and invert the actor's
-            // fact-before-request ordering.
-            if events
-                .back()
-                .is_some_and(|existing| coalesces(&existing.event, &queued.event))
-            {
-                events.pop_back();
-            }
-            if events.len() == 4_096 {
-                let removable = events
-                    .iter()
-                    .position(|queued| {
-                        matches!(
-                            queued.event,
-                            StreamEvent::StateChanged { .. }
-                                | StreamEvent::NetworkQualityChanged { .. }
-                        )
-                    })
-                    .unwrap_or(0);
-                events.remove(removable);
-            }
-            events.push_back(queued.clone());
+
+        // Coalesce only an adjacent projection. Removing an older state across a demand or
+        // failure event would move the replacement behind that event and invert the actor's
+        // fact-before-request ordering.
+        if state
+            .events
+            .back()
+            .is_some_and(|existing| coalesces(&existing.event, &queued.event))
+        {
+            state.events.pop_back();
         }
+        if state.events.len() == 4_096 {
+            let removable = state
+                .events
+                .iter()
+                .position(|queued| {
+                    matches!(
+                        queued.event,
+                        StreamEvent::StateChanged { .. }
+                            | StreamEvent::NetworkQualityChanged { .. }
+                    )
+                })
+                .unwrap_or(0);
+            state.events.remove(removable);
+        }
+        state.events.push_back(queued.clone());
+
         if let Ok(callback) = callback.read()
             && let Some(callback) = callback.as_ref()
         {
@@ -71,19 +85,19 @@ impl EventQueue {
     }
 
     pub(crate) fn drain(&self, stream_id: Option<&str>) -> Result<Vec<QueuedStreamEvent>> {
-        let mut events = self.events.write().map_err(lock_error)?;
+        let mut state = self.state.lock().map_err(lock_error)?;
         let Some(stream_id) = stream_id else {
-            return Ok(std::mem::take(&mut *events).into());
+            return Ok(std::mem::take(&mut state.events).into());
         };
-        let (drained, kept): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut *events)
+        let (drained, kept): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut state.events)
             .into_iter()
             .partition(|queued| belongs_to(&queued.event, stream_id));
-        *events = kept;
+        state.events = kept;
         Ok(drained.into())
     }
 
     pub(crate) fn clear(&self) -> Result<()> {
-        self.events.write().map_err(lock_error)?.clear();
+        self.state.lock().map_err(lock_error)?.events.clear();
         Ok(())
     }
 }
@@ -255,5 +269,49 @@ fn empty() -> StreamEventOutput {
         code: None,
         message: None,
         status: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_publish_is_drained_in_global_sequence_order() {
+        const PUBLISHERS: usize = 8;
+        const EVENTS_PER_PUBLISHER: usize = 512;
+
+        let queue = EventQueue::default();
+        let callback = Arc::new(RwLock::new(None));
+        let start = Arc::new(std::sync::Barrier::new(PUBLISHERS));
+        let mut publishers = Vec::new();
+        for publisher in 0..PUBLISHERS {
+            let queue = queue.clone();
+            let callback = Arc::clone(&callback);
+            let start = Arc::clone(&start);
+            publishers.push(std::thread::spawn(move || {
+                start.wait();
+                for event in 0..EVENTS_PER_PUBLISHER {
+                    queue.publish(
+                        &callback,
+                        StreamEvent::StreamStarted {
+                            stream_id: format!("stream-{publisher}-{event}"),
+                        },
+                    );
+                }
+            }));
+        }
+        for publisher in publishers {
+            publisher.join().expect("event publisher");
+        }
+
+        let drained = queue.drain(None).expect("drain events");
+        assert_eq!(drained.len(), PUBLISHERS * EVENTS_PER_PUBLISHER);
+        assert!(
+            drained
+                .iter()
+                .enumerate()
+                .all(|(index, event)| event.sequence == index as u64 + 1)
+        );
     }
 }

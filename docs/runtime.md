@@ -241,8 +241,9 @@ sender command、RTP/RTCP datagram和 stop 都有 deadline。
 
 ## 事件交付
 
-媒体 action 成功后才发布事件。每个事件分配 `Streamer` 内单调 sequence；callback与补偿队列中的
-同一事件使用同一 sequence，可可靠去重。callback 是低延迟通知，使用有界 non-blocking bridge；
+媒体 action 成功后才发布事件。sequence 分配、补偿队列写入和 callback bridge enqueue 经过同一个
+短发布临界区，因此多 stream并发发布时仍保持 `Streamer` 内严格单调的可见顺序；callback与补偿队列
+中的同一事件使用同一 sequence，可可靠去重。callback 是低延迟通知，使用有界 non-blocking bridge；
 补偿队列按 stream合并旧 `stateChanged`/quality快照并保留关键事件供宿主 drain。宿主不能假设
 callback永不丢失，callback panic/异常也与媒体动作隔离。
 
