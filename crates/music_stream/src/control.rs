@@ -5,6 +5,8 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+const BLOCKING_CANCELLATION_FALLBACK: Duration = Duration::from_secs(1);
+
 #[derive(Debug)]
 pub(crate) struct PauseGate {
     paused: AtomicBool,
@@ -40,6 +42,11 @@ impl PauseGate {
         let _guard = self.blocking_lock.lock().expect("pause gate lock poisoned");
         self.paused.store(false, Ordering::Release);
         self.async_state.send_replace(false);
+        self.blocking_changed.notify_all();
+    }
+
+    pub(crate) fn wake_blocking(&self) {
+        let _guard = self.blocking_lock.lock().expect("pause gate lock poisoned");
         self.blocking_changed.notify_all();
     }
 
@@ -83,7 +90,7 @@ impl PauseGate {
             }
             let (next, _) = self
                 .blocking_changed
-                .wait_timeout(guard, Duration::from_millis(20))
+                .wait_timeout(guard, BLOCKING_CANCELLATION_FALLBACK)
                 .expect("pause gate lock poisoned");
             guard = next;
         }

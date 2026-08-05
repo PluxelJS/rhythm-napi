@@ -31,6 +31,7 @@ npm test
 | codec 阻塞 realtime | source wait 和 queue wait 释放 CPU lease；sender 独立按 deadline 发送 |
 | current 之间互相饿死 | CPU 饱和时低 `bufferedMs` current先执行；相同深度和 next分别保持 FIFO |
 | queue 无界或重复 | 唯一 Opus queue 按媒体时长限流；next prime 后停止生产 |
+| event channel 外隐藏增长 | output pending 使用固定语义槽；backlog严格先于新事件，关闭channel会清空pending |
 | RTP session 被 track 重置 | switch、seek、promotion 后 sequence/timestamp 连续 |
 | sender stall 形成 burst | 超限丢旧媒体；timestamp 跳过、sequence 只统计实际包 |
 | 错误被 EOF 覆盖 | source/auth/timeout terminal 优先；failure event 先于 drained |
@@ -49,6 +50,10 @@ npm test
 - Opus queue 的容量、关闭、drain 和 stale drop；
 - RTP packetize、RTCP parse 和 quality window；
 - PauseGate、CPU scheduler、resource validation。
+- CPU wait、满Opus queue、pause、growing spool阻塞读和满worker-event channel在取消后精确唤醒，
+  不依赖1秒fallback timeout；
+- output event outbox在channel饱和时保持prebuffer-before-ended，fatal failure不会被快照覆盖，关闭后不热循环。
+- RTP/external output supervisor在满worker-event channel上等待时，shutdown仍能立即收敛。
 
 这些测试不依赖 wall-clock 网络，应尽量保持确定性。
 

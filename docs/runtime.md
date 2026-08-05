@@ -188,6 +188,9 @@ UDP pacing
 - next 达到 prime 窗口后停止生产，不无限提前解码整首歌。
 - receiver 被替换时关闭 queue 并唤醒 blocking producer。
 - wait observer 只在真正阻塞读取前释放 CPU lease，返回计算后重新参与调度。
+- output worker 的 actor channel 满载时只保留固定语义槽：最新 prebuffer/terminal/quality，致命
+  output failure 则覆盖已经失效的媒体快照；新事件不能绕过旧 backlog，因此有界 channel 外没有
+  隐藏的无界队列或顺序反转窗口。
 
 ## 实时 pacing 与迟滞恢复
 
@@ -237,7 +240,8 @@ encoded queue深度，其余packet/byte、underrun、drop和recovery计数在同
 producer和sender panic都由独立 supervisor转换为 active generation的 `INTERNAL` failure event。
 source failure 与 decoder EOF
 近同时发生时，优先保留非取消型 source terminal code，避免鉴权或 timeout 被降级成 decode error。
-sender command、RTP/RTCP datagram和 stop 都有 deadline。
+RTP sender与external pull控制命令（含worker acknowledgement）、RTP/RTCP datagram和stop都有deadline；
+只有external `pull()`按设计可停泊到媒体可用或显式`cancelExternalPull()`。
 
 ## 事件交付
 
@@ -259,7 +263,12 @@ reqwest 原始文本。
 ## Stop 与 shutdown
 
 单流 stop取消 current/next，等待 producer收敛，关闭 sender，并在容量为 `maxStreams` 的 LRU中
-保留最近 stopped status供幂等查询。取消会穿透 pause gate、HTTP、CPU scheduler和Opus queue。
+保留最近 stopped status供幂等查询。取消会穿透 pause gate、HTTP、CPU scheduler、Opus queue和
+growing spool reader。每个存活 blocking producer/reader只附带一个休眠的 Tokio cancellation future；
+取消时它在对应 mutex 下精确 notify，避免用每20 ms轮询换取收敛；blocking producer等待worker-event
+capacity时则直接同时等待channel permit和cancellation；producer以及output supervisor都不能在shutdown
+期间卡在事件发送上，避免stop与actor consumer形成等待环。1秒timed wait只用于runtime或watcher
+异常停滞时的安全兜底，不是常态调度路径，也不会额外占用OS thread。
 
 `Streamer.shutdown()`进入不可逆但幂等的 closed状态，阻止新的媒体操作，并发停止所有active runtime，清空inactive status、
 事件和 source cache。tempfile 最后一个引用释放后由专用清理线程删除；shutdown 最后等待 cleanup

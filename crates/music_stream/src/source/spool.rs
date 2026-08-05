@@ -8,6 +8,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{BlockingReadObserver, TempArtifactCleanup};
 
+const BLOCKING_CANCELLATION_FALLBACK: Duration = Duration::from_secs(1);
+
 #[derive(Debug)]
 enum SpoolTerminal {
     Complete,
@@ -45,6 +47,7 @@ pub(crate) struct GrowingSpoolReader {
     inner: Arc<GrowingSpoolInner>,
     position: u64,
     cancellation: CancellationToken,
+    cancellation_watcher: Option<tokio::task::JoinHandle<()>>,
     wait_observer: Option<Arc<dyn BlockingReadObserver>>,
 }
 
@@ -125,11 +128,25 @@ impl GrowingSpool {
         &self,
         cancellation: CancellationToken,
     ) -> std::io::Result<GrowingSpoolReader> {
+        let file = std::fs::File::open(&self.inner.path)?;
+        let watcher_cancellation = cancellation.clone();
+        let watcher_inner = Arc::clone(&self.inner);
+        let cancellation_watcher = tokio::runtime::Handle::try_current().ok().map(|runtime| {
+            runtime.spawn(async move {
+                watcher_cancellation.cancelled().await;
+                let _state = watcher_inner
+                    .state
+                    .lock()
+                    .expect("growing spool lock poisoned");
+                watcher_inner.changed.notify_all();
+            })
+        });
         Ok(GrowingSpoolReader {
-            file: std::fs::File::open(&self.inner.path)?,
+            file,
             inner: Arc::clone(&self.inner),
             position: 0,
             cancellation,
+            cancellation_watcher,
             wait_observer: None,
         })
     }
@@ -162,13 +179,21 @@ impl GrowingSpoolReader {
             let (_state, _) = self
                 .inner
                 .changed
-                .wait_timeout(state, Duration::from_millis(20))
+                .wait_timeout(state, BLOCKING_CANCELLATION_FALLBACK)
                 .expect("growing spool lock poisoned");
         };
         if let Some(observer) = &self.wait_observer {
             observer.after_wait();
         }
         result
+    }
+}
+
+impl Drop for GrowingSpoolReader {
+    fn drop(&mut self) {
+        if let Some(watcher) = &self.cancellation_watcher {
+            watcher.abort();
+        }
     }
 }
 
@@ -261,5 +286,43 @@ mod tests {
 
         assert_eq!(first_task.await.expect("first task"), b"abcdef");
         assert_eq!(second_task.await.expect("second task"), b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn cancellation_wakes_a_blocking_reader_without_fallback_polling() {
+        let named = tempfile::NamedTempFile::new().expect("tempfile");
+        let (file, path) = named.into_parts();
+        let filesystem_path = path.to_path_buf();
+        let quota = Arc::new(Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .expect("quota");
+        let cleanup = Arc::new(TempArtifactCleanup::new(
+            path,
+            crate::source::TempfileQuota {
+                global: quota,
+                preload: None,
+            },
+        ));
+        let (_writer, spool) = growing_spool(file, filesystem_path, cleanup);
+        let cancellation = CancellationToken::new();
+        let reader = spool.open_reader(cancellation.clone()).expect("reader");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let reader_task = tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
+            let mut reader = reader;
+            let mut byte = [0_u8; 1];
+            reader.read(&mut byte)
+        });
+        started_rx.await.expect("reader started");
+        tokio::task::yield_now().await;
+
+        cancellation.cancel();
+        let error = tokio::time::timeout(Duration::from_millis(200), reader_task)
+            .await
+            .expect("precise spool cancellation wake")
+            .expect("reader task")
+            .expect_err("cancelled read");
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
     }
 }

@@ -26,6 +26,8 @@ use crate::source::{
     UrlPlaybackSource, spawn_http_hls_stream, spawn_http_live_stream, supports_progressive_url,
 };
 
+const BLOCKING_CANCELLATION_FALLBACK: Duration = Duration::from_secs(1);
+
 #[derive(Debug)]
 pub(super) struct CpuScheduler {
     state: std::sync::Mutex<CpuSchedulerState>,
@@ -92,6 +94,11 @@ impl CpuScheduler {
         {
             waiter.changed.notify_one();
         }
+    }
+
+    fn wake_waiter(&self, waiter: &Arc<CpuWaiter>) {
+        let _state = self.state.lock().expect("CPU scheduler lock poisoned");
+        waiter.changed.notify_one();
     }
 
     #[cfg(test)]
@@ -195,7 +202,7 @@ impl CpuScheduler {
             }
             let (next, _) = waiter
                 .changed
-                .wait_timeout(state, Duration::from_millis(20))
+                .wait_timeout(state, BLOCKING_CANCELLATION_FALLBACK)
                 .expect("CPU scheduler lock poisoned");
             state = next;
         }
@@ -256,6 +263,7 @@ struct CpuLease {
     cancellation: CancellationToken,
     scheduler: Arc<CpuScheduler>,
     waiter: Arc<CpuWaiter>,
+    cancellation_watcher: JoinHandle<()>,
     permit: std::sync::Mutex<Option<CpuPermit>>,
     source_wait_started: std::sync::Mutex<Option<std::time::Instant>>,
 }
@@ -266,12 +274,26 @@ impl CpuLease {
         cancellation: CancellationToken,
         scheduler: Arc<CpuScheduler>,
         depth: OpusQueueDepth,
+        gate: Arc<PauseGate>,
+        promotion_gate: Arc<PauseGate>,
     ) -> Self {
+        let waiter = Arc::new(CpuWaiter::with_depth(depth.clone()));
+        let watcher_cancellation = cancellation.clone();
+        let watcher_scheduler = Arc::clone(&scheduler);
+        let watcher_waiter = Arc::clone(&waiter);
+        let cancellation_watcher = tokio::spawn(async move {
+            watcher_cancellation.cancelled().await;
+            watcher_scheduler.wake_waiter(&watcher_waiter);
+            depth.wake_blocking_sender();
+            gate.wake_blocking();
+            promotion_gate.wake_blocking();
+        });
         Self {
             current_role,
             cancellation,
             scheduler,
-            waiter: Arc::new(CpuWaiter::with_depth(depth)),
+            waiter,
+            cancellation_watcher,
             permit: std::sync::Mutex::new(None),
             source_wait_started: std::sync::Mutex::new(None),
         }
@@ -295,6 +317,12 @@ impl CpuLease {
 
     fn release(&self) {
         self.permit.lock().expect("CPU lease lock poisoned").take();
+    }
+}
+
+impl Drop for CpuLease {
+    fn drop(&mut self) {
+        self.cancellation_watcher.abort();
     }
 }
 
@@ -399,7 +427,7 @@ struct MediaControl {
     volume: AtomicU16,
     gain: AtomicI16,
     gate: Arc<PauseGate>,
-    promotion_gate: PauseGate,
+    promotion_gate: Arc<PauseGate>,
     current_role: Arc<AtomicBool>,
     current_role_changed: tokio::sync::watch::Sender<bool>,
     preload_admission: Mutex<Option<OwnedSemaphorePermit>>,
@@ -408,7 +436,7 @@ struct MediaControl {
 
 impl MediaControl {
     fn new(volume: VolumeLevel, gain: GainLevel, role: ProducerRole) -> Self {
-        let promotion_gate = PauseGate::default();
+        let promotion_gate = Arc::new(PauseGate::default());
         if matches!(role, ProducerRole::Next) {
             promotion_gate.pause();
         }
@@ -691,7 +719,7 @@ where
                     message: error.to_string(),
                 },
             };
-            let _ = events.send(event).await;
+            let _ = send_worker_event(&events, &cancellation, event).await;
         }
         drop(output_lifetime);
     });
@@ -797,14 +825,16 @@ async fn run_detected_live(
     job.track.seekable = Some(false);
     job.role = ProducerRole::Current;
     job.next_prime_ms = None;
-    job.events
-        .send(WorkerEvent::CurrentSourceClassified {
+    send_worker_event(
+        &job.events,
+        &job.cancellation,
+        WorkerEvent::CurrentSourceClassified {
             generation: job.generation,
             kind: TrackKind::Live,
             seekable: false,
-        })
-        .await
-        .map_err(|_| MusicStreamError::StreamClosed("worker event loop closed".to_owned()))?;
+        },
+    )
+    .await?;
     run_live(job, source, live_byte_budget, live_streams).await
 }
 
@@ -837,6 +867,8 @@ async fn run_file_artifact(
         job.cancellation.clone(),
         Arc::clone(&job.cpu_scheduler),
         job.output.depth(),
+        Arc::clone(&job.control.gate),
+        Arc::clone(&job.control.promotion_gate),
     ));
     let submitted_at = std::time::Instant::now();
     tokio::task::spawn_blocking(move || {
@@ -878,6 +910,8 @@ async fn run_progressive_url(
         job.cancellation.clone(),
         Arc::clone(&job.cpu_scheduler),
         job.output.depth(),
+        Arc::clone(&job.control.gate),
+        Arc::clone(&job.control.promotion_gate),
     ));
     reader.set_wait_observer(lease.clone());
     let submitted_at = std::time::Instant::now();
@@ -994,14 +1028,16 @@ async fn run_hls(
     };
     job.track.kind = kind.clone();
     job.track.seekable = Some(false);
-    job.events
-        .send(WorkerEvent::CurrentSourceClassified {
+    send_worker_event(
+        &job.events,
+        &job.cancellation,
+        WorkerEvent::CurrentSourceClassified {
             generation: job.generation,
             kind,
             seekable: false,
-        })
-        .await
-        .map_err(|_| MusicStreamError::StreamClosed("worker event loop closed".to_owned()))?;
+        },
+    )
+    .await?;
     run_http_stream(job, stream, None, admission).await
 }
 
@@ -1020,6 +1056,8 @@ async fn run_http_stream(
         job.cancellation.clone(),
         Arc::clone(&job.cpu_scheduler),
         job.output.depth(),
+        Arc::clone(&job.control.gate),
+        Arc::clone(&job.control.promotion_gate),
     ));
     reader.set_wait_observer(lease.clone());
     let submitted_at = std::time::Instant::now();
@@ -1280,13 +1318,13 @@ where
                     .is_some_and(|prime_ms| produced_ms >= prime_ms)
             {
                 lease.release();
-                job.events
-                    .blocking_send(WorkerEvent::NextReady {
+                send_worker_event_blocking(
+                    &job.events,
+                    &job.cancellation,
+                    WorkerEvent::NextReady {
                         generation: job.generation,
-                    })
-                    .map_err(|_| {
-                        MusicStreamError::StreamClosed("worker event loop closed".to_owned())
-                    })?;
+                    },
+                )?;
                 ready_sent = true;
                 if !job.control.promotion_gate.wait_blocking(&job.cancellation) {
                     return Err(MusicStreamError::StreamClosed(
@@ -1318,9 +1356,13 @@ where
                 ));
             }
             if !ready_sent && produced_ms > 0 && job.next_prime_ms.is_some() {
-                let _ = job.events.blocking_send(WorkerEvent::NextReady {
-                    generation: job.generation,
-                });
+                let _ = send_worker_event_blocking(
+                    &job.events,
+                    &job.cancellation,
+                    WorkerEvent::NextReady {
+                        generation: job.generation,
+                    },
+                );
             }
             return Ok(());
         }
@@ -1328,6 +1370,34 @@ where
             std::thread::yield_now();
         }
     }
+}
+
+async fn send_worker_event(
+    events: &mpsc::Sender<WorkerEvent>,
+    cancellation: &CancellationToken,
+    event: WorkerEvent,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => Err(MusicStreamError::StreamClosed(
+            "producer cancelled while waiting for worker event capacity".to_owned(),
+        )),
+        result = events.send(event) => result.map_err(|_| MusicStreamError::StreamClosed(
+            "worker event loop closed".to_owned(),
+        )),
+    }
+}
+
+fn send_worker_event_blocking(
+    events: &mpsc::Sender<WorkerEvent>,
+    cancellation: &CancellationToken,
+    event: WorkerEvent,
+) -> Result<()> {
+    // `blocking_send` cannot observe generation cancellation. That can deadlock stop when the
+    // actor channel is full: stop holds the orchestration lock while the event consumer needs the
+    // same lock to free capacity. This future parks the existing bounded blocking producer but is
+    // woken by either exact channel capacity or cancellation; it does not create another task.
+    tokio::runtime::Handle::current().block_on(send_worker_event(events, cancellation, event))
 }
 
 fn record_cpu_wait(performance: &RuntimePerformanceCounters, current: bool, elapsed: Duration) {
@@ -1564,6 +1634,8 @@ mod tests {
             cancellation.clone(),
             Arc::clone(&job.cpu_scheduler),
             job.output.depth(),
+            Arc::clone(&job.control.gate),
+            Arc::clone(&job.control.promotion_gate),
         ));
         let worker = tokio::task::spawn_blocking(move || run_cpu(decoder, job, lease));
 
@@ -1825,16 +1897,177 @@ mod tests {
         let waiting_cancellation = CancellationToken::new();
         let worker_cancellation = waiting_cancellation.clone();
         let worker_scheduler = Arc::clone(&scheduler);
+        let waiter_signal = Arc::new(CpuWaiter::default());
+        let worker_signal = Arc::clone(&waiter_signal);
         let waiter = std::thread::spawn(move || {
-            worker_scheduler.acquire(ProducerRole::Next, &worker_cancellation)
+            worker_scheduler.acquire_with_waiter(
+                ProducerRole::Next,
+                &worker_cancellation,
+                &worker_signal,
+            )
         });
 
         std::thread::sleep(Duration::from_millis(30));
         waiting_cancellation.cancel();
+        scheduler.wake_waiter(&waiter_signal);
         assert!(waiter.join().expect("waiter").is_none());
         assert_eq!(scheduler.diagnostics(), (1, 0, 0));
         drop(active);
         assert_eq!(scheduler.diagnostics(), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn cancellation_watcher_wakes_cpu_wait_without_fallback_polling() {
+        let scheduler = Arc::new(CpuScheduler::with_maximum(1));
+        let active = scheduler
+            .acquire(ProducerRole::Current, &CancellationToken::new())
+            .expect("active permit");
+        let cancellation = CancellationToken::new();
+        let (output, _receiver) = opus_queue::bounded(40);
+        let lease = Arc::new(CpuLease::new(
+            Arc::new(AtomicBool::new(true)),
+            cancellation.clone(),
+            Arc::clone(&scheduler),
+            output.depth(),
+            Arc::new(PauseGate::default()),
+            Arc::new(PauseGate::default()),
+        ));
+        let waiting_lease = Arc::clone(&lease);
+        let waiting = tokio::task::spawn_blocking(move || waiting_lease.acquire());
+        while scheduler.diagnostics().1 == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        cancellation.cancel();
+        assert!(
+            !tokio::time::timeout(Duration::from_millis(200), waiting)
+                .await
+                .expect("precise CPU cancellation wake")
+                .expect("CPU waiter task")
+        );
+        drop(active);
+        drop(lease);
+        assert_eq!(scheduler.diagnostics(), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn cancellation_watcher_wakes_full_output_without_fallback_polling() {
+        let cancellation = CancellationToken::new();
+        let (output, _receiver) = opus_queue::bounded(20);
+        output
+            .send_blocking(
+                OpusFrame {
+                    generation: 1,
+                    payload: Bytes::from_static(b"first"),
+                    samples_per_channel: FRAME_SAMPLES,
+                    duration_ms: 20,
+                    marker: false,
+                    track_position_samples: 0,
+                },
+                &cancellation,
+            )
+            .expect("fill output");
+        let lease = Arc::new(CpuLease::new(
+            Arc::new(AtomicBool::new(true)),
+            cancellation.clone(),
+            Arc::new(CpuScheduler::with_maximum(1)),
+            output.depth(),
+            Arc::new(PauseGate::default()),
+            Arc::new(PauseGate::default()),
+        ));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let waiting_cancellation = cancellation.clone();
+        let waiting = tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
+            output.send_blocking(
+                OpusFrame {
+                    generation: 1,
+                    payload: Bytes::from_static(b"second"),
+                    samples_per_channel: FRAME_SAMPLES,
+                    duration_ms: 20,
+                    marker: false,
+                    track_position_samples: u64::from(FRAME_SAMPLES),
+                },
+                &waiting_cancellation,
+            )
+        });
+        started_rx.await.expect("output waiter started");
+        tokio::task::yield_now().await;
+
+        cancellation.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), waiting)
+                .await
+                .expect("precise output cancellation wake")
+                .expect("output waiter task")
+                .is_err()
+        );
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn cancellation_watcher_wakes_paused_producer_without_fallback_polling() {
+        let cancellation = CancellationToken::new();
+        let gate = Arc::new(PauseGate::default());
+        gate.pause();
+        let (output, _receiver) = opus_queue::bounded(20);
+        let lease = Arc::new(CpuLease::new(
+            Arc::new(AtomicBool::new(true)),
+            cancellation.clone(),
+            Arc::new(CpuScheduler::with_maximum(1)),
+            output.depth(),
+            Arc::clone(&gate),
+            Arc::new(PauseGate::default()),
+        ));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let waiting_gate = Arc::clone(&gate);
+        let waiting_cancellation = cancellation.clone();
+        let waiting = tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
+            waiting_gate.wait_blocking(&waiting_cancellation)
+        });
+        started_rx.await.expect("pause waiter started");
+        tokio::task::yield_now().await;
+
+        cancellation.cancel();
+        assert!(
+            !tokio::time::timeout(Duration::from_millis(200), waiting)
+                .await
+                .expect("precise pause cancellation wake")
+                .expect("pause waiter task")
+        );
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn cancellation_wakes_worker_event_capacity_wait() {
+        let (events, _event_receiver) = mpsc::channel(1);
+        events
+            .send(WorkerEvent::NextReady { generation: 0 })
+            .await
+            .expect("fill worker event channel");
+        let cancellation = CancellationToken::new();
+        let waiting_events = events.clone();
+        let waiting_cancellation = cancellation.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let waiting = tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
+            send_worker_event_blocking(
+                &waiting_events,
+                &waiting_cancellation,
+                WorkerEvent::NextReady { generation: 1 },
+            )
+        });
+        started_rx.await.expect("worker event waiter started");
+        tokio::task::yield_now().await;
+
+        cancellation.cancel();
+        let error = tokio::time::timeout(Duration::from_millis(200), waiting)
+            .await
+            .expect("precise worker event cancellation wake")
+            .expect("worker event waiter task")
+            .expect_err("cancelled worker event send");
+        assert!(matches!(error, MusicStreamError::StreamClosed(_)));
     }
 
     #[test]

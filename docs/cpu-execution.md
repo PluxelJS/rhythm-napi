@@ -94,6 +94,13 @@ permit 释放时只精确唤醒一个符合角色与预留规则的 waiter；若
 唤醒下一个。无竞争获取不进入队列，也不产生逐 turn 分配或引用计数修改。不能在每个 Opus frame
 边界广播唤醒全部 producer，否则高并发下会把公平性开销变成 mutex 惊群。
 
+generation cancellation另有一个随producer存活的休眠Tokio future。它不占blocking thread；token触发后
+在各自状态mutex下精确唤醒CPU waiter、满Opus queue、pause和promotion gate，growing spool reader也用
+同样的lost-wake保护。condvar的1秒timeout只是watcher或runtime失效时的收敛兜底，常态不再让最多256个
+blocking producer以50 Hz轮询取消状态。blocking worker发送`NextReady`时同时等待有界event channel和
+cancellation，不能使用无法取消的`blocking_send`，否则持有orchestration lock的stop可能与actor consumer
+和producer构成等待环。
+
 current waiter 按其 Opus queue 的实时 `bufferedMs` 从低到高选择；相同深度保持 FIFO。等待 CPU 时
 producer 不能补充 queue，而 sender 仍会继续消费，因此健康 current 会自然向低水位老化，不需要
 额外 timer 或人为 priority boost。next 仍严格 FIFO，且只有没有 current waiter并满足 `N-1` 预留时
@@ -126,7 +133,7 @@ frame/turn 边界获得机会，而不是等待另一首歌完成。
 
 `spawn_blocking` 已经开始运行后，Tokio 的 `abort` 不能强行终止同步闭包。正确停止路径始终是
 `CancellationToken`、关闭 queue/source、唤醒 condvar 和在循环边界检查 cancellation；abort 只可
-作为尚未开始任务的辅助行为，不能成为资源释放证明。
+作为尚未开始任务和休眠watcher析构的辅助行为，不能成为blocking producer资源释放证明。
 
 ## 为什么当前不使用 Rayon
 

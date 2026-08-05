@@ -9,6 +9,8 @@ use tokio_util::sync::CancellationToken;
 use crate::audio::frame::OpusFrame;
 use crate::error::{MusicStreamError, Result};
 
+const BLOCKING_CANCELLATION_FALLBACK: Duration = Duration::from_secs(1);
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct QueueSnapshot {
     buffered_ms: u64,
@@ -53,6 +55,11 @@ impl OpusQueueDepth {
     #[must_use]
     pub(super) fn buffered_ms(&self) -> u64 {
         self.inner.buffered_ms.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn wake_blocking_sender(&self) {
+        let _state = self.inner.state.lock().expect("Opus queue lock poisoned");
+        self.inner.space_available.notify_all();
     }
 }
 
@@ -118,7 +125,7 @@ impl OpusQueueSender {
             let (next, _) = self
                 .inner
                 .space_available
-                .wait_timeout(state, Duration::from_millis(20))
+                .wait_timeout(state, BLOCKING_CANCELLATION_FALLBACK)
                 .expect("Opus queue lock poisoned");
             state = next;
         }

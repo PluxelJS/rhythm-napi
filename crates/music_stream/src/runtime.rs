@@ -15,6 +15,7 @@ mod opus_queue;
 mod playout_clock;
 mod producer;
 mod sender;
+mod worker_events;
 
 use external_pull::ExternalPullHandle;
 pub use external_pull::{ExternalFrameAck, ExternalFrameOutcome, ExternalOpusFrame};

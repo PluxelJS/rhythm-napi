@@ -6,10 +6,12 @@ use bytes::{Bytes, BytesMut};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{Instant, MissedTickBehavior};
+use tokio_util::sync::CancellationToken;
 
 use super::StreamRuntimeProgress;
 use super::opus_queue::OpusQueueReceiver;
 use super::playout_clock::PlayoutClock;
+use super::worker_events::{PendingWorkerEvents, emit_worker_event, flush_worker_events};
 use crate::audio::frame::OpusFrame;
 use crate::audio::opus::{OPUS_FRAME_DURATION_MS, OPUS_FRAME_SAMPLES};
 use crate::error::{MusicStreamError, Result};
@@ -36,10 +38,12 @@ pub(super) struct SenderHandle {
 struct SenderTask {
     supervisor: Mutex<Option<tokio::task::JoinHandle<Result<()>>>>,
     worker_abort: tokio::task::AbortHandle,
+    shutdown: CancellationToken,
 }
 
 impl Drop for SenderTask {
     fn drop(&mut self) {
+        self.shutdown.cancel();
         self.worker_abort.abort();
         if let Ok(slot) = self.supervisor.get_mut()
             && let Some(supervisor) = slot.take()
@@ -81,6 +85,7 @@ impl SenderHandle {
         let (commands, command_rx) = mpsc::channel(32);
         let (progress_tx, progress) = watch::channel(StreamRuntimeProgress::default());
         let active_generation = Arc::new(AtomicU64::new(0));
+        let shutdown = CancellationToken::new();
         let worker = tokio::spawn(run_sender(
             socket,
             rtcp_socket,
@@ -96,13 +101,15 @@ impl SenderHandle {
             Arc::clone(&active_generation),
         ));
         let worker_abort = worker.abort_handle();
-        let supervisor = supervise_sender(worker, active_generation, events);
+        let supervisor =
+            supervise_sender(worker, active_generation, events, shutdown.child_token());
         Ok(Self {
             commands,
             progress,
             task: Arc::new(SenderTask {
                 supervisor: Mutex::new(Some(supervisor)),
                 worker_abort,
+                shutdown,
             }),
         })
     }
@@ -144,6 +151,7 @@ impl SenderHandle {
     }
 
     pub(super) async fn shutdown(&self) -> Result<()> {
+        self.task.shutdown.cancel();
         let command_result = self
             .request(|reply| SenderCommand::Shutdown { reply })
             .await;
@@ -207,6 +215,7 @@ fn supervise_sender(
     worker: tokio::task::JoinHandle<Result<()>>,
     active_generation: Arc<AtomicU64>,
     events: mpsc::Sender<WorkerEvent>,
+    shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<Result<()>> {
     tokio::spawn(async move {
         let result = match worker.await {
@@ -218,12 +227,15 @@ fn supervise_sender(
         if let Err(error) = &result {
             let generation = active_generation.load(Ordering::Acquire);
             if generation != 0 {
-                let _ = events
-                    .send(WorkerEvent::OutputFailed {
-                        code: error.code(),
-                        message: error.to_string(),
-                    })
-                    .await;
+                let event = WorkerEvent::OutputFailed {
+                    code: error.code(),
+                    message: error.to_string(),
+                };
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => {}
+                    _ = events.send(event) => {}
+                }
             }
         }
         result
@@ -767,78 +779,6 @@ async fn run_sender(
     }
 }
 
-#[derive(Debug, Default)]
-struct PendingWorkerEvents {
-    prebuffer: Option<WorkerEvent>,
-    terminal: Option<WorkerEvent>,
-    quality: Option<WorkerEvent>,
-}
-
-impl PendingWorkerEvents {
-    fn store(&mut self, event: WorkerEvent) {
-        match event {
-            event @ WorkerEvent::CurrentPrebufferReady { .. } => self.prebuffer = Some(event),
-            event @ (WorkerEvent::CurrentEnded { .. }
-            | WorkerEvent::CurrentFailed { .. }
-            | WorkerEvent::OutputFailed { .. }) => {
-                self.terminal = Some(event);
-            }
-            event @ WorkerEvent::CurrentNetworkQualityChanged { .. } => {
-                self.quality = Some(event);
-            }
-            WorkerEvent::CurrentSourceClassified { .. }
-            | WorkerEvent::NextReady { .. }
-            | WorkerEvent::NextFailed { .. }
-            | WorkerEvent::StartupTimedOut { .. } => {
-                unreachable!("producer events never originate from the RTP sender");
-            }
-        }
-    }
-
-    fn pop(&mut self) -> Option<WorkerEvent> {
-        self.prebuffer
-            .take()
-            .or_else(|| self.terminal.take())
-            .or_else(|| self.quality.take())
-    }
-
-    fn is_empty(&self) -> bool {
-        self.prebuffer.is_none() && self.terminal.is_none() && self.quality.is_none()
-    }
-
-    fn clear(&mut self) {
-        *self = Self::default();
-    }
-}
-
-fn emit_worker_event(
-    sender: &mpsc::Sender<WorkerEvent>,
-    pending: &mut PendingWorkerEvents,
-    event: WorkerEvent,
-) {
-    match sender.try_send(event) {
-        Ok(()) => {}
-        Err(mpsc::error::TrySendError::Full(event)) => pending.store(event),
-        Err(mpsc::error::TrySendError::Closed(_)) => {}
-    }
-}
-
-fn flush_worker_events(sender: &mpsc::Sender<WorkerEvent>, pending: &mut PendingWorkerEvents) {
-    while let Some(event) = pending.pop() {
-        match sender.try_send(event) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(event)) => {
-                pending.store(event);
-                return;
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                pending.clear();
-                return;
-            }
-        }
-    }
-}
-
 async fn recv_rtcp(rtp: &UdpSocket, rtcp: Option<&UdpSocket>) -> Result<Option<Bytes>> {
     let mut buffer = [0_u8; 1_500];
     let len = rtcp
@@ -867,7 +807,8 @@ mod tests {
             #[allow(unreachable_code)]
             Ok(())
         });
-        let supervisor = supervise_sender(worker, active_generation, events);
+        let supervisor =
+            supervise_sender(worker, active_generation, events, CancellationToken::new());
 
         let event = event_rx.recv().await.expect("sender failure event");
         assert!(matches!(
@@ -878,6 +819,34 @@ mod tests {
             }
         ));
         assert!(supervisor.await.expect("supervisor").is_err());
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_supervisor_blocked_on_event_capacity() {
+        let active_generation = Arc::new(AtomicU64::new(42));
+        let (events, _event_rx) = mpsc::channel(1);
+        events
+            .send(WorkerEvent::CurrentPrebufferReady { generation: 42 })
+            .await
+            .expect("fill worker event channel");
+        let worker = tokio::spawn(async {
+            Err(MusicStreamError::RtpOutputError(
+                "injected sender failure".to_owned(),
+            ))
+        });
+        let shutdown = CancellationToken::new();
+        let supervisor =
+            supervise_sender(worker, active_generation, events, shutdown.child_token());
+        tokio::task::yield_now().await;
+
+        shutdown.cancel();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), supervisor)
+                .await
+                .expect("precise sender supervisor cancellation wake")
+                .expect("sender supervisor task")
+                .is_err()
+        );
     }
 
     #[test]
