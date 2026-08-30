@@ -24,7 +24,9 @@
 	"exports": {
 		".": {
 			"types": "./index.d.ts",
-			"require": "./index.js"
+			"import": "./index.js",
+			"require": "./index.js",
+			"default": "./index.js"
 		}
 	},
 	"publishConfig": {
