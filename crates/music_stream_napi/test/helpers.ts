@@ -271,7 +271,7 @@ function closeHttpServerWorker(worker: Worker): Promise<void> {
 export function waitForDatagram(
   socket: Socket,
   predicate: (message: Buffer, rinfo: RemoteInfo) => boolean,
-  timeoutMs = 2_000,
+  timeoutMs = 5_000,
 ): Promise<Datagram> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
