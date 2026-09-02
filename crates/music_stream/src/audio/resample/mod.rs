@@ -297,7 +297,10 @@ mod rubato_backend {
             let ratio = f64::from(self.config.target.sample_rate) / f64::from(input_sample_rate);
             let params = SincInterpolationParameters {
                 sinc_len: self.config.sinc_len,
-                f_cutoff: calculate_cutoff(self.config.sinc_len, self.config.window),
+                f_cutoff: Some(calculate_cutoff::<f32>(
+                    self.config.sinc_len,
+                    self.config.window,
+                )),
                 interpolation: self.config.interpolation,
                 oversampling_factor: self.config.oversampling_factor,
                 window: self.config.window,

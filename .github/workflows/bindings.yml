@@ -10,9 +10,6 @@ on:
 
 env:
   CARGO_INCREMENTAL: '0'
-  # audiopus_sys vendors an older Opus CMake project. New CMake releases require
-  # the compatibility floor to be opted into explicitly.
-  CMAKE_POLICY_VERSION_MINIMUM: '3.5'
   NAPI_DIR: crates/music_stream_napi
 
 jobs:

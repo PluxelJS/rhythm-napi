@@ -141,7 +141,7 @@ benchmark用于寻找等质量实现中的CPU、复制和allocation浪费，不�
 cargo bench --bench allocation_profile
 ```
 
-当前5秒基线中，Rubato是526次/567333 bytes，Opus是250次/201050 bytes；Opus恰好每个
+当前5秒基线中，Rubato是526次/567341 bytes，Opus是250次/201050 bytes；Opus恰好每个
 20 ms frame产生一次payload allocation，但总量只有约39 KiB/s。短fixture的完整pipeline为
 568至2280次allocation，其中Vorbis的高值主要来自open/init（open并drain为1737次，预先open后的
 steady drain只有4次），不能把每首歌冷启动成本误判成持续decode热点。基于这组证据，暂不增加

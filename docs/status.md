@@ -58,7 +58,7 @@
 下一阶段只处理 profile 已证明的热点，并按以下顺序评估；这些项目尚未成为当前实现能力：
 
 1. 分析剩余 Rubato/PCM 分配。mono 输入已改为先 resample、再原地扩展 stereo；确定性 5 秒 fixture
-   保持 bit-for-bit 双声道等价，resample 中位时间下降约 41%，当前约 526 次分配、567333 bytes。
+   保持 bit-for-bit 双声道等价，resample 中位时间下降约 41%，当前约 526 次分配、567341 bytes。
    后续只在 callsite profile 证明收益时检查 pending input compact、output recycle 和 Rubato 内部分配。
 2. 继续分析 DSP。unity-gain validity scan 已通过等价条件化简获得自动向量化，5 秒合法 PCM 基线
    中位时间下降约 66%，并保持 over-range、NaN 和 infinity 处理。后续只有 profile 证明收益时，
