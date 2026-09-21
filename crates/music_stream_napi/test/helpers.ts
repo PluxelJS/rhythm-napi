@@ -289,13 +289,16 @@ export function waitForDatagram(
       cleanup()
       reject(error)
     }
+    const onClose = () => onError(new Error('UDP socket closed before the expected datagram'))
     const cleanup = () => {
       clearTimeout(timer)
       socket.off('message', onMessage)
       socket.off('error', onError)
+      socket.off('close', onClose)
     }
     socket.on('message', onMessage)
     socket.on('error', onError)
+    socket.on('close', onClose)
   })
 }
 

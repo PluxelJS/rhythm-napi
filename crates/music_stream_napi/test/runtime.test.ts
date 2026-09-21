@@ -83,23 +83,25 @@ test('all lifecycle methods are asynchronous and RTP remains monotonic across sw
 		expect(batch[1].code).toBe('STREAM_NOT_FOUND')
 		await streamer.resumeStream(streamId)
 
-		const switched = await streamer.reconcilePlan(streamId, {
-			version: 1,
-			current: {
-				id: 'second',
-				attemptId: 'attempt-second',
-				kind: 'file',
-				path: secondPath,
-				seekable: true,
-			},
-		})
-		expect(switched.current?.id).toBe('second')
-		const after = (
-			await waitForDatagram(
+		// Register before switching: the native sender can emit the marker before reconcile resolves.
+		const [nextPacket, switched] = await Promise.all([
+			waitForDatagram(
 				socket,
 				(message) => isRtpForSsrc(message, ssrc) && (message[1] & 0x80) !== 0,
-			)
-		).message
+			),
+			streamer.reconcilePlan(streamId, {
+				version: 1,
+				current: {
+					id: 'second',
+					attemptId: 'attempt-second',
+					kind: 'file',
+					path: secondPath,
+					seekable: true,
+				},
+			}),
+		])
+		expect(switched.current?.id).toBe('second')
+		const after = nextPacket.message
 		expect(after.readUInt16BE(2)).toBeGreaterThan(before.readUInt16BE(2))
 		expect(after.readUInt32BE(4)).toBeGreaterThan(before.readUInt32BE(4))
 
