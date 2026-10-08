@@ -4,7 +4,7 @@
   "packageManager": "pnpm@11.28.0",
   "scripts": {
     "catalog:migrate": "pncat migrate --yes",
-    "catalog:check": "pncat detect --yes"
+    "catalog:detect": "pncat detect --yes"
   },
   "devDependencies": {
     "pncat": "catalog:tooling"

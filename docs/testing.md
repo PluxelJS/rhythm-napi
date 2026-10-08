@@ -97,6 +97,12 @@ Node 层验证生成的 `index.d.ts` 能被 TypeScript 消费，并覆盖 lifecy
 callback/补偿队列、鉴权刷新信号、批量 status、ReplayGain 和 shutdown。Rust 单元测试不能替代
 这些 ABI 与 event-loop 契约。
 
+开发工具安装、类型检查和完整 Vitest 套件使用 Node 24。包的运行时支持仍为 Node >=20；
+CI 在每个平台下载构建产物后，用 Node 20 和 24 直接运行
+`node --test scripts/runtime-smoke.mjs`（工作目录 `crates/music_stream_napi`），验证公共包的
+import/require、原生实例、异步查询、输入校验和 shutdown，不让开发工具的 Node 要求
+误充当包的运行时要求。
+
 ## 性能判断
 
 离线 pipeline 吞吐只是一个下限。当前开发机的 release Criterion 参考值（5 秒 48 kHz stereo

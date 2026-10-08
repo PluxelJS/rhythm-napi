@@ -67,7 +67,7 @@ jobs:
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v6
         with:
-          node-version: ${{ matrix.node }}
+          node-version: 24
           architecture: ${{ matrix.settings.architecture }}
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
@@ -78,5 +78,13 @@ jobs:
           name: binding-${{ matrix.settings.target }}
           path: crates/music_stream_napi
       - name: Type contract and binding tests
+        if: matrix.node == 24
         working-directory: ${{ env.NAPI_DIR }}
         run: pnpm exec tsc --noEmit && pnpm exec vitest run
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          architecture: ${{ matrix.settings.architecture }}
+      - name: Runtime compatibility without development tools
+        working-directory: ${{ env.NAPI_DIR }}
+        run: node --test scripts/runtime-smoke.mjs

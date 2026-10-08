@@ -82,4 +82,4 @@ cargo doc --workspace --no-deps
 pnpm --filter @rhythm-app/streamer test
 ```
 
-Node 开发依赖由根 `pnpm-workspace.yaml` catalog 与 pncat 管理；运行 `pnpm catalog:migrate` 迁移声明，安装后提交根锁文件。嵌入 Rhythm 工作区时同名 catalog 由父工作区统一选择版本。npm 包的安装与发布入口保持不变。
+Node 开发依赖由根 `pnpm-workspace.yaml` catalog 与 pncat 管理；运行 `pnpm catalog:detect` 查看未迁移声明（报告命令，不是 CI 阻断检查），用 `pnpm catalog:migrate` 迁移声明，安装后提交根锁文件。嵌入 Rhythm 工作区时同名 catalog 由父工作区统一选择版本。npm 包的安装与发布入口保持不变。
