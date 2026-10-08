@@ -43,6 +43,15 @@ jobs:
         run: rustup target add ${{ matrix.target }}
       - name: Install Node dependencies
         run: pnpm install --frozen-lockfile
+      - name: Link the Windows Node host import library
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $nodeVersion = node -p "process.version"
+          $nodeLibDir = Join-Path $env:RUNNER_TEMP 'node-import-library'
+          New-Item -ItemType Directory -Force $nodeLibDir | Out-Null
+          Invoke-WebRequest "https://nodejs.org/dist/$nodeVersion/win-x64/node.lib" -OutFile (Join-Path $nodeLibDir 'node.lib')
+          "RUSTFLAGS=-L native=$nodeLibDir -l node" >> $env:GITHUB_ENV
       - name: Build release binding
         working-directory: ${{ env.NAPI_DIR }}
         shell: bash

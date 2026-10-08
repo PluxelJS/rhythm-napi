@@ -103,6 +103,11 @@ CI 在每个平台下载构建产物后，用 Node 20 和 24 直接运行
 import/require、原生实例、异步查询、输入校验和 shutdown，不让开发工具的 Node 要求
 误充当包的运行时要求。
 
+Windows MSVC 构建还需要当前 Node 版本的 `node.lib`：napi 的异步执行路径引用宿主的
+`uv_hrtime`，仅动态加载 Node-API 符号不足以完成链接。构建 workflow 下载对应版本的
+官方导入库，并用 `RUSTFLAGS=-L native=<node.lib 所在目录> -l node` 传给 Cargo；
+本地 Windows 构建也使用这一设置。运行时不需要额外分发该导入库。
+
 ## 性能判断
 
 离线 pipeline 吞吐只是一个下限。当前开发机的 release Criterion 参考值（5 秒 48 kHz stereo
