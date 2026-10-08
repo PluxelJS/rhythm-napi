@@ -71,8 +71,9 @@ gh secret delete NPM_TOKEN --env npm --repo PluxelJS/rhythm-napi
 cd crates/music_stream_napi
 npm version patch --no-git-tag-version
 cd ../..
+pnpm install --lockfile-only
 git add crates/music_stream_napi/package.json \
-  crates/music_stream_napi/package-lock.json \
+  pnpm-lock.yaml \
   crates/music_stream_napi/npm
 git commit -m "release: @rhythm-app/streamer v$(node -p "require('./crates/music_stream_napi/package.json').version")"
 git push origin main

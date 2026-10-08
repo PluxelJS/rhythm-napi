@@ -21,17 +21,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: npm
-          cache-dependency-path: crates/music_stream_napi/package-lock.json
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - name: Install Node dependencies
-        working-directory: ${{ env.NAPI_DIR }}
-        run: npm ci
+        run: pnpm install --frozen-lockfile
       - name: Rust formatting
         run: cargo fmt --all -- --check
       - name: Rust tests
@@ -42,7 +42,7 @@ jobs:
         run: cargo doc --workspace --no-deps
       - name: Node and N-API tests
         working-directory: ${{ env.NAPI_DIR }}
-        run: npm test
+        run: pnpm test
 
   build-bindings:
     uses: ./.github/workflows/bindings.yml
@@ -64,19 +64,19 @@ jobs:
           - { host: macos-latest, target: aarch64-apple-darwin, architecture: arm64 }
     steps:
       - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node }}
           architecture: ${{ matrix.settings.architecture }}
-          cache: npm
-          cache-dependency-path: crates/music_stream_napi/package-lock.json
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
       - name: Install Node dependencies
-        working-directory: ${{ env.NAPI_DIR }}
-        run: npm ci
+        run: pnpm install --frozen-lockfile
       - uses: actions/download-artifact@v8
         with:
           name: binding-${{ matrix.settings.target }}
           path: crates/music_stream_napi
       - name: Type contract and binding tests
         working-directory: ${{ env.NAPI_DIR }}
-        run: npx tsc --noEmit && npx vitest run
+        run: pnpm exec tsc --noEmit && pnpm exec vitest run

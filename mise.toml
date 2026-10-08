@@ -2,3 +2,4 @@
 codex = "latest"
 node = "latest"
 rust = "latest"
+pnpm = "11.28.0"

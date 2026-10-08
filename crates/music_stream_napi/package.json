@@ -40,16 +40,16 @@
 		"artifacts": "napi artifacts",
 		"create:npm": "napi create-npm-dirs",
 		"prepublishOnly": "napi pre-publish -t npm --gh-release",
-		"soak": "npm run build && node scripts/soak.mjs",
-		"test": "npm run build:debug && npm run test:check",
+		"soak": "pnpm run build && node scripts/soak.mjs",
+		"test": "pnpm run build:debug && pnpm run test:check",
 		"test:check": "tsc --noEmit && vitest run",
 		"version": "napi version && git add npm"
 	},
 	"devDependencies": {
-		"@napi-rs/cli": "3.10.5",
-		"@types/node": "26.6.3",
-		"typescript": "7.0.2",
-		"vitest": "5.0.2"
+		"@napi-rs/cli": "catalog:tooling",
+		"@types/node": "catalog:tooling",
+		"typescript": "catalog:tooling",
+		"vitest": "catalog:test"
 	},
 	"napi": {
 		"binaryName": "rhythm_streamer",
@@ -62,6 +62,5 @@
 	},
 	"engines": {
 		"node": ">=20"
-	},
-	"packageManager": "npm@11.17.0"
+	}
 }

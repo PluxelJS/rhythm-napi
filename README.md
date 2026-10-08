@@ -62,13 +62,12 @@ docs/                      当前设计与使用契约
 ## N-API 包
 
 ```sh
-cd crates/music_stream_napi
-npm ci
-npm run build
-npm run create:npm
+pnpm install --frozen-lockfile
+pnpm --filter @rhythm-app/streamer build
+pnpm --filter @rhythm-app/streamer create:npm
 ```
 
-`build` 始终生成经过 LTO 和 strip 的 release 原生库；`npm test` 使用单独的 debug 构建。
+`build` 始终生成经过 LTO 和 strip 的 release 原生库；`pnpm test` 使用单独的 debug 构建。
 正式发布由 GitHub Actions 分 target 构建并通过 `napi artifacts`/`napi pre-publish` 组装主包和
 平台子包，详见 [发布契约](docs/releasing.md)。
 
@@ -80,6 +79,7 @@ cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo doc --workspace --no-deps
 
-cd crates/music_stream_napi
-npm test
+pnpm --filter @rhythm-app/streamer test
 ```
+
+Node 开发依赖由根 `pnpm-workspace.yaml` catalog 与 pncat 管理；运行 `pnpm catalog:migrate` 迁移声明，安装后提交根锁文件。嵌入 Rhythm 工作区时同名 catalog 由父工作区统一选择版本。npm 包的安装与发布入口保持不变。
