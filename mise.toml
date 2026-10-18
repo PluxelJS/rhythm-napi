@@ -6,6 +6,10 @@ rust = { version = "1.98.1", profile = "minimal", components = ["clippy", "rustf
 hk = "2.6.0"
 viteplus = "1.2.0"
 
+# pnpm's portable npm package also supports Intel macOS, which has no standalone binary.
+[tool_alias]
+pnpm = "npm:pnpm"
+
 [env]
 _.path = ["node_modules/.bin"]
 PNPM_CONFIG_PM_ON_FAIL = "ignore"
