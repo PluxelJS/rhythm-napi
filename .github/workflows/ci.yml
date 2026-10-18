@@ -66,8 +66,9 @@ jobs:
         with:
           install: true
           cache: true
+          # Install the tools used to test the prebuilt bindings.
+          install_args: node npm pnpm viteplus
           cache_key_prefix: mise-v1-${{ matrix.settings.architecture }}
-          mise_dir: ${{ runner.temp }}/mise-${{ matrix.settings.architecture }}
       - name: Install dependencies
         run: vp install --frozen-lockfile
       - uses: actions/download-artifact@v8
