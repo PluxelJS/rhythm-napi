@@ -5,6 +5,10 @@ settings:
   excludeLinksFromLockfile: false
 
 catalogs:
+  build:
+    vite-plus:
+      specifier: 1.2.0
+      version: 1.2.0
   test:
     vitest:
       specifier: 5.0.4
@@ -22,9 +26,6 @@ catalogs:
     typescript:
       specifier: ^7.0.2
       version: 7.0.2
-    vite-plus:
-      specifier: 1.2.0
-      version: 1.2.0
 
 overrides:
   vite@*: npm:@voidzero-dev/vite-plus-core@1.2.0
@@ -37,7 +38,7 @@ importers:
         specifier: catalog:tooling
         version: 0.13.4
       vite-plus:
-        specifier: catalog:tooling
+        specifier: catalog:build
         version: 1.2.0(@types/node@26.6.5)(@vitest/ui@5.0.4)(jiti@2.7.0)(typescript@7.0.2)(yaml@2.9.1)
 
   crates/music_stream_napi:
@@ -52,7 +53,7 @@ importers:
         specifier: catalog:tooling
         version: 7.0.2
       vite-plus:
-        specifier: catalog:tooling
+        specifier: catalog:build
         version: 1.2.0(@types/node@26.6.5)(@vitest/ui@5.0.4)(jiti@2.7.0)(typescript@7.0.2)(yaml@2.9.1)
       vitest:
         specifier: catalog:test

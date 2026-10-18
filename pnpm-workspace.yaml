@@ -9,6 +9,8 @@ peerDependencyRules:
     vite: '1.2.0'
 
 catalogs:
+  build:
+    vite-plus: 1.2.0
   test:
     vitest: 5.0.4
   tooling:
@@ -16,4 +18,3 @@ catalogs:
     '@types/node': ^26.6.4
     pncat: ^0.13.4
     typescript: ^7.0.2
-    vite-plus: 1.2.0

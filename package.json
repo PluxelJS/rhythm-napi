@@ -13,7 +13,7 @@
 		"catalog:detect": "pncat detect --yes"
 	},
 	"devDependencies": {
-		"vite-plus": "catalog:tooling",
+		"vite-plus": "catalog:build",
 		"pncat": "catalog:tooling"
 	},
 	"packageManager": "pnpm@11.28.2"

@@ -4,6 +4,7 @@ export default defineConfig({
 	saveExact: false,
 	depFields: { peerDependencies: false },
 	catalogRules: [
+		{ name: 'build', match: ['vite-plus'], priority: 5 },
 		{ name: 'test', match: ['vitest'], priority: 10 },
 		{
 			name: 'tooling',
