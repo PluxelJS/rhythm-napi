@@ -2,21 +2,21 @@
 
 依赖按系统边界选择，而不是按便利性堆叠。
 
-| 依赖 | 采用理由 | 使用边界 |
-| --- | --- | --- |
-| `tokio`, `tokio-util` | async task、UDP、timer、channel、cancellation | 不运行 codec/DSP，不用 runtime worker 承担同步清理 |
-| `reqwest` | async HTTP、连接池、TLS | 禁止 blocking client；业务鉴权和 URL 解析留给宿主 |
-| `m3u8-rs` | HLS master/media playlist 语法解析 | 只解析清单；variant 策略、segment 上限与获取生命周期仍由 source 控制 |
-| `aes`, `cbc` | 标准 HLS AES-128 whole-segment 解密 | 仅做 identity key format、CBC 和 PKCS#7；不实现 SAMPLE-AES/DRM |
-| `symphonia` | 容器 probe、demux、decode、seek | 只在受控 blocking worker 中调用 |
-| `rubato` | 高质量 sample-rate conversion | 只处理 PCM，不负责调度或 buffering |
-| `opus` | libopus 安全封装 | 解码 Ogg Opus mono/stereo packet，并编码固定输出格式；codec 不进入 sender task |
-| `rtp`, `rtcp`, `webrtc-util` | 标准协议对象与 marshal/parse | 不承载 pacing、网关协商或 protection 策略 |
-| `bytes` | immutable payload 和低成本 slice | 不作为无界缓存容器 |
-| `tempfile`, `lru` | 完整 HTTP artifact 生命周期与内存索引 | 磁盘容量由 runtime semaphore 约束 |
-| `napi`, `napi-derive` | Node Promise 和 bounded ThreadsafeFunction | 不旁路 actor，不阻塞 JavaScript event loop |
-| `metrics`, `tracing` | 宿主可选观测 facade | library 不安装全局 recorder/subscriber |
-| `rand` | RTP sequence/timestamp 随机初值 | 不用于内容身份或安全密钥生成 |
+| 依赖                         | 采用理由                                      | 使用边界                                                                       |
+| ---------------------------- | --------------------------------------------- | ------------------------------------------------------------------------------ |
+| `tokio`, `tokio-util`        | async task、UDP、timer、channel、cancellation | 不运行 codec/DSP，不用 runtime worker 承担同步清理                             |
+| `reqwest`                    | async HTTP、连接池、TLS                       | 禁止 blocking client；业务鉴权和 URL 解析留给宿主                              |
+| `m3u8-rs`                    | HLS master/media playlist 语法解析            | 只解析清单；variant 策略、segment 上限与获取生命周期仍由 source 控制           |
+| `aes`, `cbc`                 | 标准 HLS AES-128 whole-segment 解密           | 仅做 identity key format、CBC 和 PKCS#7；不实现 SAMPLE-AES/DRM                 |
+| `symphonia`                  | 容器 probe、demux、decode、seek               | 只在受控 blocking worker 中调用                                                |
+| `rubato`                     | 高质量 sample-rate conversion                 | 只处理 PCM，不负责调度或 buffering                                             |
+| `opus`                       | libopus 安全封装                              | 解码 Ogg Opus mono/stereo packet，并编码固定输出格式；codec 不进入 sender task |
+| `rtp`, `rtcp`, `webrtc-util` | 标准协议对象与 marshal/parse                  | 不承载 pacing、网关协商或 protection 策略                                      |
+| `bytes`                      | immutable payload 和低成本 slice              | 不作为无界缓存容器                                                             |
+| `tempfile`, `lru`            | 完整 HTTP artifact 生命周期与内存索引         | 磁盘容量由 runtime semaphore 约束                                              |
+| `napi`, `napi-derive`        | Node Promise 和 bounded ThreadsafeFunction    | 不旁路 actor，不阻塞 JavaScript event loop                                     |
+| `metrics`, `tracing`         | 宿主可选观测 facade                           | library 不安装全局 recorder/subscriber                                         |
+| `rand`                       | RTP sequence/timestamp 随机初值               | 不用于内容身份或安全密钥生成                                                   |
 
 ## 准入原则
 

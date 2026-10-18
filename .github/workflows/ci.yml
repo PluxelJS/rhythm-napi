@@ -21,28 +21,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: jdx/mise-action@v5
         with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: crates/music_stream_napi/package-lock.json
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
-      - name: Install Node dependencies
-        working-directory: ${{ env.NAPI_DIR }}
-        run: npm ci
+          install: true
+          cache: true
+      - name: Install dependencies
+        run: vp install --frozen-lockfile
+      - name: Validate development tools
+        run: vp run check-tools && hk validate
       - name: Rust formatting
-        run: cargo fmt --all -- --check
+        run: vp run check-rust-format
       - name: Rust tests
-        run: cargo test --workspace --all-targets
+        run: vp run check-rust-tests
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: vp run check-rust-lint
       - name: Rust documentation
-        run: cargo doc --workspace --no-deps
+        run: vp run check-rust-docs
       - name: Node and N-API tests
         working-directory: ${{ env.NAPI_DIR }}
-        run: npm test
+        run: vp run check-tests
 
   build-bindings:
     uses: ./.github/workflows/bindings.yml
@@ -50,13 +47,14 @@ jobs:
       checkout_ref: ${{ github.sha }}
 
   test-bindings:
-    name: Test ${{ matrix.settings.target }} on Node ${{ matrix.node }}
+    name: Test ${{ matrix.settings.target }} on Node 24 and Node 20 runtime
     needs: build-bindings
     runs-on: ${{ matrix.settings.host }}
+    env:
+      MISE_ARCH: ${{ matrix.settings.architecture }}
     strategy:
       fail-fast: false
       matrix:
-        node: [20, 24]
         settings:
           - { host: ubuntu-latest, target: x86_64-unknown-linux-gnu, architecture: x64 }
           - { host: windows-latest, target: x86_64-pc-windows-msvc, architecture: x64 }
@@ -64,19 +62,21 @@ jobs:
           - { host: macos-latest, target: aarch64-apple-darwin, architecture: arm64 }
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: jdx/mise-action@v5
         with:
-          node-version: ${{ matrix.node }}
-          architecture: ${{ matrix.settings.architecture }}
-          cache: npm
-          cache-dependency-path: crates/music_stream_napi/package-lock.json
-      - name: Install Node dependencies
-        working-directory: ${{ env.NAPI_DIR }}
-        run: npm ci
+          install: true
+          cache: true
+          cache_key_prefix: mise-v1-${{ matrix.settings.architecture }}
+          mise_dir: ${{ runner.temp }}/mise-${{ matrix.settings.architecture }}
+      - name: Install dependencies
+        run: vp install --frozen-lockfile
       - uses: actions/download-artifact@v8
         with:
           name: binding-${{ matrix.settings.target }}
           path: crates/music_stream_napi
       - name: Type contract and binding tests
         working-directory: ${{ env.NAPI_DIR }}
-        run: npx tsc --noEmit && npx vitest run
+        run: vp run check-bindings
+      - name: Minimum runtime binding compatibility
+        working-directory: ${{ env.NAPI_DIR }}
+        run: mise exec node@20 -- node -e "const { Streamer } = require('.'); const streamer = new Streamer(); streamer.shutdown().catch(error => { console.error(error); process.exitCode = 1 })"

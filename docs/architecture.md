@@ -33,14 +33,14 @@ Rust 不猜下一首，不保存 provider 凭据，不根据网络质量自行�
 
 理解所有权比理解模块名称更重要：
 
-| 作用域 | 唯一所有者 | 拥有的状态 |
-| --- | --- | --- |
-| 进程 | 静态 HTTP client | DNS/TLS/HTTP 连接池 |
-| `Streamer` | `RuntimeResources` | stream总量、CPU、blocking producer、HTTP/live、live bytes、tempfile/cache 配额和共享 URL flight registry |
-| stream | `StreamRuntime` | actor、current/next handle、事件入口和 persistent sender |
-| RTP session | sender | socket、SSRC、sequence、timestamp、pacing、RTCP 和 active receiver |
-| generation | producer | source reader、decoder、resampler、DSP、encoder 和 Opus queue sender |
-| artifact | cache/使用者引用 | 完整文件及其延迟清理凭据 |
+| 作用域      | 唯一所有者         | 拥有的状态                                                                                               |
+| ----------- | ------------------ | -------------------------------------------------------------------------------------------------------- |
+| 进程        | 静态 HTTP client   | DNS/TLS/HTTP 连接池                                                                                      |
+| `Streamer`  | `RuntimeResources` | stream总量、CPU、blocking producer、HTTP/live、live bytes、tempfile/cache 配额和共享 URL flight registry |
+| stream      | `StreamRuntime`    | actor、current/next handle、事件入口和 persistent sender                                                 |
+| RTP session | sender             | socket、SSRC、sequence、timestamp、pacing、RTCP 和 active receiver                                       |
+| generation  | producer           | source reader、decoder、resampler、DSP、encoder 和 Opus queue sender                                     |
+| artifact    | cache/使用者引用   | 完整文件及其延迟清理凭据                                                                                 |
 
 `Streamer` 级预算不是进程级预算。创建多个 `Streamer` 会得到多套媒体资源额度；只有 HTTP
 client 的连接池在进程内共享。生产宿主通常应该创建一个长生命周期 `Streamer`。

@@ -32,13 +32,13 @@ stop 时不会重复上报。supervisor 自身失败和退出超时才升级为 
 
 公开状态只有五种：
 
-| 状态 | 含义 |
-| --- | --- |
-| `idle` | runtime 存在，但当前没有可播放 generation；可等待宿主提供 next/current |
-| `buffering` | current 已启动但尚未达到 prebuffer，或 promotion 前仍在等待 ready |
-| `playing` | current 已 prebuffer 并由 sender 按实时节拍发送 |
-| `paused` | 宿主明确冻结了可暂停媒体；该意图跨 current/next 空窗和 generation 替换保留 |
-| `stopped` | runtime 已终止，sender 与 producer 已收敛，不再接受播放控制 |
+| 状态        | 含义                                                                       |
+| ----------- | -------------------------------------------------------------------------- |
+| `idle`      | runtime 存在，但当前没有可播放 generation；可等待宿主提供 next/current     |
+| `buffering` | current 已启动但尚未达到 prebuffer，或 promotion 前仍在等待 ready          |
+| `playing`   | current 已 prebuffer 并由 sender 按实时节拍发送                            |
+| `paused`    | 宿主明确冻结了可暂停媒体；该意图跨 current/next 空窗和 generation 替换保留 |
+| `stopped`   | runtime 已终止，sender 与 producer 已收敛，不再接受播放控制                |
 
 `Buffering` 不承诺正在占用 CPU，它也可能在等待 HTTP、tempfile、blocking admission 或足够的
 媒体字节。`Paused` 是用户意图，不是某个 task 的瞬时状态；seek、switch、refresh 和 promotion
@@ -144,15 +144,15 @@ tempfile worst-case quota
 
 `RuntimeResources` 为 current 保留资源：
 
-| 资源 | 总限制 | preload 约束 |
-| --- | --- | --- |
-| stream | `maxStreams` | 硬限制 active/starting runtime、sender task和UDP socket |
-| CPU turn | `maxCpuWorkers` | current 等待时 next 不重新获取；多核时至少留一个位置 |
-| blocking producer | `maxBlockingProducers` | next 受更小的 `maxBlockingPreloads` 限制 |
-| bounded HTTP | `maxConcurrentHttpDownloads` | 至少留一个 current 槽 |
-| live connection | `maxConcurrentLiveStreams` | 至少留一个 current 槽 |
-| tempfile | `maxTempfileBytes` | preload 最多使用四分之一预算 |
-| live bytes | `maxLiveBufferedBytes` | 所有 live bridge 与 HLS playlist/segment allocation 共享 |
+| 资源              | 总限制                       | preload 约束                                             |
+| ----------------- | ---------------------------- | -------------------------------------------------------- |
+| stream            | `maxStreams`                 | 硬限制 active/starting runtime、sender task和UDP socket  |
+| CPU turn          | `maxCpuWorkers`              | current 等待时 next 不重新获取；多核时至少留一个位置     |
+| blocking producer | `maxBlockingProducers`       | next 受更小的 `maxBlockingPreloads` 限制                 |
+| bounded HTTP      | `maxConcurrentHttpDownloads` | 至少留一个 current 槽                                    |
+| live connection   | `maxConcurrentLiveStreams`   | 至少留一个 current 槽                                    |
+| tempfile          | `maxTempfileBytes`           | preload 最多使用四分之一预算                             |
+| live bytes        | `maxLiveBufferedBytes`       | 所有 live bridge 与 HLS playlist/segment allocation 共享 |
 
 每个 source 的 `maxBytes` 不得超过 `Streamer` tempfile 预算的四分之一，单个 live bridge 也必须
 小于共享 live byte 预算。这些关系在启动前校验，避免运行中等待永远无法满足的 semaphore。

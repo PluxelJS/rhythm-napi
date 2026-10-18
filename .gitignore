@@ -9,3 +9,5 @@
 /crates/*/*.node
 *.node
 *.log
+
+.vite/

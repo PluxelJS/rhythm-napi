@@ -7,9 +7,9 @@ Opus queue、sender 和资源预算，不为每种协议复制播放状态机。
 
 - [ ] 若真实语料需要，扩展 Ogg Opus multistream/channel mapping；当前输入支持常见 mono/stereo。
 - [ ] 继续扩充生产语料；小型确定性测试现已覆盖 ADTS AAC、MP3、FLAC、Ogg Opus/Vorbis、WAV、
-  faststart M4A AAC/ALAC和损坏 FLAC header，仍需真实 VBR、多声道、超大 metadata及更多损坏样本。
+      faststart M4A AAC/ALAC和损坏 FLAC header，仍需真实 VBR、多声道、超大 metadata及更多损坏样本。
 - [ ] 评估仍返回非标准 `ICY 200 OK` 状态行的老式 Shoutcast 服务；当前标准 HTTP Icecast/ICY
-  响应已支持。
+      响应已支持。
 
 ## P1：HLS 后续
 
@@ -18,7 +18,7 @@ MPEG-TS 内的 ADTS AAC/MP3、`EXT-X-MAP`/fMP4/CMAF 和 byte range；以下能�
 需求增加：
 
 - [ ] SAMPLE-AES/DRM，以及跨 discontinuity 的初始化段/codec generation 切换；标准 AES-128、
-  `EXT-X-GAP` 和同初始化段/codec discontinuity 已支持。
+      `EXT-X-GAP` 和同初始化段/codec discontinuity 已支持。
 - [ ] LL-HLS partial segment、blocking reload 和 preload hint。
 - [ ] 若语料需要，基于 PAT/PMT 扩展多 program/多 audio PID 选择，并评估 LATM AAC、AC-3/E-AC-3。
 
@@ -32,6 +32,6 @@ MPEG-TS 内的 ADTS AAC/MP3、`EXT-X-MAP`/fMP4/CMAF 和 byte range；以下能�
 ## P3：可选体验能力
 
 - [ ] 若产品确实需要直播 pause/seek，增加显式启用、有磁盘和时长上限的 timeshift ring；默认 live
-  仍不保留历史。
+      仍不保留历史。
 - [ ] 若宿主会据此改善UI或provider策略，再向状态暴露source protocol/container/codec。sender的
-  `bufferedMs`、underrun、lateness和drop诊断已可通过N-API status批量查询。
+      `bufferedMs`、underrun、lateness和drop诊断已可通过N-API status批量查询。

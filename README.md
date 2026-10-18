@@ -62,24 +62,29 @@ docs/                      当前设计与使用契约
 ## N-API 包
 
 ```sh
+mise trust
+mise install
+mise exec -- vp install --frozen-lockfile
+mise exec -- vp run hooks:install
 cd crates/music_stream_napi
-npm ci
-npm run build
-npm run create:npm
+vp run build
+vp run create:npm
 ```
 
-`build` 始终生成经过 LTO 和 strip 的 release 原生库；`npm test` 使用单独的 debug 构建。
+`build` 始终生成经过 LTO 和 strip 的 release 原生库；`vp run test` 通过同一 Vite Task release 构建测试实际发布 binding；`vp run build:debug` 可显式调试。
 正式发布由 GitHub Actions 分 target 构建并通过 `napi artifacts`/`napi pre-publish` 组装主包和
 平台子包，详见 [发布契约](docs/releasing.md)。
 
 ## 验证
 
+hk 的 `rust-format` 步骤在 Rust 源码、Cargo manifest、rustfmt 配置或 `mise.toml` 变化时对整个 Cargo workspace 执行 `cargo fmt --check`。显式修复用 `mise exec -- hk fix --step rust-format`；手动检查和完整验证复用同一格式命令：
+
 ```sh
-cargo fmt --all -- --check
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
-cargo doc --workspace --no-deps
+mise exec -- vp run check-rust-format
+mise exec -- vp run check-rust-tests
+mise exec -- vp run check-rust-lint
+mise exec -- vp run check-rust-docs
 
 cd crates/music_stream_napi
-npm test
+vp run test
 ```

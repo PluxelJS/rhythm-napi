@@ -10,6 +10,10 @@ npm 主包是 `@rhythm-app/streamer`。原生库由 napi-rs 拆分为四个可�
 主包只包含 loader、TypeScript 契约和文档，并通过 `optionalDependencies` 选择当前平台包。
 不得把单一平台 `.node` 文件直接发进主包。
 
+Node、pnpm 和 npm 的版本由 `mise.toml` 统一管理。根包通过 `vp pm publish` 发布；
+`napi pre-publish` 为平台包调用 npm，因此 npm 也必须保留受控版本。CI 用 `MISE_ARCH`
+和独立 `MISE_DATA_DIR` 安装对应架构的工具，并分别验证 Node 24 与最低支持的 Node 20。
+
 ## 你需要配置什么
 
 一次性准备以下权限：
@@ -65,14 +69,15 @@ gh secret delete NPM_TOKEN --env npm --repo PluxelJS/rhythm-napi
 
 ## 以后发布新版本
 
-以下示例发布 patch 版本。`npm version` 会同步主包和平台包的版本：
+以下示例发布 patch 版本。版本命令会同步主包和平台包的版本：
 
 ```sh
 cd crates/music_stream_napi
-npm version patch --no-git-tag-version
+vp pm version patch --no-git-tag-version
 cd ../..
+vp install --lockfile-only
 git add crates/music_stream_napi/package.json \
-  crates/music_stream_napi/package-lock.json \
+  pnpm-lock.yaml \
   crates/music_stream_napi/npm
 git commit -m "release: @rhythm-app/streamer v$(node -p "require('./crates/music_stream_napi/package.json').version")"
 git push origin main

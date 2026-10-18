@@ -43,14 +43,14 @@ runtime 负责一次确定媒体执行：下载、解码、预载、Opus、RTP/R
 import { Streamer } from '@rhythm-app/streamer'
 
 const streamer = new Streamer({
-  maxStreams: 1_024,
-  maxCpuWorkers: 8,
-  maxBlockingProducers: 64,
-  maxBlockingPreloads: 16,
-  maxConcurrentHttpDownloads: 8,
-  maxConcurrentLiveStreams: 64,
-  maxLiveBufferedBytes: 64 * 1024 * 1024,
-  maxTempfileBytes: 1024 * 1024 * 1024,
+	maxStreams: 1_024,
+	maxCpuWorkers: 8,
+	maxBlockingProducers: 64,
+	maxBlockingPreloads: 16,
+	maxConcurrentHttpDownloads: 8,
+	maxConcurrentLiveStreams: 64,
+	maxLiveBufferedBytes: 64 * 1024 * 1024,
+	maxTempfileBytes: 1024 * 1024 * 1024,
 })
 ```
 
@@ -76,10 +76,10 @@ worker。`getResourceDiagnostics()`中的`cpuParallelism`、`cpuWorkersMaximum`�
 
 ```ts
 const source = {
-  id: `${provider}:${trackId}:${contentVersion}`,
-  kind: 'url',
-  url: signedUrl,
-  formatHint: 'mp3',
+	id: `${provider}:${trackId}:${contentVersion}`,
+	kind: 'url',
+	url: signedUrl,
+	formatHint: 'mp3',
 }
 ```
 
@@ -91,12 +91,12 @@ single-flight 只在 HTTP 字节上限、超时、重试和 cache 策略也相�
 
 ### 选择 source 类型
 
-| 类型 | 适用场景 | 行为 |
-| --- | --- | --- |
-| `file` | 本机完整文件 | seekable，无下载和 tempfile 配额 |
-| `url` | 有大小上限、最终会完成的远程音频 | 零起点渐进播放，完成后可 cache/seek |
-| `live` | 不确定总长度的直播 body | bounded byte bridge，不 cache，作为 current 时不 pause/seek |
-| HLS（`.m3u8` 或 hint） | 音频 VOD/live playlist | 解析 playlist 后分类；VOD 为 `url`，直播为 `live`，都不可 seek/cache |
+| 类型                   | 适用场景                         | 行为                                                                 |
+| ---------------------- | -------------------------------- | -------------------------------------------------------------------- |
+| `file`                 | 本机完整文件                     | seekable，无下载和 tempfile 配额                                     |
+| `url`                  | 有大小上限、最终会完成的远程音频 | 零起点渐进播放，完成后可 cache/seek                                  |
+| `live`                 | 不确定总长度的直播 body          | bounded byte bridge，不 cache，作为 current 时不 pause/seek          |
+| HLS（`.m3u8` 或 hint） | 音频 VOD/live playlist           | 解析 playlist 后分类；VOD 为 `url`，直播为 `live`，都不可 seek/cache |
 
 不要把直播伪装成 bounded URL，否则 `maxBytes` 和完整 artifact 语义不成立；也不要把普通歌曲标成
 live，否则会失去 pause、seek、完整 artifact 和 cache语义。
@@ -137,51 +137,51 @@ provider 必须只返回自己信任的媒体图。`networkPolicy: 'public-only'
 
 ```ts
 const status = await streamer.startStream({
-  streamId: voiceConnectionId,
-  current: {
-    id: 'provider:track-a:v3',
-    kind: 'url',
-    url: signedCurrentUrl,
-    formatHint: 'mp3',
-    headers: { referer: 'https://provider.example/' },
-  },
-  next: {
-    id: 'provider:track-b:v1',
-    kind: 'url',
-    url: signedNextUrl,
-    formatHint: 'mp3',
-  },
-  opusBitrateLimitBps: 128_000,
-  transport: {
-    ip: gatewayIp,
-    port: gatewayRtpPort,
-    rtcpPort: gatewayRtcpPort,
-    rtcpMux: false,
-    audioSsrc: negotiatedSsrc,
-    audioPt: 96,
-    // Optional sparse Opus silence RTP during idle/buffering/paused gaps.
-    // This preserves NAT/media-server state without advancing track progress.
-    rtpKeepaliveIntervalMs: 5_000,
-    mtu: 1_200,
-  },
-  source: {
-    http: {
-      maxBytes: 256 * 1024 * 1024,
-      ioTimeoutMs: 30_000,
-      maxRetries: 2,
-      retryBackoffMs: 250,
-      cacheTempFiles: true,
-    },
-    liveHttp: {
-      openTimeoutMs: 30_000,
-      idleTimeoutMs: 30_000,
-      maxBufferedBytes: 512 * 1024,
-      maxRetries: 2,
-      retryBackoffMs: 250,
-    },
-  },
-  volume: 1,
-  gainDb: 0,
+	streamId: voiceConnectionId,
+	current: {
+		id: 'provider:track-a:v3',
+		kind: 'url',
+		url: signedCurrentUrl,
+		formatHint: 'mp3',
+		headers: { referer: 'https://provider.example/' },
+	},
+	next: {
+		id: 'provider:track-b:v1',
+		kind: 'url',
+		url: signedNextUrl,
+		formatHint: 'mp3',
+	},
+	opusBitrateLimitBps: 128_000,
+	transport: {
+		ip: gatewayIp,
+		port: gatewayRtpPort,
+		rtcpPort: gatewayRtcpPort,
+		rtcpMux: false,
+		audioSsrc: negotiatedSsrc,
+		audioPt: 96,
+		// Optional sparse Opus silence RTP during idle/buffering/paused gaps.
+		// This preserves NAT/media-server state without advancing track progress.
+		rtpKeepaliveIntervalMs: 5_000,
+		mtu: 1_200,
+	},
+	source: {
+		http: {
+			maxBytes: 256 * 1024 * 1024,
+			ioTimeoutMs: 30_000,
+			maxRetries: 2,
+			retryBackoffMs: 250,
+			cacheTempFiles: true,
+		},
+		liveHttp: {
+			openTimeoutMs: 30_000,
+			idleTimeoutMs: 30_000,
+			maxBufferedBytes: 512 * 1024,
+			maxRetries: 2,
+			retryBackoffMs: 250,
+		},
+	},
+	volume: 1,
+	gainDb: 0,
 })
 ```
 
@@ -206,17 +206,17 @@ let drainScheduled = false
 let eventChain = Promise.resolve()
 
 function scheduleDrain() {
-  if (drainScheduled) return
-  drainScheduled = true
-  queueMicrotask(() => {
-    drainScheduled = false
-    const events = streamer.drainEvents()
-    eventChain = eventChain
-      .then(async () => {
-        for (const event of events) await handleMediaEvent(event)
-      })
-      .catch(reportMediaPolicyError)
-  })
+	if (drainScheduled) return
+	drainScheduled = true
+	queueMicrotask(() => {
+		drainScheduled = false
+		const events = streamer.drainEvents()
+		eventChain = eventChain
+			.then(async () => {
+				for (const event of events) await handleMediaEvent(event)
+			})
+			.catch(reportMediaPolicyError)
+	})
 }
 
 streamer.setEventCallback(scheduleDrain)
@@ -296,15 +296,15 @@ Promise rejection 的 message 以稳定 code 和冒号开头，异步媒体错�
 code。这是 napi-rs Tokio Promise 边界的明确契约：宿主只取第一个冒号前的 code 做恢复分类，
 其余 message 只用于诊断：
 
-| Code | 宿主建议 |
-| --- | --- |
-| `SOURCE_AUTH_EXPIRED` | 获取同 ID 新 URL并 refresh；失败则按 playlist 策略跳过 |
-| `SOURCE_TIMEOUT` | 根据 provider/节点策略有限重试或切换，不在紧循环重启 |
-| `INVALID_SOURCE`, `DECODE_ERROR` | 标记本次 source不可用，选择下一首或上报内容问题 |
-| `NOT_SEEKABLE`, `UNSUPPORTED` | 修正产品操作，不把它当网络重试 |
-| `OUTPUT_ERROR` | 检查 gateway/session；通常需要重建外部连接，而非重试同一 packet |
-| `BUSY` | 等待正在进行的生命周期操作完成，避免并发重复命令 |
-| `INTERNAL`, `STREAM_CLOSED` | 查询状态并收敛该 stream；持续出现时记录诊断并重建 runtime |
+| Code                             | 宿主建议                                                        |
+| -------------------------------- | --------------------------------------------------------------- |
+| `SOURCE_AUTH_EXPIRED`            | 获取同 ID 新 URL并 refresh；失败则按 playlist 策略跳过          |
+| `SOURCE_TIMEOUT`                 | 根据 provider/节点策略有限重试或切换，不在紧循环重启            |
+| `INVALID_SOURCE`, `DECODE_ERROR` | 标记本次 source不可用，选择下一首或上报内容问题                 |
+| `NOT_SEEKABLE`, `UNSUPPORTED`    | 修正产品操作，不把它当网络重试                                  |
+| `OUTPUT_ERROR`                   | 检查 gateway/session；通常需要重建外部连接，而非重试同一 packet |
+| `BUSY`                           | 等待正在进行的生命周期操作完成，避免并发重复命令                |
+| `INTERNAL`, `STREAM_CLOSED`      | 查询状态并收敛该 stream；持续出现时记录诊断并重建 runtime       |
 
 current failure可能已经 promotion 到 next，不能看到 `error` 就无条件 start 新 stream。先消费后续
 状态事件或查询 status，再执行宿主策略。
@@ -313,14 +313,14 @@ current failure可能已经 promotion 到 next，不能看到 `error` 就无条�
 
 默认值优先保证低延迟和有界资源：
 
-| 参数组 | 默认思路 | 调大后的主要代价 |
-| --- | --- | --- |
-| prebuffer 100 ms | 小范围网络/CPU 抖动 | 首包更慢 |
-| encoded capacity 800 ms | 有界 producer/sender 解耦 | 每流内存和可积累延迟增加 |
-| next prime 200 ms | 低 promotion 延迟 | preload CPU/内存增加 |
-| max lateness 100 ms | 实时优先，严重 stall 后追赶 | 更大值保留更多延迟 |
-| URL max 256 MiB | 有界歌曲 artifact | 需要更大 tempfile worst-case reservation |
-| live bridge 512 KiB/流 | 解耦 HTTP chunk 与 decoder | live 内存增加 |
+| 参数组                  | 默认思路                    | 调大后的主要代价                         |
+| ----------------------- | --------------------------- | ---------------------------------------- |
+| prebuffer 100 ms        | 小范围网络/CPU 抖动         | 首包更慢                                 |
+| encoded capacity 800 ms | 有界 producer/sender 解耦   | 每流内存和可积累延迟增加                 |
+| next prime 200 ms       | 低 promotion 延迟           | preload CPU/内存增加                     |
+| max lateness 100 ms     | 实时优先，严重 stall 后追赶 | 更大值保留更多延迟                       |
+| URL max 256 MiB         | 有界歌曲 artifact           | 需要更大 tempfile worst-case reservation |
+| live bridge 512 KiB/流  | 解耦 HTTP chunk 与 decoder  | live 内存增加                            |
 
 不要只因机器内存充足就扩大 queue。先观察 activation-to-prebuffer、underrun、CPU/admission wait、
 sender lateness 和 Node event-loop delay，再调整最接近瓶颈的一层。
@@ -366,7 +366,7 @@ clearInterval(fallback)
 streamer.setEventCallback(null)
 const finalEvents = streamer.drainEvents()
 eventChain = eventChain.then(async () => {
-  for (const event of finalEvents) await handleMediaEvent(event)
+	for (const event of finalEvents) await handleMediaEvent(event)
 })
 await eventChain
 await streamer.shutdown()

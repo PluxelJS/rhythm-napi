@@ -535,7 +535,9 @@ mod rubato_backend {
                         assert!(
                             chunk
                                 .samples_interleaved
-                                .chunks_exact(2)
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
                                 .all(|frame| frame[0] == frame[1])
                         );
                         output_frames += chunk.samples_per_channel();

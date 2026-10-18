@@ -79,11 +79,11 @@ decode、Rubato resample、音量与 limiter、libopus encode，以及同步 rea
 
 不能把 blocking thread、blocking producer 和 CPU worker 当成同一个数量：
 
-| 名称 | 提供者 | 表达的资源 | 默认策略 |
-| --- | --- | --- | --- |
-| Tokio blocking thread | Tokio runtime | 可执行同步闭包的 OS thread | 上游 runtime 默认，Rhythm 当前不配置 |
-| `maxBlockingProducers` | Rhythm semaphore | 可长期存活的 codec producer | `clamp(maxCpuWorkers * 4, 64, 256)` |
-| `maxCpuWorkers` | Rhythm `CpuScheduler` | 同时真正进行 codec 计算的 turn | `available_parallelism - 1`，至少1、最多256 |
+| 名称                   | 提供者                | 表达的资源                     | 默认策略                                    |
+| ---------------------- | --------------------- | ------------------------------ | ------------------------------------------- |
+| Tokio blocking thread  | Tokio runtime         | 可执行同步闭包的 OS thread     | 上游 runtime 默认，Rhythm 当前不配置        |
+| `maxBlockingProducers` | Rhythm semaphore      | 可长期存活的 codec producer    | `clamp(maxCpuWorkers * 4, 64, 256)`         |
+| `maxCpuWorkers`        | Rhythm `CpuScheduler` | 同时真正进行 codec 计算的 turn | `available_parallelism - 1`，至少1、最多256 |
 
 next 还受 `maxBlockingPreloads = maxBlockingProducers / 4` 限制。多核时 next 重新获取 CPU lease
 必须满足没有 current waiter，并至少给 current 留一个 CPU 名额。promotion 会让同一个 producer
@@ -173,14 +173,14 @@ pool，会让两套执行器都按整机 CPU 数扩张。结果可能是更多�
 
 ## 候选设计比较
 
-| 方案 | 结论 | 主要理由 |
-| --- | --- | --- |
-| codec 直接 `tokio::spawn` | 拒绝 | 同步 CPU/阻塞 read 会饿死 async timer、UDP 和控制任务 |
-| 当前 `spawn_blocking` + `CpuScheduler` | 采用 | 容忍同步等待，同时提供独立 CPU 上限、current 优先和可控演进成本 |
-| 整个 producer 提交 Rayon | 拒绝 | 长期等待占满固定 worker；没有播放优先级和 async 生命周期桥接 |
-| `spawn_blocking` 内嵌 Rayon | 拒绝 | 双池过度订阅；同一 generation 又缺乏安全、有效的并行边界 |
-| 多文件/clip 离线任务使用专用 Rayon pool | 条件采用 | 任务独立、有限、纯计算时 work stealing能平衡不规则工作量 |
-| 短 codec turn 的专用优先级 executor | 条件评估 | 可严格绑定 thread 数，但前提是 turn 内绝不等待 source/queue |
+| 方案                                    | 结论     | 主要理由                                                        |
+| --------------------------------------- | -------- | --------------------------------------------------------------- |
+| codec 直接 `tokio::spawn`               | 拒绝     | 同步 CPU/阻塞 read 会饿死 async timer、UDP 和控制任务           |
+| 当前 `spawn_blocking` + `CpuScheduler`  | 采用     | 容忍同步等待，同时提供独立 CPU 上限、current 优先和可控演进成本 |
+| 整个 producer 提交 Rayon                | 拒绝     | 长期等待占满固定 worker；没有播放优先级和 async 生命周期桥接    |
+| `spawn_blocking` 内嵌 Rayon             | 拒绝     | 双池过度订阅；同一 generation 又缺乏安全、有效的并行边界        |
+| 多文件/clip 离线任务使用专用 Rayon pool | 条件采用 | 任务独立、有限、纯计算时 work stealing能平衡不规则工作量        |
+| 短 codec turn 的专用优先级 executor     | 条件评估 | 可严格绑定 thread 数，但前提是 turn 内绝不等待 source/queue     |
 
 ## 当前设计的已知代价
 

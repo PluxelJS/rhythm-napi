@@ -5,17 +5,17 @@
 
 ## 模块职责
 
-| 模块 | 职责 | 不应承担的职责 |
-| --- | --- | --- |
-| `session` | 纯 actor 状态机、generation 过滤、action/event 规划 | task、socket、codec、playlist |
-| `runtime` | action 编排、producer/sender 生命周期、共享资源 | provider 策略、协议字节细节 |
-| `runtime/producer` | source 到 Opus queue 的 generation worker | RTP 时钟、playlist |
-| `runtime/sender` | prebuffer、pacing、RTP/RTCP、进度 | source、decode、DSP、encode |
-| `runtime/opus_queue` | 唯一的 duration-bounded encoded bridge | 第二级缓存或业务状态 |
-| `source` | file/URL/live 获取、cache、共享 flight、配额 | CPU 调度策略、playlist retry |
-| `audio` | decode、normalize、resample、DSP、Opus | async I/O、RTP session |
-| `transport` | RTP/RTCP 配置、marshal/parse | pacing、媒体生产、平台协商 |
-| `music_stream_napi` | Promise、类型转换、事件桥接、runtime registry | 媒体状态旁路或阻塞等待 |
+| 模块                 | 职责                                                | 不应承担的职责                |
+| -------------------- | --------------------------------------------------- | ----------------------------- |
+| `session`            | 纯 actor 状态机、generation 过滤、action/event 规划 | task、socket、codec、playlist |
+| `runtime`            | action 编排、producer/sender 生命周期、共享资源     | provider 策略、协议字节细节   |
+| `runtime/producer`   | source 到 Opus queue 的 generation worker           | RTP 时钟、playlist            |
+| `runtime/sender`     | prebuffer、pacing、RTP/RTCP、进度                   | source、decode、DSP、encode   |
+| `runtime/opus_queue` | 唯一的 duration-bounded encoded bridge              | 第二级缓存或业务状态          |
+| `source`             | file/URL/live 获取、cache、共享 flight、配额        | CPU 调度策略、playlist retry  |
+| `audio`              | decode、normalize、resample、DSP、Opus              | async I/O、RTP session        |
+| `transport`          | RTP/RTCP 配置、marshal/parse                        | pacing、媒体生产、平台协商    |
+| `music_stream_napi`  | Promise、类型转换、事件桥接、runtime registry       | 媒体状态旁路或阻塞等待        |
 
 ## 控制原语
 

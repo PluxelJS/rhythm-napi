@@ -33,29 +33,29 @@ rtcp = "0.17.2"
 rtp = "0.17.2"
 rubato = "5.0.0"
 symphonia = { version = "0.6.1", default-features = false, features = [
-  "aac",
-  "alac",
-  "flac",
-  "isomp4",
-  "mp3",
-  "ogg",
-  "pcm",
-  "vorbis",
-  "wav",
+	"aac",
+	"alac",
+	"flac",
+	"isomp4",
+	"mp3",
+	"ogg",
+	"pcm",
+	"vorbis",
+	"wav",
 ] }
 tempfile = "3.27.0"
 thiserror = "2.0.20"
 util = { package = "webrtc-util", version = "0.17.2", default-features = false, features = [
-  "marshal",
+	"marshal",
 ] }
 tokio = { version = "1.53.1", features = [
-  "rt-multi-thread",
-  "macros",
-  "sync",
-  "time",
-  "net",
-  "fs",
-  "io-util",
+	"rt-multi-thread",
+	"macros",
+	"sync",
+	"time",
+	"net",
+	"fs",
+	"io-util",
 ] }
 tokio-util = "0.7.19"
 tracing = "0.1.44"

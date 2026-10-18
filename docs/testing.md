@@ -6,13 +6,13 @@
 ## 必须通过的验证
 
 ```sh
-cargo fmt --all -- --check
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
-cargo doc --workspace --no-deps
+mise exec vp run check-rust-format
+mise exec vp run check-rust-tests
+mise exec vp run check-rust-lint
+mise exec vp run check-rust-docs
 
 cd crates/music_stream_napi
-npm test
+vp run test
 ```
 
 `--all-targets` 会运行 Criterion debug harness，确保 fake encoder 和 libopus 两条 pipeline 至少能够
@@ -20,25 +20,25 @@ npm test
 
 ## 不变量矩阵
 
-| 设计风险 | 必须验证的行为 |
-| --- | --- |
-| actor 与异步结果竞争 | generation 过滤、staged commit、callback failure 不跳过 action |
-| next 抢占 current | CPU、blocking、HTTP 和 tempfile 都保留 current 能力；live 不允许作为 next |
-| stream/status/registry增长 | `maxStreams`硬 admission、stopped LRU和dead weak key周期清理 |
-| pause 被实现成 cancel | URL 保持同一 response；超时不计算暂停时间；resume 不重置 RTP clock |
-| shared download 相互阻塞 | 单 subscriber pause/cancel 不影响 active follower；全部 pause 才冻结 |
-| partial response 被伪装完整 | 正文交付后不重试拼接；partial 不进入 cache |
-| codec 阻塞 realtime | source wait 和 queue wait 释放 CPU lease；sender 独立按 deadline 发送 |
-| current 之间互相饿死 | CPU 饱和时低 `bufferedMs` current先执行；相同深度和 next分别保持 FIFO |
-| queue 无界或重复 | 唯一 Opus queue 按媒体时长限流；next prime 后停止生产 |
-| event channel 外隐藏增长 | output pending 使用固定语义槽；backlog严格先于新事件，关闭channel会清空pending |
-| RTP session 被 track 重置 | switch、seek、promotion 后 sequence/timestamp 连续 |
-| sender stall 形成 burst | 超限丢旧媒体；timestamp 跳过、sequence 只统计实际包 |
-| 错误被 EOF 覆盖 | source/auth/timeout terminal 优先；failure event 先于 drained |
-| 任务 panic 或关闭泄漏 | producer/shared-flight panic 事件化；stop/shutdown 有 deadline 与 barrier |
-| sender panic 后假 Playing | supervisor立即发布active generation failure并收敛runtime |
-| Node event loop 被阻塞 | URL 启动期间 heartbeat 继续；所有等待型方法返回 Promise |
-| 多 stream事件乱序 | sequence 分配、补偿入队和 callback enqueue使用同一全局发布顺序 |
+| 设计风险                    | 必须验证的行为                                                                 |
+| --------------------------- | ------------------------------------------------------------------------------ |
+| actor 与异步结果竞争        | generation 过滤、staged commit、callback failure 不跳过 action                 |
+| next 抢占 current           | CPU、blocking、HTTP 和 tempfile 都保留 current 能力；live 不允许作为 next      |
+| stream/status/registry增长  | `maxStreams`硬 admission、stopped LRU和dead weak key周期清理                   |
+| pause 被实现成 cancel       | URL 保持同一 response；超时不计算暂停时间；resume 不重置 RTP clock             |
+| shared download 相互阻塞    | 单 subscriber pause/cancel 不影响 active follower；全部 pause 才冻结           |
+| partial response 被伪装完整 | 正文交付后不重试拼接；partial 不进入 cache                                     |
+| codec 阻塞 realtime         | source wait 和 queue wait 释放 CPU lease；sender 独立按 deadline 发送          |
+| current 之间互相饿死        | CPU 饱和时低 `bufferedMs` current先执行；相同深度和 next分别保持 FIFO          |
+| queue 无界或重复            | 唯一 Opus queue 按媒体时长限流；next prime 后停止生产                          |
+| event channel 外隐藏增长    | output pending 使用固定语义槽；backlog严格先于新事件，关闭channel会清空pending |
+| RTP session 被 track 重置   | switch、seek、promotion 后 sequence/timestamp 连续                             |
+| sender stall 形成 burst     | 超限丢旧媒体；timestamp 跳过、sequence 只统计实际包                            |
+| 错误被 EOF 覆盖             | source/auth/timeout terminal 优先；failure event 先于 drained                  |
+| 任务 panic 或关闭泄漏       | producer/shared-flight panic 事件化；stop/shutdown 有 deadline 与 barrier      |
+| sender panic 后假 Playing   | supervisor立即发布active generation failure并收敛runtime                       |
+| Node event loop 被阻塞      | URL 启动期间 heartbeat 继续；所有等待型方法返回 Promise                        |
+| 多 stream事件乱序           | sequence 分配、补偿入队和 callback enqueue使用同一全局发布顺序                 |
 
 ## 测试层次
 
@@ -106,22 +106,22 @@ PCM）为：fake encoder 约 176 µs，libopus pipeline 约 39.1 ms，约 128 �
 `criterion_media`把确定性真实fixture拆成decode和完整pipeline，并独立测量44.1→48 kHz Rubato与
 非静音Opus。2026-07-22同一开发机的初始中位数为：
 
-| 阶段/fixture | 媒体时长 | 运行时间 | 约实时倍数 |
-| --- | ---: | ---: | ---: |
-| Rubato mono 44.1→stereo 48 kHz | 5 s | 16.0 ms | 313x |
-| Opus stereo 48 kHz complexity 10 | 5 s | 35.1 ms | 142x |
-| MP3完整pipeline | 0.25 s | 5.07 ms | 49x |
-| FLAC完整pipeline | 0.20 s | 3.98 ms | 50x |
-| Vorbis完整pipeline | 0.25 s | 5.58 ms | 45x |
-| ALAC/M4A完整pipeline | 0.20 s | 4.09 ms | 49x |
-| AAC/M4A完整pipeline | 0.50 s | 8.20 ms | 61x |
+| 阶段/fixture                     | 媒体时长 | 运行时间 | 约实时倍数 |
+| -------------------------------- | -------: | -------: | ---------: |
+| Rubato mono 44.1→stereo 48 kHz   |      5 s |  16.0 ms |       313x |
+| Opus stereo 48 kHz complexity 10 |      5 s |  35.1 ms |       142x |
+| MP3完整pipeline                  |   0.25 s |  5.07 ms |        49x |
+| FLAC完整pipeline                 |   0.20 s |  3.98 ms |        50x |
+| Vorbis完整pipeline               |   0.25 s |  5.58 ms |        45x |
+| ALAC/M4A完整pipeline             |   0.20 s |  4.09 ms |        49x |
+| AAC/M4A完整pipeline              |   0.50 s |  8.20 ms |        61x |
 
 fixture很短且命中OS page cache，只适合检测代码级回归。保存优化前基线并让Criterion统计比较：
 
 ```sh
-cargo bench --bench criterion_media -- --save-baseline before
+mise exec -- cargo bench --bench criterion_media -- --save-baseline before
 # 修改后
-cargo bench --bench criterion_media -- --baseline before
+mise exec -- cargo bench --bench criterion_media -- --baseline before
 ```
 
 结果显示生产常见44.1 kHz输入不能只看Opus：Rubato也是主要CPU阶段。mono-first resample 保持原
@@ -138,7 +138,7 @@ benchmark用于寻找等质量实现中的CPU、复制和allocation浪费，不�
 `allocation_profile`用release构建直接统计每次workload的allocation次数和申请字节，不测耗时：
 
 ```sh
-cargo bench --bench allocation_profile
+mise exec -- cargo bench --bench allocation_profile
 ```
 
 当前5秒基线中，Rubato是526次/567341 bytes，Opus是250次/201050 bytes；Opus恰好每个
@@ -156,9 +156,9 @@ N-API runner固定使用Opus complexity 10、320 kbps和现有高质量Rubato配
 
 ```sh
 cd crates/music_stream_napi
-npm run soak -- --streams 10 --duration-seconds 1800 --sample-seconds 2 --fixture-seconds 5
-npm run soak -- --streams 50 --duration-seconds 7200 --sample-seconds 2 --fixture-seconds 5
-npm run soak -- --streams 50 --duration-seconds 1800 --sample-seconds 2 --fixture-seconds 5 --fixture-channels 1
+vp run soak --streams 10 --duration-seconds 1800 --sample-seconds 2 --fixture-seconds 5
+vp run soak --streams 50 --duration-seconds 7200 --sample-seconds 2 --fixture-seconds 5
+vp run soak --streams 50 --duration-seconds 1800 --sample-seconds 2 --fixture-seconds 5 --fixture-channels 1
 ```
 
 runner输出JSONL：

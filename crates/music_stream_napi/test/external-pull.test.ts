@@ -221,9 +221,7 @@ test('external output unavailability is a stream error, not a track attempt fail
 	)
 	const events = streamer.drainEvents(streamId)
 
-	expect(events).toContainEqual(
-		expect.objectContaining({ type: 'error', code: 'OUTPUT_ERROR' }),
-	)
+	expect(events).toContainEqual(expect.objectContaining({ type: 'error', code: 'OUTPUT_ERROR' }))
 	expect(events.every((event) => event.type !== 'attemptFailed')).toBe(true)
 	expect(events.every((event) => event.type !== 'nextNeeded')).toBe(true)
 })
@@ -259,9 +257,7 @@ test('an abandoned retired frame lease fails the output within a fixed deadline'
 	)
 	const events = streamer.drainEvents(streamId)
 
-	expect(events).toContainEqual(
-		expect.objectContaining({ type: 'error', code: 'OUTPUT_ERROR' }),
-	)
+	expect(events).toContainEqual(expect.objectContaining({ type: 'error', code: 'OUTPUT_ERROR' }))
 	expect(events.every((event) => event.type !== 'attemptFailed')).toBe(true)
 })
 

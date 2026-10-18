@@ -1,0 +1,18 @@
+packages:
+  - crates/music_stream_napi
+
+overrides:
+  'vite@*': npm:@voidzero-dev/vite-plus-core@1.2.0
+
+peerDependencyRules:
+  allowedVersions:
+    vite: '1.2.0'
+
+catalogs:
+  test:
+    vitest: 5.0.4
+  tooling:
+    '@napi-rs/cli': 3.10.5
+    '@types/node': ^26.6.4
+    typescript: ^7.0.2
+    vite-plus: 1.2.0

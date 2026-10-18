@@ -59,7 +59,7 @@ unit与thin LTO；libopus可使用自己的runtime dispatch，但通用Rust代�
 固定硬件的私有部署可以另建native二进制并与正式通用包做同语料对比：
 
 ```sh
-RUSTFLAGS='-C target-cpu=native' npm run build
+RUSTFLAGS='-C target-cpu=native' vp run build
 ```
 
 公开发布若需要更高指令集，应增加显式的x86-64-v3等分档包或对已profile出的纯Rust热点使用runtime

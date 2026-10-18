@@ -541,8 +541,7 @@ test('a pending preload gains current priority as soon as the previous track end
 		const playing = await waitForStatus(
 			() => streamer.getStatus(streamId),
 			(status) =>
-				status.playState === 'playing' &&
-				status.current?.attemptId === 'attempt-pending-next',
+				status.playState === 'playing' && status.current?.attemptId === 'attempt-pending-next',
 		)
 		expect(playing.current?.id).toBe('pending-next')
 	} finally {
