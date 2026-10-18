@@ -7,6 +7,13 @@ on:
         description: Git ref or SHA to build
         required: true
         type: string
+      cache_tools:
+        description: Reuse installed tools for CI; release callers disable this cache.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
 
 env:
   CARGO_INCREMENTAL: '0'
@@ -16,6 +23,7 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.host }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -35,7 +43,7 @@ jobs:
       - uses: jdx/mise-action@v5
         with:
           install: true
-          cache: true
+          cache: ${{ inputs.cache_tools }}
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
       - name: Install dependencies

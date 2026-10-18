@@ -6,6 +6,9 @@ on:
     tags-ignore: ['**']
   pull_request:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -19,6 +22,7 @@ jobs:
   quality:
     name: Quality and runtime tests
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: jdx/mise-action@v5
@@ -50,6 +54,7 @@ jobs:
     name: Test ${{ matrix.settings.target }} on Node 24 and Node 20 runtime
     needs: build-bindings
     runs-on: ${{ matrix.settings.host }}
+    timeout-minutes: 15
     env:
       MISE_ARCH: ${{ matrix.settings.architecture }}
     strategy:

@@ -10,6 +10,9 @@ on:
         required: true
         type: string
 
+permissions:
+  contents: read
+
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -23,11 +26,13 @@ jobs:
     uses: ./.github/workflows/bindings.yml
     with:
       checkout_ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      cache_tools: false
 
   publish:
     name: Publish npm packages and GitHub release
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: npm
     permissions:
       contents: write
@@ -39,7 +44,7 @@ jobs:
       - uses: jdx/mise-action@v5
         with:
           install: true
-          cache: true
+          cache: false
       - name: Install dependencies
         run: vp install --frozen-lockfile
       - name: Verify tag matches package version
