@@ -88,3 +88,5 @@ mise exec -- vp run check-rust-docs
 cd crates/music_stream_napi
 vp run test
 ```
+
+Node 开发依赖由根 `pnpm-workspace.yaml` catalog 与 pncat 管理；运行 `vp run catalog:detect` 查看未迁移声明（报告命令，不是 CI 阻断检查），用 `vp run catalog:migrate` 迁移声明，安装后提交根锁文件。嵌入 Rhythm 工作区时同名 catalog 由父工作区统一选择版本。Node 24 运行开发工具和完整测试，Node 20 通过不加载开发工具的 `node --test scripts/runtime-smoke.mjs` 验证发布 binding 的最低运行时。npm 包的安装与发布入口保持不变。

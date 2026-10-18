@@ -60,7 +60,10 @@ test('all lifecycle methods are asynchronous and RTP remains monotonic across sw
 		expect(started.current?.id).toBe('first')
 		expect(started.current && 'path' in started.current).toBe(false)
 		const before = (await firstPacket).message
-		const activeStatus = await streamer.getStatus(streamId)
+		const activeStatus = await waitForStatus(
+			() => streamer.getStatus(streamId),
+			(status) => (status.playoutDiagnostics?.packetsSent ?? 0) > 0,
+		)
 		expect(activeStatus.playoutDiagnostics?.packetsSent).toBeGreaterThan(0)
 		expect(activeStatus.playoutDiagnostics?.bytesSent).toBeGreaterThan(0)
 		expect(activeStatus.playoutDiagnostics?.bufferedMs).toBeGreaterThanOrEqual(0)

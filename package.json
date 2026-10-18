@@ -8,10 +8,13 @@
 		"check": "vp check",
 		"fix": "vp check --fix",
 		"verify": "vp run --concurrency-limit 2 workspace:verify",
-		"hooks:install": "hk install --mise"
+		"hooks:install": "hk install --mise",
+		"catalog:migrate": "pncat migrate --yes",
+		"catalog:detect": "pncat detect --yes"
 	},
 	"devDependencies": {
-		"vite-plus": "catalog:tooling"
+		"vite-plus": "catalog:tooling",
+		"pncat": "catalog:tooling"
 	},
 	"packageManager": "pnpm@11.28.2"
 }

@@ -77,6 +77,9 @@ jobs:
       - name: Type contract and binding tests
         working-directory: ${{ env.NAPI_DIR }}
         run: vp run check-bindings
+      - name: Development runtime binding compatibility
+        working-directory: ${{ env.NAPI_DIR }}
+        run: node --test scripts/runtime-smoke.mjs
       - name: Minimum runtime binding compatibility
         working-directory: ${{ env.NAPI_DIR }}
-        run: mise exec node@20 -- node -e "const { Streamer } = require('.'); const streamer = new Streamer(); streamer.shutdown().catch(error => { console.error(error); process.exitCode = 1 })"
+        run: mise exec node@20 -- node --test scripts/runtime-smoke.mjs
