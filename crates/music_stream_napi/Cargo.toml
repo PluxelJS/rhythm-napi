@@ -21,7 +21,7 @@ napi-derive.workspace = true
 tokio.workspace = true
 
 [build-dependencies]
-napi-build = "2.4.1"
+napi-build = "2.6.0"
 
 [dev-dependencies]
 # Rust unit tests run without a Node host. Dynamic symbols keep the test binary linkable while the

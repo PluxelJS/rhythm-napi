@@ -2434,6 +2434,7 @@ mod tests {
         let address = listener.local_addr().expect("address");
         let connections = Arc::new(AtomicUsize::new(0));
         let server_connections = Arc::clone(&connections);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.expect("accept");
             server_connections.fetch_add(1, Ordering::Relaxed);
@@ -2443,6 +2444,7 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nopus")
                 .await
                 .expect("partial body");
+            release_rx.await.expect("body prefix delivered");
             drop(stream);
             if tokio::time::timeout(Duration::from_millis(100), listener.accept())
                 .await
@@ -2453,23 +2455,29 @@ mod tests {
         });
         let source = url_source(format!("http://{address}/audio.opus"));
         let config = HttpSourceConfig {
+            io_timeout: Duration::from_secs(2),
             max_retries: 2,
             retry_backoff: Duration::from_millis(1),
             ..HttpSourceConfig::default()
         };
-        let (reader_tx, reader_rx) = watch::channel(None);
+        let (reader_tx, mut reader_rx) = watch::channel(None);
 
-        let result = download_http_artifact_with_writer(
-            &source,
-            &config,
-            reqwest::Client::new(),
-            &PauseGate::default(),
-            &CancellationToken::new(),
-            Some(reader_tx),
-        )
-        .await;
+        let transfer = tokio::spawn(async move {
+            download_http_artifact_with_writer(
+                &source,
+                &config,
+                reqwest::Client::new(),
+                &PauseGate::default(),
+                &CancellationToken::new(),
+                Some(reader_tx),
+            )
+            .await
+        });
 
-        assert!(result.is_err());
+        tokio::time::timeout(Duration::from_secs(2), reader_rx.changed())
+            .await
+            .expect("reader publication timeout")
+            .expect("reader channel");
         let mut reader = reader_rx
             .borrow()
             .clone()
@@ -2477,10 +2485,13 @@ mod tests {
             .open_reader(CancellationToken::new())
             .expect("spool reader");
         let reader_task = tokio::task::spawn_blocking(move || {
-            let mut output = Vec::new();
+            let mut output = vec![0; 4];
+            reader.read_exact(&mut output).expect("body prefix");
+            release_tx.send(()).expect("release server");
             let result = reader.read_to_end(&mut output);
             (output, result)
         });
+        assert!(transfer.await.expect("transfer task").is_err());
         let (output, read_result) = reader_task.await.expect("reader");
         assert_eq!(output, b"opus");
         assert!(read_result.is_err());

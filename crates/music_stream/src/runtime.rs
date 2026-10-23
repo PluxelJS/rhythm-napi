@@ -110,7 +110,7 @@ impl RuntimeTimingCounter {
         self.samples.fetch_add(1, Ordering::Relaxed);
         let _ = self
             .total_us
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 Some(current.saturating_add(elapsed_us))
             });
         self.max_us.fetch_max(elapsed_us, Ordering::Relaxed);
