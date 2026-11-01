@@ -10,11 +10,11 @@ peerDependencyRules:
 
 catalogs:
   build:
-    vite-plus: 1.2.0
+    vite-plus: 1.4.0
   test:
-    vitest: 5.0.4
+    vitest: 5.0.5
   tooling:
-    '@napi-rs/cli': ^3.10.8
-    '@types/node': ^26.6.4
+    '@napi-rs/cli': ^3.10.9
+    '@types/node': ^26.6.6
     pncat: ^0.13.4
     typescript: ^7.0.2
