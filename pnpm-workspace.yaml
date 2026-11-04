@@ -2,19 +2,73 @@ packages:
   - crates/music_stream_napi
 
 overrides:
-  'vite@*': npm:@voidzero-dev/vite-plus-core@1.2.0
+  'vite@*': npm:@voidzero-dev/vite-plus-core@1.4.0
+  'vitest@*': 5.0.5
 
 peerDependencyRules:
   allowedVersions:
-    vite: '1.2.0'
+    vite: '1.4.0'
 
 catalogs:
   build:
-    vite-plus: 1.2.0
+    vite-plus: 1.4.0
   test:
-    vitest: 5.0.4
+    vitest: 5.0.5
   tooling:
-    '@napi-rs/cli': ^3.10.8
-    '@types/node': ^26.6.4
+    '@napi-rs/cli': ^3.10.12
+    '@types/node': ^26.6.6
     pncat: ^0.13.4
     typescript: ^7.0.2
+
+minimumReleaseAgeExclude:
+  - '@napi-rs/cli@3.10.12'
+  - '@napi-rs/cross-toolchain@1.0.5'
+  - '@napi-rs/lzma-android-arm-eabi@1.5.3'
+  - '@napi-rs/lzma-android-arm64@1.5.3'
+  - '@napi-rs/lzma-darwin-arm64@1.5.3'
+  - '@napi-rs/lzma-darwin-x64@1.5.3'
+  - '@napi-rs/lzma-freebsd-x64@1.5.3'
+  - '@napi-rs/lzma-linux-arm-gnueabihf@1.5.3'
+  - '@napi-rs/lzma-linux-arm64-gnu@1.5.3'
+  - '@napi-rs/lzma-linux-arm64-musl@1.5.3'
+  - '@napi-rs/lzma-linux-ppc64-gnu@1.5.3'
+  - '@napi-rs/lzma-linux-riscv64-gnu@1.5.3'
+  - '@napi-rs/lzma-linux-s390x-gnu@1.5.3'
+  - '@napi-rs/lzma-linux-x64-gnu@1.5.3'
+  - '@napi-rs/lzma-linux-x64-musl@1.5.3'
+  - '@napi-rs/lzma-wasm32-wasi@1.5.3'
+  - '@napi-rs/lzma-win32-arm64-msvc@1.5.3'
+  - '@napi-rs/lzma-win32-ia32-msvc@1.5.3'
+  - '@napi-rs/lzma-win32-x64-msvc@1.5.3'
+  - '@napi-rs/lzma@1.5.3'
+  - '@napi-rs/tar-android-arm-eabi@1.1.3'
+  - '@napi-rs/tar-android-arm64@1.1.3'
+  - '@napi-rs/tar-darwin-arm64@1.1.3'
+  - '@napi-rs/tar-darwin-x64@1.1.3'
+  - '@napi-rs/tar-freebsd-x64@1.1.3'
+  - '@napi-rs/tar-linux-arm-gnueabihf@1.1.3'
+  - '@napi-rs/tar-linux-arm64-gnu@1.1.3'
+  - '@napi-rs/tar-linux-arm64-musl@1.1.3'
+  - '@napi-rs/tar-linux-ppc64-gnu@1.1.3'
+  - '@napi-rs/tar-linux-s390x-gnu@1.1.3'
+  - '@napi-rs/tar-linux-x64-gnu@1.1.3'
+  - '@napi-rs/tar-linux-x64-musl@1.1.3'
+  - '@napi-rs/tar-wasm32-wasi@1.1.3'
+  - '@napi-rs/tar-win32-arm64-msvc@1.1.3'
+  - '@napi-rs/tar-win32-ia32-msvc@1.1.3'
+  - '@napi-rs/tar-win32-x64-msvc@1.1.3'
+  - '@napi-rs/tar@1.1.3'
+  - '@napi-rs/wasm-tools-android-arm-eabi@1.1.2'
+  - '@napi-rs/wasm-tools-android-arm64@1.1.2'
+  - '@napi-rs/wasm-tools-darwin-arm64@1.1.2'
+  - '@napi-rs/wasm-tools-darwin-x64@1.1.2'
+  - '@napi-rs/wasm-tools-freebsd-x64@1.1.2'
+  - '@napi-rs/wasm-tools-linux-arm64-gnu@1.1.2'
+  - '@napi-rs/wasm-tools-linux-arm64-musl@1.1.2'
+  - '@napi-rs/wasm-tools-linux-x64-gnu@1.1.2'
+  - '@napi-rs/wasm-tools-linux-x64-musl@1.1.2'
+  - '@napi-rs/wasm-tools-wasm32-wasi@1.1.2'
+  - '@napi-rs/wasm-tools-win32-arm64-msvc@1.1.2'
+  - '@napi-rs/wasm-tools-win32-ia32-msvc@1.1.2'
+  - '@napi-rs/wasm-tools-win32-x64-msvc@1.1.2'
+  - '@napi-rs/wasm-tools@1.1.2'

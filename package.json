@@ -16,5 +16,5 @@
 		"vite-plus": "catalog:build",
 		"pncat": "catalog:tooling"
 	},
-	"packageManager": "pnpm@11.28.2"
+	"packageManager": "pnpm@11.28.10"
 }

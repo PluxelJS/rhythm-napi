@@ -1,10 +1,10 @@
 [tools]
-node = "24.21.0"
-npm = "11.17.0"
-pnpm = "11.28.2"
-rust = { version = "1.98.1", profile = "minimal", components = ["clippy", "rustfmt"] }
-hk = "2.6.0"
-viteplus = "1.2.0"
+node = "24.22.2"
+npm = "12.2.1"
+pnpm = "11.28.10"
+rust = { version = "1.99.1", profile = "minimal", components = ["clippy", "rustfmt"] }
+hk = "2.11.0"
+viteplus = "1.4.0"
 
 # pnpm's portable npm package also supports Intel macOS, which has no standalone binary.
 [tool_alias]
