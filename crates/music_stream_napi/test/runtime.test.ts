@@ -153,7 +153,7 @@ test('seek near the end preserves repeated automatic preload promotion', async (
 		}),
 	)
 	const socket = await createBoundUdpSocket()
-	const streamer = new Streamer()
+	const streamer = new Streamer({ maxCpuWorkers: 1 })
 	const streamId = `seek-promotion-${Date.now()}`
 
 	try {

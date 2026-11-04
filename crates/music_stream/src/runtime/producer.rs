@@ -175,7 +175,8 @@ impl CpuScheduler {
                 };
             if allowed {
                 if current {
-                    debug_assert!(remove_cpu_waiter(&mut state, current, waiter));
+                    let removed = remove_cpu_waiter(&mut state, current, waiter);
+                    debug_assert!(removed);
                 } else {
                     let acquired = state.next_waiters.pop_front();
                     debug_assert!(
